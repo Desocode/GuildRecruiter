@@ -19,7 +19,7 @@
 
 GuildRecruiter_Settings = GuildRecruiter_Settings or {}
 
-local VERSION    = "2.1"
+local VERSION    = "2.2"
 local CAP_HINT   = 49      -- treat a query returning >= this many as truncated
 local START_WIDTH = 10     -- initial level-band width to try
 local WHO_TIMEOUT = 12     -- give up waiting on a reply after this many seconds
@@ -45,6 +45,14 @@ local MODE_LABEL = {
   whisper       = "Whisper only",
   whisperinvite = "Whisper, invite on reply",
 }
+-- shorter text for the compact config buttons (full labels above are for chat)
+local METHOD_SHORT = { auto = "Auto", byname = "GuildInviteByName", invite = "GuildInvite", chat = "/ginvite" }
+local MODE_SHORT   = { invite = "Invite only", whisper = "Whisper only", whisperinvite = "Whisper, then invite" }
+
+-- default whisper; OLD_WHISPER is migrated to NEW_WHISPER so testers on the old
+-- default pick up the better one (custom messages are left untouched)
+local OLD_WHISPER = "Hi %p! We're recruiting for %g -- whisper me back if you're interested and I'll send an invite. :)"
+local NEW_WHISPER = "Hi %p! :) I'm recruiting for <%g>, a friendly and active guild that loves grouping up for quests, dungeons and raids. If you're after a guild, just whisper me back and I'll send an invite -- no pressure either way!"
 
 local f = CreateFrame("Frame", "GuildRecruiterFrame")
 
@@ -112,7 +120,7 @@ local function Defaults()
   if s.hideWho == nil   then s.hideWho      = true end
   if not s.inviteMethod then s.inviteMethod = "auto" end
   if not s.mode         then s.mode         = "invite" end  -- invite|whisper|whisperinvite
-  if not s.whisperMsg   then s.whisperMsg   = "Hi %p! We're recruiting for %g -- whisper me back if you're interested and I'll send an invite. :)" end
+  if not s.whisperMsg or s.whisperMsg == OLD_WHISPER then s.whisperMsg = NEW_WHISPER end
   if not s.minLevel     then s.minLevel     = 1 end
   if not s.maxLevel     then s.maxLevel     = 60 end
   if not s.classFilter  then s.classFilter  = nil end  -- nil = all classes; else set of lowercase names
@@ -178,6 +186,7 @@ end
 RecomputeBand = function()
   local s = GuildRecruiter_Settings
   local loL, hiL = s.minLevel, s.maxLevel
+  if loL > hiL then loL, hiL = hiL, loL end   -- tolerate reversed saved bounds
   if not s.guildSync or not IsInGuild() then
     myLo, myHi = loL, hiL
   else
@@ -801,6 +810,21 @@ end
 local configFrame
 local RefreshConfig  -- forward decl
 
+-- level setters used by both the GUI boxes and slash: clamp to 1-60, drop any
+-- fraction, and keep min <= max (raising the other bound if they cross)
+local function SetMinLevel(v)
+  v = clamp(math.floor(tonumber(v) or 1), 1, 60)
+  GuildRecruiter_Settings.minLevel = v
+  if GuildRecruiter_Settings.maxLevel < v then GuildRecruiter_Settings.maxLevel = v end
+  RecomputeBand(); RefreshConfig()
+end
+local function SetMaxLevel(v)
+  v = clamp(math.floor(tonumber(v) or 60), 1, 60)
+  GuildRecruiter_Settings.maxLevel = v
+  if GuildRecruiter_Settings.minLevel > v then GuildRecruiter_Settings.minLevel = v end
+  RecomputeBand(); RefreshConfig()
+end
+
 local function ApplyInvite(v) GuildRecruiter_Settings.inviteDelay = clamp(math.floor(v + 0.5), INVITE_MIN, INVITE_MAX); RefreshConfig() end
 local function ApplyWho(v)    GuildRecruiter_Settings.whoDelay    = clamp(math.floor(v + 0.5), WHO_MIN, WHO_MAX); RefreshConfig() end
 
@@ -873,8 +897,8 @@ RefreshConfig = function()
   configFrame.whoSlider:SetValue(clamp(s.whoDelay, WHO_MIN, WHO_MAX))
   configFrame.inviteEdit:SetText(tostring(s.inviteDelay))
   configFrame.whoEdit:SetText(tostring(s.whoDelay))
-  configFrame.methodBtn:SetText("Invite method: "..(METHOD_LABEL[s.inviteMethod] or s.inviteMethod))
-  configFrame.modeBtn:SetText("Mode: "..(MODE_LABEL[s.mode] or s.mode))
+  configFrame.methodBtn:SetText(METHOD_SHORT[s.inviteMethod] or s.inviteMethod)
+  configFrame.modeBtn:SetText(MODE_SHORT[s.mode] or s.mode)
   configFrame.whisperEdit:SetText(s.whisperMsg or "")
   configFrame.minEdit:SetText(tostring(s.minLevel))
   configFrame.maxEdit:SetText(tostring(s.maxLevel))
@@ -919,12 +943,14 @@ local function BuildConfig()
   fr.inviteSlider, fr.inviteEdit = MakeSlider(fr, "GuildRecruiterConfigInvite", "Invite/contact delay (s)", INVITE_MIN, INVITE_MAX, -48, ApplyInvite)
   fr.whoSlider,    fr.whoEdit    = MakeSlider(fr, "GuildRecruiterConfigWho",    "/who delay (s)",           WHO_MIN,    WHO_MAX,    -92, ApplyWho)
 
+  Label(fr, "Invite method:", 24, -128)
   fr.methodBtn = CreateFrame("Button", "GuildRecruiterConfigMethodBtn", fr, "UIPanelButtonTemplate")
-  fr.methodBtn:SetPoint("TOPLEFT", 22, -124); fr.methodBtn:SetWidth(312); fr.methodBtn:SetHeight(22)
+  fr.methodBtn:SetPoint("TOPLEFT", 150, -124); fr.methodBtn:SetWidth(184); fr.methodBtn:SetHeight(22)
   fr.methodBtn:SetScript("OnClick", function() CycleMethod() end)
 
+  Label(fr, "Mode:", 24, -154)
   fr.modeBtn = CreateFrame("Button", "GuildRecruiterConfigModeBtn", fr, "UIPanelButtonTemplate")
-  fr.modeBtn:SetPoint("TOPLEFT", 22, -150); fr.modeBtn:SetWidth(312); fr.modeBtn:SetHeight(22)
+  fr.modeBtn:SetPoint("TOPLEFT", 150, -150); fr.modeBtn:SetWidth(184); fr.modeBtn:SetHeight(22)
   fr.modeBtn:SetScript("OnClick", function() CycleMode() end)
 
   Label(fr, "Whisper message (%p = name, %g = guild):", 24, -178)
@@ -935,11 +961,11 @@ local function BuildConfig()
   fr.whisperEdit:SetScript("OnEscapePressed", function() this:ClearFocus() end)
 
   Label(fr, "Levels", 24, -222)
-  fr.minEdit = MakeNumBox(fr, "GuildRecruiterConfigMin", 70, -218, 34, 2, function(v) GuildRecruiter_Settings.minLevel = clamp(v, 1, 60); RecomputeBand(); RefreshConfig() end)
+  fr.minEdit = MakeNumBox(fr, "GuildRecruiterConfigMin", 70, -218, 34, 2, function(v) SetMinLevel(v) end)
   Label(fr, "to", 112, -222)
-  fr.maxEdit = MakeNumBox(fr, "GuildRecruiterConfigMax", 132, -218, 34, 2, function(v) GuildRecruiter_Settings.maxLevel = clamp(v, 1, 60); RecomputeBand(); RefreshConfig() end)
+  fr.maxEdit = MakeNumBox(fr, "GuildRecruiterConfigMax", 132, -218, 34, 2, function(v) SetMaxLevel(v) end)
   Label(fr, "Session cap (0=off)", 186, -222)
-  fr.capEdit = MakeNumBox(fr, "GuildRecruiterConfigCap", 300, -218, 34, 4, function(v) GuildRecruiter_Settings.sessionCap = v end)
+  fr.capEdit = MakeNumBox(fr, "GuildRecruiterConfigCap", 300, -218, 34, 4, function(v) GuildRecruiter_Settings.sessionCap = clamp(math.floor(v), 0, 9999) end)
 
   fr.jitterCheck   = MakeCheck(fr, "GuildRecruiterConfigJitter",   "Random delays (anti-pattern)", 22,  -248, "jitter")
   fr.syncCheck     = MakeCheck(fr, "GuildRecruiterConfigSync",     "Guild sync (dedup + split)",   22,  -274, "guildSync")
@@ -1122,18 +1148,19 @@ SlashCmdList["GUILDRECRUITER"] = function(msg)
   elseif cmd == "set" then
     local _, _, which, rest = string.find(larg, "^(%a+)%s+(%S+)$")
     local val = tonumber(rest)
+    if val then val = math.floor(val) end   -- whole numbers only; drop decimals
     if which == "invite" and val and val >= 1 then
-      GuildRecruiter_Settings.inviteDelay = val; RefreshConfig(); Print("Invite delay "..val.."s.")
+      val = clamp(val, 1, 600); GuildRecruiter_Settings.inviteDelay = val; RefreshConfig(); Print("Invite delay "..val.."s.")
     elseif which == "who" and val and val >= 1 then
-      GuildRecruiter_Settings.whoDelay = val; RefreshConfig(); Print("Who delay "..val.."s.")
+      val = clamp(val, 1, 600); GuildRecruiter_Settings.whoDelay = val; RefreshConfig(); Print("Who delay "..val.."s.")
     elseif which == "reinvite" and val then
-      GuildRecruiter_Settings.reinviteDays = val; Print("Re-invite cooldown "..val.." day(s).")
+      val = clamp(val, 0, 3650); GuildRecruiter_Settings.reinviteDays = val; Print("Re-invite cooldown "..val.." day(s).")
     elseif which == "cap" and val then
-      GuildRecruiter_Settings.sessionCap = val; RefreshConfig(); Print("Session cap "..(val == 0 and "off" or val)..".")
+      val = clamp(val, 0, 9999); GuildRecruiter_Settings.sessionCap = val; RefreshConfig(); Print("Session cap "..(val == 0 and "off" or val)..".")
     elseif which == "min" and val then
-      GuildRecruiter_Settings.minLevel = clamp(val, 1, 60); RecomputeBand(); RefreshConfig(); Print("Min level "..GuildRecruiter_Settings.minLevel..".")
+      SetMinLevel(val); Print("Levels "..GuildRecruiter_Settings.minLevel.."-"..GuildRecruiter_Settings.maxLevel..".")
     elseif which == "max" and val then
-      GuildRecruiter_Settings.maxLevel = clamp(val, 1, 60); RecomputeBand(); RefreshConfig(); Print("Max level "..GuildRecruiter_Settings.maxLevel..".")
+      SetMaxLevel(val); Print("Levels "..GuildRecruiter_Settings.minLevel.."-"..GuildRecruiter_Settings.maxLevel..".")
     elseif which == "method" and METHOD_LABEL[rest] then
       GuildRecruiter_Settings.inviteMethod = rest; RefreshConfig(); Print("Invite method: "..rest..".")
     elseif which == "mode" and MODE_LABEL[rest] then

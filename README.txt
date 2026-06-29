@@ -42,8 +42,9 @@ CONTACT MODES  (/gr set mode ...)
 
 Whisper text is editable (/gr msg <text> or the settings window). Tokens:
   %p = player name      %g = your guild name
-Default: "Hi %p! We're recruiting for %g -- whisper me back if you're
-interested and I'll send an invite. :)"
+Default: "Hi %p! :) I'm recruiting for <%g>, a friendly and active guild that
+loves grouping up for quests, dungeons and raids. If you're after a guild, just
+whisper me back and I'll send an invite -- no pressure either way!"
 
 NOTE: blind mass guild invites break many servers' rules (Turtle included).
 Whisper or whisper-on-reply modes are the safer, better-received options.
