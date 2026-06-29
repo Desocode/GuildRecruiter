@@ -19,7 +19,7 @@
 
 GuildRecruiter_Settings = GuildRecruiter_Settings or {}
 
-local VERSION    = "2.2"
+local VERSION    = "3.0"
 local CAP_HINT   = 49      -- treat a query returning >= this many as truncated
 local START_WIDTH = 10     -- initial level-band width to try
 local WHO_TIMEOUT = 12     -- give up waiting on a reply after this many seconds
@@ -53,6 +53,30 @@ local MODE_SHORT   = { invite = "Invite only", whisper = "Whisper only", whisper
 -- default pick up the better one (custom messages are left untouched)
 local OLD_WHISPER = "Hi %p! We're recruiting for %g -- whisper me back if you're interested and I'll send an invite. :)"
 local NEW_WHISPER = "Hi %p! :) I'm recruiting for <%g>, a friendly and active guild that loves grouping up for quests, dungeons and raids. If you're after a guild, just whisper me back and I'll send an invite -- no pressure either way!"
+
+-- default affirmative library (whisperinvite mode invites when a reply matches
+-- one of these as a whole word/phrase). Saved to SavedVariables and editable.
+local AFFIRM_DEFAULTS = {
+  "yes", "yeah", "yep", "yup", "ya", "yea", "yess", "yas", "yes please", "yes pls",
+  "sure", "ok", "okay", "kk", "alright", "aight", "of course", "ofc",
+  "definitely", "absolutely", "sounds good", "sounds great", "why not",
+  "go ahead", "go for it", "please", "pls", "plz", "im in", "count me in",
+  "sign me up", "lets go", "do it", "send it", "send invite", "invite me",
+  "inv me", "add me", "invite", "inv", "for sure", "heck yes", "hell yes",
+  "id love to", "love to", "happy to", "lets do it",
+}
+-- negatives veto an affirmative match (so "ok no thanks" is NOT treated as yes)
+local NEGATIVES = {
+  "no", "nope", "nah", "not interested", "no thanks", "no thank you",
+  "leave me", "stop", "go away", "not now", "maybe later", "busy",
+  "fuck off", "piss off", "reported", "report",
+}
+-- which settings a profile snapshots (history/blacklist/stats/affirmatives stay global)
+local PROFILE_KEYS = {
+  "inviteDelay", "whoDelay", "reinviteDays", "mode", "whisperMsg", "minLevel",
+  "maxLevel", "sessionCap", "jitter", "skipCombat", "skipInstance", "guildSync",
+  "quietWho", "inviteMethod", "affirmOnly", "classFilter",
+}
 
 local f = CreateFrame("Frame", "GuildRecruiterFrame")
 
@@ -131,6 +155,15 @@ local function Defaults()
   if s.skipInstance == nil then s.skipInstance = true end
   if s.guildSync == nil    then s.guildSync    = true end
   if s.quietWho == nil     then s.quietWho     = true end  -- hide /who chat spam during a run
+  if s.affirmOnly == nil   then s.affirmOnly   = true end  -- only auto-invite on an affirmative reply
+  if not s.affirmatives then
+    s.affirmatives = {}
+    for i = 1, table.getn(AFFIRM_DEFAULTS) do s.affirmatives[AFFIRM_DEFAULTS[i]] = true end
+  end
+  if not s.profiles then s.profiles = {} end
+  if not s.tally then s.tally = {} end
+  if not s.tally.totals then s.tally.totals = { invited=0, whispered=0, joined=0, declined=0 } end
+  if not s.tally.days   then s.tally.days   = {} end
   if not s.minimapAngle then s.minimapAngle = 210 end
   -- prune history past the cooldown so the saved table can't grow forever
   if s.reinviteDays > 0 then
@@ -140,6 +173,63 @@ local function Defaults()
     end
   end
 end
+
+-- ---------------------------------------------------------------------------
+-- Analytics tally (persisted: lifetime totals + per-day buckets)
+-- ---------------------------------------------------------------------------
+local function Today()
+  if type(date) == "function" then return date("%Y%m%d") end
+  return "alltime"
+end
+
+local function TallyBump(field)
+  local t = GuildRecruiter_Settings.tally
+  if not t then return end
+  t.totals[field] = (t.totals[field] or 0) + 1
+  local d = Today()
+  if not t.days[d] then t.days[d] = { invited=0, whispered=0, joined=0, declined=0 } end
+  t.days[d][field] = (t.days[d][field] or 0) + 1
+end
+
+-- ---------------------------------------------------------------------------
+-- Affirmative-reply detection
+-- ---------------------------------------------------------------------------
+local function Normalize(s)
+  s = string.lower(s or "")
+  s = string.gsub(s, "'", "")            -- drop apostrophes so "i'm" == "im"
+  s = string.gsub(s, "[^%a%d ]", " ")    -- other punctuation -> space
+  s = " " .. s .. " "
+  s = string.gsub(s, "%s+", " ")
+  return s
+end
+
+-- true if the reply clearly says yes (and isn't vetoed by a negative)
+local function IsAffirmative(reply)
+  local norm = Normalize(reply)
+  for i = 1, table.getn(NEGATIVES) do
+    if string.find(norm, " " .. NEGATIVES[i] .. " ", 1, true) then return false end
+  end
+  local set = GuildRecruiter_Settings.affirmatives or {}
+  for phrase in set do
+    if string.find(norm, " " .. phrase .. " ", 1, true) then return true end
+  end
+  return false
+end
+
+-- ---------------------------------------------------------------------------
+-- Guild join / decline detection (locale-safe via the client's format strings)
+-- ---------------------------------------------------------------------------
+local function ToPattern(s)
+  if not s then return nil end
+  s = string.gsub(s, "%%s", "\001")                                   -- protect the name slot
+  s = string.gsub(s, "([%^%$%(%)%.%[%]%*%+%-%?%%])", "%%%1")           -- escape magic chars
+  s = string.gsub(s, "\001", "(.+)")                                  -- name slot -> capture
+  return "^" .. s .. "$"
+end
+-- built from the client's format strings when present, with an enUS fallback so
+-- detection still works if those globals are absent/renamed on this core
+local JOIN_PAT    = ToPattern(ERR_GUILD_JOIN_S)    or "^(.+) has joined the guild"
+local DECLINE_PAT = ToPattern(ERR_GUILD_DECLINE_S) or "^(.+) declines your guild invitation"
 
 -- ---------------------------------------------------------------------------
 -- Skip rules: recently contacted, blacklisted
@@ -290,15 +380,18 @@ local function Contact(name)
   if mode == "whisper" then
     SendChatMessage(WhisperBody(name), "WHISPER", nil, name)
     stats.whispered = stats.whispered + 1
+    TallyBump("whispered")
     RecordHandled(name)
   elseif mode == "whisperinvite" then
     SendChatMessage(WhisperBody(name), "WHISPER", nil, name)
     stats.whispered = stats.whispered + 1
+    TallyBump("whispered")
     whispered[name] = GetTime()
     RecordHandled(name)
   else
     DoGuildInvite(name)
     stats.invited = stats.invited + 1
+    TallyBump("invited")
     RecordHandled(name)
   end
   stats.contacted = stats.contacted + 1
@@ -465,17 +558,33 @@ local function GR_OnEvent()
   elseif event == "CHAT_MSG_ADDON" then
     OnAddonMessage()
   elseif event == "CHAT_MSG_SYSTEM" then
-    local m = string.lower(arg1 or "")
+    local raw = arg1 or ""
+    local m = string.lower(raw)
     if string.find(m, "too quickly") or string.find(m, "too many")
        or (string.find(m, "wait") and string.find(m, "invit")) then
       backoffUntil = GetTime() + BACKOFF_SECS
       Print("|cffffcc00Server throttle detected -- pausing sends "..BACKOFF_SECS.."s.|r")
     end
+    -- analytics: attribute a join to us only if we contacted them; declines of
+    -- our invitation are always ours
+    if JOIN_PAT then
+      local _, _, jn = string.find(raw, JOIN_PAT)
+      if jn and GuildRecruiter_Settings.history and GuildRecruiter_Settings.history[jn] then
+        TallyBump("joined")
+      end
+    end
+    if DECLINE_PAT then
+      local _, _, dn = string.find(raw, DECLINE_PAT)
+      if dn then TallyBump("declined") end
+    end
   elseif event == "CHAT_MSG_WHISPER" then
     local sender = arg2
     if sender and whispered[sender] then
-      whispered[sender] = nil
-      tinsert(replyQueue, sender)   -- they replied: invite them (paced)
+      if not GuildRecruiter_Settings.affirmOnly or IsAffirmative(arg1) then
+        whispered[sender] = nil
+        tinsert(replyQueue, sender)   -- said yes: invite them (paced, ~1 invite delay)
+      end
+      -- otherwise keep waiting -- a later, clearer "yes" still triggers it
     end
   elseif event == "PLAYER_REGEN_DISABLED" then
     inCombat = true
@@ -562,6 +671,7 @@ local function GR_OnUpdate()
         if not GuildRecruiter_Settings.history then GuildRecruiter_Settings.history = {} end
         GuildRecruiter_Settings.history[name] = time()
         stats.invited = stats.invited + 1
+        TallyBump("invited")
         Print("Invited (replied) "..name.." ("..stats.invited..")")
         inviteTimer = Pace(GuildRecruiter_Settings.inviteDelay)
       elseif not CapReached() then
@@ -676,8 +786,8 @@ end
 local listFrame, listMode = nil, "queue"
 local listData = {}
 local NUM_ROWS, ROW_HEIGHT = 13, 18
-local LIST_ORDER = { "queue", "blacklist", "history" }
-local LIST_TITLE = { queue = "Queue (this run)", blacklist = "Blacklist", history = "Invite history" }
+local LIST_ORDER = { "queue", "blacklist", "history", "affirmatives" }
+local LIST_TITLE = { queue = "Queue (this run)", blacklist = "Blacklist", history = "Invite history", affirmatives = "Affirmative replies" }
 
 local function BuildListData()
   listData = {}
@@ -685,6 +795,9 @@ local function BuildListData()
     for i = 1, table.getn(contactQueue) do tinsert(listData, contactQueue[i]) end
   elseif listMode == "blacklist" then
     for n in GuildRecruiter_Settings.blacklist do tinsert(listData, n) end
+    table.sort(listData)
+  elseif listMode == "affirmatives" then
+    for n in GuildRecruiter_Settings.affirmatives do tinsert(listData, n) end
     table.sort(listData)
   else
     for n in GuildRecruiter_Settings.history do tinsert(listData, n) end
@@ -699,6 +812,8 @@ local function RemoveListItem(name)
     end
   elseif listMode == "blacklist" then
     GuildRecruiter_Settings.blacklist[name] = nil
+  elseif listMode == "affirmatives" then
+    GuildRecruiter_Settings.affirmatives[name] = nil
   else
     GuildRecruiter_Settings.history[name] = nil
   end
@@ -767,13 +882,18 @@ local function BuildListWindow()
   local function doAdd()
     local n = addEdit:GetText()
     if n and n ~= "" then
-      GuildRecruiter_Settings.blacklist[string.lower(n)] = true
-      addEdit:SetText(""); listMode = "blacklist"; UpdateList()
+      if listMode == "affirmatives" then
+        GuildRecruiter_Settings.affirmatives[string.lower(n)] = true
+      else
+        GuildRecruiter_Settings.blacklist[string.lower(n)] = true
+        listMode = "blacklist"
+      end
+      addEdit:SetText(""); UpdateList()
     end
   end
   local addBtn = CreateFrame("Button", nil, fr, "UIPanelButtonTemplate")
   addBtn:SetPoint("LEFT", addEdit, "RIGHT", 8, 0); addBtn:SetWidth(92); addBtn:SetHeight(22)
-  addBtn:SetText("Blacklist"); addBtn:SetScript("OnClick", doAdd)
+  addBtn:SetText("Add"); addBtn:SetScript("OnClick", doAdd)
   addEdit:SetScript("OnEnterPressed", function() doAdd(); this:ClearFocus() end)
   addEdit:SetScript("OnEscapePressed", function() this:ClearFocus() end)
 
@@ -973,8 +1093,11 @@ local function BuildConfig()
   fr.quietCheck    = MakeCheck(fr, "GuildRecruiterConfigQuiet",    "Quiet /who chat",              186, -248, "quietWho")
   fr.instanceCheck = MakeCheck(fr, "GuildRecruiterConfigInstance", "Pause in instances",           186, -274, "skipInstance")
   local listsBtn = CreateFrame("Button", nil, fr, "UIPanelButtonTemplate")
-  listsBtn:SetPoint("TOPLEFT", 188, -302); listsBtn:SetWidth(146); listsBtn:SetHeight(22)
-  listsBtn:SetText("Lists / blacklist..."); listsBtn:SetScript("OnClick", function() ToggleList() end)
+  listsBtn:SetPoint("TOPLEFT", 188, -302); listsBtn:SetWidth(70); listsBtn:SetHeight(22)
+  listsBtn:SetText("Lists"); listsBtn:SetScript("OnClick", function() ToggleList() end)
+  local statsBtn = CreateFrame("Button", nil, fr, "UIPanelButtonTemplate")
+  statsBtn:SetPoint("LEFT", listsBtn, "RIGHT", 6, 0); statsBtn:SetWidth(72); statsBtn:SetHeight(22)
+  statsBtn:SetText("Stats"); statsBtn:SetScript("OnClick", function() GuildRecruiter_ToggleStats() end)
 
   -- live status + progress
   fr.status = fr:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
@@ -1023,6 +1146,163 @@ local function ToggleConfig()
   if not configFrame then BuildConfig() end
   if configFrame:IsVisible() then configFrame:Hide()
   else RefreshConfig(); configFrame:Show() end
+end
+
+-- ---------------------------------------------------------------------------
+-- Profiles (swappable named setting snapshots; persisted in SavedVariables)
+-- ---------------------------------------------------------------------------
+local function CopyValue(v)
+  if type(v) == "table" then
+    local c = {}
+    for k, x in v do c[k] = CopyValue(x) end
+    return c
+  end
+  return v
+end
+
+local function SaveProfile(name)
+  if not name or name == "" then return false end
+  GuildRecruiter_Settings.profiles = GuildRecruiter_Settings.profiles or {}
+  local p = {}
+  for i = 1, table.getn(PROFILE_KEYS) do
+    local k = PROFILE_KEYS[i]
+    p[k] = CopyValue(GuildRecruiter_Settings[k])
+  end
+  GuildRecruiter_Settings.profiles[name] = p
+  GuildRecruiter_Settings.activeProfile = name
+  return true
+end
+
+local function LoadProfile(name)
+  local prof = GuildRecruiter_Settings.profiles and GuildRecruiter_Settings.profiles[name]
+  if not prof then return false end
+  for i = 1, table.getn(PROFILE_KEYS) do
+    local k = PROFILE_KEYS[i]
+    if prof[k] ~= nil then GuildRecruiter_Settings[k] = CopyValue(prof[k]) end
+  end
+  GuildRecruiter_Settings.activeProfile = name
+  RecomputeBand(); RefreshConfig()
+  return true
+end
+
+local function DeleteProfile(name)
+  if GuildRecruiter_Settings.profiles then GuildRecruiter_Settings.profiles[name] = nil end
+  if GuildRecruiter_Settings.activeProfile == name then GuildRecruiter_Settings.activeProfile = nil end
+end
+
+-- ---------------------------------------------------------------------------
+-- Stats & Profiles window
+-- ---------------------------------------------------------------------------
+local statsFrame
+local function Rate(j, d)
+  local t = j + d
+  if t <= 0 then return "--" end
+  return math.floor(j / t * 100 + 0.5) .. "%"
+end
+
+local RefreshStats  -- forward decl
+
+local function BuildStatsWindow()
+  local fr = CreateFrame("Frame", "GuildRecruiterStats", UIParent)
+  fr:SetWidth(320); fr:SetHeight(360)
+  fr:SetPoint("CENTER", -180, 0)
+  fr:SetFrameStrata("DIALOG")
+  fr:SetBackdrop({
+    bgFile = "Interface\\DialogFrame\\UI-DialogBox-Background",
+    edgeFile = "Interface\\DialogFrame\\UI-DialogBox-Border",
+    tile = true, tileSize = 32, edgeSize = 32,
+    insets = { left = 11, right = 12, top = 12, bottom = 11 },
+  })
+  fr:EnableMouse(true); fr:SetMovable(true); fr:RegisterForDrag("LeftButton")
+  fr:SetScript("OnDragStart", function() this:StartMoving() end)
+  fr:SetScript("OnDragStop", function() this:StopMovingOrSizing() end)
+  fr:Hide()
+
+  local title = fr:CreateFontString(nil, "ARTWORK", "GameFontNormal")
+  title:SetPoint("TOP", 0, -16); title:SetText("Guild Recruiter -- Stats & Profiles")
+  local close = CreateFrame("Button", nil, fr, "UIPanelCloseButton")
+  close:SetPoint("TOPRIGHT", -6, -6)
+
+  local plabel = fr:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
+  plabel:SetPoint("TOPLEFT", 18, -42); plabel:SetText("Profile:")
+  local pedit = CreateFrame("EditBox", "GuildRecruiterStatsProfile", fr, "InputBoxTemplate")
+  pedit:SetPoint("TOPLEFT", 70, -38); pedit:SetWidth(150); pedit:SetHeight(20)
+  pedit:SetAutoFocus(false); pedit:SetMaxLetters(24)
+  pedit:SetScript("OnEscapePressed", function() this:ClearFocus() end)
+  local saveB = CreateFrame("Button", nil, fr, "UIPanelButtonTemplate")
+  saveB:SetPoint("TOPLEFT", 18, -64); saveB:SetWidth(80); saveB:SetHeight(22); saveB:SetText("Save")
+  local loadB = CreateFrame("Button", nil, fr, "UIPanelButtonTemplate")
+  loadB:SetPoint("LEFT", saveB, "RIGHT", 6, 0); loadB:SetWidth(80); loadB:SetHeight(22); loadB:SetText("Load")
+  local delB = CreateFrame("Button", nil, fr, "UIPanelButtonTemplate")
+  delB:SetPoint("LEFT", loadB, "RIGHT", 6, 0); delB:SetWidth(80); delB:SetHeight(22); delB:SetText("Delete")
+  saveB:SetScript("OnClick", function() if SaveProfile(pedit:GetText()) then RefreshStats() end end)
+  loadB:SetScript("OnClick", function() if LoadProfile(pedit:GetText()) then RefreshStats() end end)
+  delB:SetScript("OnClick", function() DeleteProfile(pedit:GetText()); RefreshStats() end)
+
+  fr.profileText = fr:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
+  fr.profileText:SetPoint("TOPLEFT", 18, -96); fr.profileText:SetWidth(286); fr.profileText:SetJustifyH("LEFT")
+
+  fr.text = fr:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
+  fr.text:SetPoint("TOPLEFT", 18, -142); fr.text:SetWidth(286); fr.text:SetJustifyH("LEFT")
+
+  local resetB = CreateFrame("Button", nil, fr, "UIPanelButtonTemplate")
+  resetB:SetPoint("BOTTOMRIGHT", -16, 16); resetB:SetWidth(110); resetB:SetHeight(22); resetB:SetText("Reset stats")
+  resetB:SetScript("OnClick", function()
+    GuildRecruiter_Settings.tally = { totals = { invited=0, whispered=0, joined=0, declined=0 }, days = {} }
+    RefreshStats()
+  end)
+
+  fr.tick = 0
+  fr:SetScript("OnUpdate", function()
+    fr.tick = fr.tick - (arg1 or 0)
+    if fr.tick > 0 then return end
+    fr.tick = 1.0
+    RefreshStats()
+  end)
+
+  statsFrame = fr
+end
+
+RefreshStats = function()
+  if not statsFrame then return end
+  local t = GuildRecruiter_Settings.tally
+  local tot = t.totals
+  local lines = {}
+  tinsert(lines, "|cffffd100Lifetime|r")
+  tinsert(lines, "Invited "..tot.invited.."    Whispered "..tot.whispered)
+  tinsert(lines, "Joined "..tot.joined.."    Declined "..tot.declined.."    Join rate "..Rate(tot.joined, tot.declined))
+  tinsert(lines, " ")
+  tinsert(lines, "|cffffd100Recent days|r")
+  local keys = {}
+  for d in t.days do tinsert(keys, d) end
+  table.sort(keys)
+  local n = table.getn(keys)
+  if n == 0 then tinsert(lines, "(no activity yet)") end
+  local first = n - 7; if first < 1 then first = 1 end
+  for i = first, n do
+    local d = keys[i]; local r = t.days[d]
+    local label = d
+    if string.len(d) == 8 then label = string.sub(d, 5, 6).."/"..string.sub(d, 7, 8) end
+    tinsert(lines, label..":  inv "..(r.invited or 0)..", wsp "..(r.whispered or 0)
+                 ..", join "..(r.joined or 0)..", dec "..(r.declined or 0)
+                 .."  ("..Rate(r.joined or 0, r.declined or 0)..")")
+  end
+  statsFrame.text:SetText(table.concat(lines, "\n"))
+
+  local pnames = {}
+  if GuildRecruiter_Settings.profiles then
+    for nm in GuildRecruiter_Settings.profiles do tinsert(pnames, nm) end
+  end
+  table.sort(pnames)
+  statsFrame.profileText:SetText("Active profile: |cff33ff99"..(GuildRecruiter_Settings.activeProfile or "(unsaved)")
+    .."|r\nSaved: "..(table.getn(pnames) > 0 and table.concat(pnames, ", ") or "(none)"))
+end
+
+-- global so the config window's Stats button can reach it regardless of load order
+function GuildRecruiter_ToggleStats()
+  Defaults()
+  if not statsFrame then BuildStatsWindow() end
+  if statsFrame:IsVisible() then statsFrame:Hide() else RefreshStats(); statsFrame:Show() end
 end
 
 -- ---------------------------------------------------------------------------
@@ -1111,6 +1391,36 @@ SlashCmdList["GUILDRECRUITER"] = function(msg)
   elseif cmd == "status" then Status()
   elseif cmd == "config" or cmd == "options" or cmd == "gui" then ToggleConfig()
   elseif cmd == "list" or cmd == "lists" then ToggleList()
+  elseif cmd == "stats" then GuildRecruiter_ToggleStats()
+  elseif cmd == "profile" then
+    local _, _, sub, pname = string.find(arg or "", "^(%a+)%s*(.*)$")
+    sub = sub and string.lower(sub) or ""
+    if sub == "save" and pname ~= "" then
+      SaveProfile(pname); Print("Saved profile '"..pname.."'.")
+    elseif sub == "load" and pname ~= "" then
+      if LoadProfile(pname) then Print("Loaded profile '"..pname.."'.") else Print("No profile '"..pname.."'.") end
+    elseif sub == "delete" and pname ~= "" then
+      DeleteProfile(pname); Print("Deleted profile '"..pname.."'.")
+    elseif sub == "list" then
+      local names = ""
+      if GuildRecruiter_Settings.profiles then for nm in GuildRecruiter_Settings.profiles do names = names..nm..", " end end
+      Print("Profiles: "..(names ~= "" and names or "(none)").."  -- active: "..(GuildRecruiter_Settings.activeProfile or "(unsaved)"))
+    else
+      Print("Usage: /gr profile save|load|delete <name> | profile list")
+    end
+  elseif cmd == "affirm" then
+    local _, _, sub, phrase = string.find(larg, "^(%a+)%s*(.*)$")
+    if sub == "add" and phrase ~= "" then
+      GuildRecruiter_Settings.affirmatives[phrase] = true; Print("Added affirmative '"..phrase.."'.")
+    elseif sub == "remove" and phrase ~= "" then
+      GuildRecruiter_Settings.affirmatives[phrase] = nil; Print("Removed affirmative '"..phrase.."'.")
+    elseif sub == "list" then
+      local a = ""
+      for p in GuildRecruiter_Settings.affirmatives do a = a..p..", " end
+      Print("Affirmatives: "..a)
+    else
+      Print("Usage: /gr affirm add|remove <phrase> | affirm list")
+    end
   elseif cmd == "reset" then
     seen = {}; Print("Cleared this session's scan list (history kept).")
   elseif cmd == "forget" then
@@ -1168,18 +1478,19 @@ SlashCmdList["GUILDRECRUITER"] = function(msg)
     else
       Print("set invite|who|reinvite|cap|min|max <n> | set method auto|byname|invite|chat | set mode invite|whisper|whisperinvite")
     end
-  elseif cmd == "jitter" or cmd == "sync" or cmd == "combat" or cmd == "instance" or cmd == "quiet" then
-    local keymap = { jitter="jitter", sync="guildSync", combat="skipCombat", instance="skipInstance", quiet="quietWho" }
+  elseif cmd == "jitter" or cmd == "sync" or cmd == "combat" or cmd == "instance" or cmd == "quiet" or cmd == "affirmonly" then
+    local keymap = { jitter="jitter", sync="guildSync", combat="skipCombat", instance="skipInstance", quiet="quietWho", affirmonly="affirmOnly" }
     local key = keymap[cmd]
     GuildRecruiter_Settings[key] = (larg == "on") or (larg ~= "off" and not GuildRecruiter_Settings[key])
     if cmd == "sync" then RecomputeBand() end
     RefreshConfig()
     Print(cmd.." "..(GuildRecruiter_Settings[key] and "ON" or "OFF"))
   else
-    Print("|cff33ff99GuildRecruiter v"..VERSION.."|r  --  /gr config (settings), /gr list (queue/blacklist/history)")
+    Print("|cff33ff99GuildRecruiter v"..VERSION.."|r  --  /gr config, /gr list, /gr stats")
     Print("start | stop | pause | resume | status | reset | forget | hide")
     Print("set invite/who/reinvite/cap/min/max/method/mode <v> | msg <text> | class <list|all>")
-    Print("black add/remove/list <name> | jitter/sync/combat/instance/quiet [on|off]")
+    Print("profile save/load/delete/list <name> | affirm add/remove/list <phrase>")
+    Print("black add/remove/list <name> | jitter/sync/combat/instance/quiet/affirmonly [on|off]")
   end
 end
 

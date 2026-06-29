@@ -38,7 +38,34 @@ CONTACT MODES  (/gr set mode ...)
 ---------------------------------
   invite          Send a guild invite (default; original behaviour).
   whisper         Send only a whisper -- no invite. More polite / less spammy.
-  whisperinvite   Whisper first; if the player whispers back, THEN invite them.
+  whisperinvite   Whisper first; then auto-invite (~1s later) ONLY if they reply
+                  with something affirmative ("yes", "sure", "invite me", ...).
+
+AFFIRMATIVE REPLIES (whisperinvite mode)
+----------------------------------------
+With "affirm only" on (default), a whisper reply only triggers an invite if it
+matches the affirmative library -- a big editable list of yes-phrases. A reply
+containing a negative ("no thanks") never triggers an invite, and a vague reply
+("what guild?") keeps the person on hold so a later "ok" still works.
+  /gr affirmonly on|off     Require an affirmative (off = invite on ANY reply).
+  /gr affirm add <phrase>   Add a yes-phrase (also editable in the list window).
+  /gr affirm remove <phrase>
+  /gr affirm list
+
+PROFILES (swappable setting presets, saved across logout)
+---------------------------------------------------------
+Save your tuning (delays, mode, message, level range, filters, toggles...) as a
+named profile and switch between them -- e.g. a polite "whisper" profile and a
+fast "invite" profile. Managed in the Stats window or via slash:
+  /gr profile save <name> | load <name> | delete <name> | list
+
+STATS  (/gr stats)
+------------------
+Tracks invited / whispered / joined / declined with a join-rate %, both lifetime
+and per-day, saved across logouts so you can compare over time. Joins are
+attributed to you only for people you contacted; declines of your invites always
+count. (Detection reads the client's guild join/decline messages; if your core's
+wording differs and counts look off, tell me the exact text.)
 
 Whisper text is editable (/gr msg <text> or the settings window). Tokens:
   %p = player name      %g = your guild name
