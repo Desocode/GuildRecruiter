@@ -1,0 +1,8 @@
+# editor / backup cruft
+*.bak
+*.swp
+*~
+
+# WoW writes these per-account, not part of the addon source
+SavedVariables/
+*.lua.bak
