@@ -1498,6 +1498,8 @@ local function Status()
 end
 
 SLASH_GUILDRECRUITER1 = "/gr"
+SLASH_GUILDRECRUITER2 = "/grecruit"       -- fallback aliases in case another
+SLASH_GUILDRECRUITER3 = "/guildrecruiter" -- addon has already claimed /gr
 SlashCmdList["GUILDRECRUITER"] = function(msg)
   Defaults()
   msg = msg or ""
@@ -1639,3 +1641,7 @@ SlashCmdList["GUILDRECRUITER"] = function(msg)
 end
 
 -- (init happens on VARIABLES_LOADED, once SavedVariables are actually loaded)
+
+-- end-of-chunk marker: if you see this in chat on load, the whole file compiled
+-- and ran, so /gr (and /grecruit, /guildrecruiter) are registered
+DEFAULT_CHAT_FRAME:AddMessage("|cff33ff99GuildRecruiter|r v"..VERSION.." ready -- type /gr or /grecruit")
