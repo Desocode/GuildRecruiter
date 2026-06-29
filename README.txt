@@ -71,6 +71,22 @@ attributed to you only for people you contacted; declines of your invites always
 count. (Detection reads the client's guild join/decline messages; if your core's
 wording differs and counts look off, tell me the exact text.)
 
+A/B TESTING (compare configs simultaneously)
+---------------------------------------------
+Find out which approach actually converts better. Flag 2+ saved profiles as
+variants, turn A/B on, and every player you contact is randomly dealt one
+variant -- so both run in the same hour over the same /who population (a fair
+test). Only the per-contact settings differ between variants (whisper message,
+mode, invite method, affirm-only); run-level settings (delays, levels, pacing)
+are shared. Each variant's contacted / joined / declined and conversion % show
+in the Stats tab.
+  /gr ab add <profile>   (do this for 2+ profiles)
+  /gr ab on              (then recruit normally)
+  /gr ab off | clear
+Even with A/B off, stats are tagged by the active profile, so you can also just
+run profile A for a while, switch to B, and compare. A/B stats are per-account
+(they merge across your own alts, not across other guildmates).
+
 Whisper text is editable (/gr msg <text> or the settings window). Tokens:
   %p = player name      %g = your guild name
 Default: "Hi %p! :) I'm recruiting for <%g>, a friendly and active guild that
