@@ -19,7 +19,7 @@
 
 GuildRecruiter_Settings = GuildRecruiter_Settings or {}
 
-local VERSION    = "3.1"
+local VERSION    = "3.2"
 local CAP_HINT   = 49      -- treat a query returning >= this many as truncated
 local START_WIDTH = 10     -- initial level-band width to try
 local WHO_TIMEOUT = 12     -- give up waiting on a reply after this many seconds
@@ -988,6 +988,20 @@ local function Label(parent, text, x, y)
   return fs
 end
 
+-- a categorised section subheading (gold caption + a faint underline) so option
+-- panels are always grouped, never a flat wall of controls
+local function Header(parent, text, y)
+  local h = parent:CreateFontString(nil, "ARTWORK", "GameFontNormal")
+  h:SetPoint("TOPLEFT", parent, "TOPLEFT", 16, y)
+  h:SetText(text); h:SetTextColor(1, 0.82, 0)
+  local ln = parent:CreateTexture(nil, "ARTWORK")
+  ln:SetTexture(1, 0.82, 0, 0.3)
+  ln:SetPoint("TOPLEFT", parent, "TOPLEFT", 16, y - 15)
+  ln:SetPoint("TOPRIGHT", parent, "TOPRIGHT", -16, y - 15)
+  ln:SetHeight(1)
+  return h
+end
+
 RefreshConfig = function()
   if not configFrame then return end
   local s = GuildRecruiter_Settings
@@ -1023,46 +1037,48 @@ local function BuildSettingsPanel(parent)
   local fr = CreateFrame("Frame", "GuildRecruiterConfig", parent)
   fr:SetAllPoints(parent)
 
-  fr.inviteSlider, fr.inviteEdit = MakeSlider(fr, "GuildRecruiterConfigInvite", "Invite/contact delay (s)", INVITE_MIN, INVITE_MAX, -48, ApplyInvite)
-  fr.whoSlider,    fr.whoEdit    = MakeSlider(fr, "GuildRecruiterConfigWho",    "/who delay (s)",           WHO_MIN,    WHO_MAX,    -92, ApplyWho)
+  Header(fr, "Pacing & timing", -40)
+  fr.inviteSlider, fr.inviteEdit = MakeSlider(fr, "GuildRecruiterConfigInvite", "Invite/contact delay (s)", INVITE_MIN, INVITE_MAX, -78, ApplyInvite)
+  fr.whoSlider,    fr.whoEdit    = MakeSlider(fr, "GuildRecruiterConfigWho",    "/who delay (s)",           WHO_MIN,    WHO_MAX,    -120, ApplyWho)
+  fr.jitterCheck   = MakeCheck(fr, "GuildRecruiterConfigJitter", "Random delays (harder to pattern-detect)", 20, -150, "jitter")
 
-  Label(fr, "Invite method:", 24, -128)
+  Header(fr, "Recruitment & messaging", -182)
+  Label(fr, "Invite method:", 24, -216)
   fr.methodBtn = CreateFrame("Button", "GuildRecruiterConfigMethodBtn", fr, "UIPanelButtonTemplate")
-  fr.methodBtn:SetPoint("TOPLEFT", 150, -124); fr.methodBtn:SetWidth(184); fr.methodBtn:SetHeight(22)
+  fr.methodBtn:SetPoint("TOPLEFT", 150, -212); fr.methodBtn:SetWidth(184); fr.methodBtn:SetHeight(22)
   fr.methodBtn:SetScript("OnClick", function() CycleMethod() end)
-
-  Label(fr, "Mode:", 24, -154)
+  Label(fr, "Mode:", 24, -242)
   fr.modeBtn = CreateFrame("Button", "GuildRecruiterConfigModeBtn", fr, "UIPanelButtonTemplate")
-  fr.modeBtn:SetPoint("TOPLEFT", 150, -150); fr.modeBtn:SetWidth(184); fr.modeBtn:SetHeight(22)
+  fr.modeBtn:SetPoint("TOPLEFT", 150, -238); fr.modeBtn:SetWidth(184); fr.modeBtn:SetHeight(22)
   fr.modeBtn:SetScript("OnClick", function() CycleMode() end)
-
-  Label(fr, "Whisper message (%p = name, %g = guild):", 24, -178)
+  fr.affirmCheck = MakeCheck(fr, "GuildRecruiterConfigAffirm", "Invite only on a 'yes' reply", 20, -264, "affirmOnly")
+  Label(fr, "Whisper message (%p = name, %g = guild):", 24, -290)
   fr.whisperEdit = CreateFrame("EditBox", "GuildRecruiterConfigWhisper", fr, "InputBoxTemplate")
-  fr.whisperEdit:SetPoint("TOPLEFT", 26, -192); fr.whisperEdit:SetWidth(300); fr.whisperEdit:SetHeight(20)
+  fr.whisperEdit:SetPoint("TOPLEFT", 26, -306); fr.whisperEdit:SetWidth(300); fr.whisperEdit:SetHeight(20)
   fr.whisperEdit:SetAutoFocus(false); fr.whisperEdit:SetMaxLetters(255)
   fr.whisperEdit:SetScript("OnEnterPressed", function() GuildRecruiter_Settings.whisperMsg = this:GetText(); this:ClearFocus() end)
   fr.whisperEdit:SetScript("OnEscapePressed", function() this:ClearFocus() end)
 
-  Label(fr, "Levels", 24, -222)
-  fr.minEdit = MakeNumBox(fr, "GuildRecruiterConfigMin", 70, -218, 34, 2, function(v) SetMinLevel(v) end)
-  Label(fr, "to", 112, -222)
-  fr.maxEdit = MakeNumBox(fr, "GuildRecruiterConfigMax", 132, -218, 34, 2, function(v) SetMaxLevel(v) end)
-  Label(fr, "Session cap (0=off)", 186, -222)
-  fr.capEdit = MakeNumBox(fr, "GuildRecruiterConfigCap", 300, -218, 34, 4, function(v) GuildRecruiter_Settings.sessionCap = clamp(math.floor(v), 0, 9999) end)
+  Header(fr, "Targeting", -340)
+  Label(fr, "Levels", 24, -374)
+  fr.minEdit = MakeNumBox(fr, "GuildRecruiterConfigMin", 70, -370, 34, 2, function(v) SetMinLevel(v) end)
+  Label(fr, "to", 112, -374)
+  fr.maxEdit = MakeNumBox(fr, "GuildRecruiterConfigMax", 132, -370, 34, 2, function(v) SetMaxLevel(v) end)
+  Label(fr, "Session cap (0=off)", 186, -374)
+  fr.capEdit = MakeNumBox(fr, "GuildRecruiterConfigCap", 300, -370, 34, 4, function(v) GuildRecruiter_Settings.sessionCap = clamp(math.floor(v), 0, 9999) end)
 
-  fr.jitterCheck   = MakeCheck(fr, "GuildRecruiterConfigJitter",   "Random delays (anti-pattern)", 22,  -248, "jitter")
-  fr.syncCheck     = MakeCheck(fr, "GuildRecruiterConfigSync",     "Guild sync (dedup + split)",   22,  -274, "guildSync")
-  fr.combatCheck   = MakeCheck(fr, "GuildRecruiterConfigCombat",   "Pause in combat",              22,  -300, "skipCombat")
-  fr.quietCheck    = MakeCheck(fr, "GuildRecruiterConfigQuiet",    "Quiet /who chat",              186, -248, "quietWho")
-  fr.instanceCheck = MakeCheck(fr, "GuildRecruiterConfigInstance", "Pause in instances",           186, -274, "skipInstance")
-  fr.affirmCheck   = MakeCheck(fr, "GuildRecruiterConfigAffirm",   "Invite only on 'yes' reply",   186, -300, "affirmOnly")
+  Header(fr, "Coordination & safety", -406)
+  fr.syncCheck     = MakeCheck(fr, "GuildRecruiterConfigSync",     "Guild sync (dedup + split)", 20,  -434, "guildSync")
+  fr.quietCheck    = MakeCheck(fr, "GuildRecruiterConfigQuiet",    "Quiet /who chat",            186, -434, "quietWho")
+  fr.combatCheck   = MakeCheck(fr, "GuildRecruiterConfigCombat",   "Pause in combat",            20,  -460, "skipCombat")
+  fr.instanceCheck = MakeCheck(fr, "GuildRecruiterConfigInstance", "Pause in instances",         186, -460, "skipInstance")
 
-  -- live status + progress
+  Header(fr, "Run", -508)
   fr.status = fr:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
-  fr.status:SetPoint("TOPLEFT", 24, -332); fr.status:SetWidth(310); fr.status:SetJustifyH("LEFT")
+  fr.status:SetPoint("TOPLEFT", 24, -528); fr.status:SetWidth(312); fr.status:SetJustifyH("LEFT")
 
   fr.bar = CreateFrame("StatusBar", nil, fr)
-  fr.bar:SetPoint("TOPLEFT", 24, -352); fr.bar:SetWidth(310); fr.bar:SetHeight(14)
+  fr.bar:SetPoint("TOPLEFT", 24, -544); fr.bar:SetWidth(312); fr.bar:SetHeight(14)
   fr.bar:SetStatusBarTexture("Interface\\TargetingFrame\\UI-StatusBar")
   fr.bar:SetStatusBarColor(0.2, 0.8, 0.3)
   fr.bar:SetMinMaxValues(0, 1); fr.bar:SetValue(0)
@@ -1071,7 +1087,7 @@ local function BuildSettingsPanel(parent)
 
   -- start / pause / stop (pause label flips to Resume while paused)
   local startBtn = CreateFrame("Button", nil, fr, "UIPanelButtonTemplate")
-  startBtn:SetPoint("BOTTOMLEFT", 22, 18); startBtn:SetWidth(100); startBtn:SetHeight(22)
+  startBtn:SetPoint("BOTTOMLEFT", 22, 16); startBtn:SetWidth(100); startBtn:SetHeight(22)
   startBtn:SetText("Start"); startBtn:SetScript("OnClick", function() Start() end)
   local pauseBtn = CreateFrame("Button", nil, fr, "UIPanelButtonTemplate")
   pauseBtn:SetPoint("LEFT", startBtn, "RIGHT", 7, 0); pauseBtn:SetWidth(100); pauseBtn:SetHeight(22)
@@ -1158,14 +1174,15 @@ local function BuildStatsPanel(parent)
   local fr = CreateFrame("Frame", "GuildRecruiterStats", parent)
   fr:SetAllPoints(parent)
 
+  Header(fr, "Profiles", -40)
   local plabel = fr:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
-  plabel:SetPoint("TOPLEFT", 18, -42); plabel:SetText("Profile:")
+  plabel:SetPoint("TOPLEFT", 18, -64); plabel:SetText("Name:")
   local pedit = CreateFrame("EditBox", "GuildRecruiterStatsProfile", fr, "InputBoxTemplate")
-  pedit:SetPoint("TOPLEFT", 70, -38); pedit:SetWidth(150); pedit:SetHeight(20)
+  pedit:SetPoint("TOPLEFT", 70, -60); pedit:SetWidth(150); pedit:SetHeight(20)
   pedit:SetAutoFocus(false); pedit:SetMaxLetters(24)
   pedit:SetScript("OnEscapePressed", function() this:ClearFocus() end)
   local saveB = CreateFrame("Button", nil, fr, "UIPanelButtonTemplate")
-  saveB:SetPoint("TOPLEFT", 18, -64); saveB:SetWidth(80); saveB:SetHeight(22); saveB:SetText("Save")
+  saveB:SetPoint("TOPLEFT", 18, -86); saveB:SetWidth(80); saveB:SetHeight(22); saveB:SetText("Save")
   local loadB = CreateFrame("Button", nil, fr, "UIPanelButtonTemplate")
   loadB:SetPoint("LEFT", saveB, "RIGHT", 6, 0); loadB:SetWidth(80); loadB:SetHeight(22); loadB:SetText("Load")
   local delB = CreateFrame("Button", nil, fr, "UIPanelButtonTemplate")
@@ -1175,10 +1192,11 @@ local function BuildStatsPanel(parent)
   delB:SetScript("OnClick", function() DeleteProfile(pedit:GetText()); RefreshStats() end)
 
   fr.profileText = fr:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
-  fr.profileText:SetPoint("TOPLEFT", 18, -96); fr.profileText:SetWidth(286); fr.profileText:SetJustifyH("LEFT")
+  fr.profileText:SetPoint("TOPLEFT", 18, -116); fr.profileText:SetWidth(286); fr.profileText:SetJustifyH("LEFT")
 
+  Header(fr, "Statistics", -160)
   fr.text = fr:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
-  fr.text:SetPoint("TOPLEFT", 18, -142); fr.text:SetWidth(286); fr.text:SetJustifyH("LEFT")
+  fr.text:SetPoint("TOPLEFT", 18, -182); fr.text:SetWidth(286); fr.text:SetJustifyH("LEFT")
 
   local resetB = CreateFrame("Button", nil, fr, "UIPanelButtonTemplate")
   resetB:SetPoint("BOTTOMRIGHT", -16, 16); resetB:SetWidth(110); resetB:SetHeight(22); resetB:SetText("Reset stats")
@@ -1256,7 +1274,7 @@ end
 
 local function BuildUI()
   local m = CreateFrame("Frame", "GuildRecruiterUI", UIParent)
-  m:SetWidth(360); m:SetHeight(470)
+  m:SetWidth(360); m:SetHeight(600)
   m:SetPoint("CENTER", 0, 0)
   m:SetFrameStrata("DIALOG")
   m:SetBackdrop({
