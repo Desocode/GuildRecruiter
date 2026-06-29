@@ -19,7 +19,7 @@
 
 GuildRecruiter_Settings = GuildRecruiter_Settings or {}
 
-local VERSION    = "3.4"
+local VERSION    = "3.5"
 local CAP_HINT   = 49      -- treat a query returning >= this many as truncated
 local START_WIDTH = 10     -- initial level-band width to try
 local WHO_TIMEOUT = 12     -- give up waiting on a reply after this many seconds
@@ -924,9 +924,9 @@ local function BuildListsPanel(parent)
       addEdit:SetText(""); UpdateList()
     end
   end
-  local addBtn = CreateFrame("Button", nil, fr, "UIPanelButtonTemplate")
-  addBtn:SetPoint("LEFT", addEdit, "RIGHT", 8, 0); addBtn:SetWidth(92); addBtn:SetHeight(22)
-  addBtn:SetText("Add"); addBtn:SetScript("OnClick", doAdd)
+  fr.addBtn = CreateFrame("Button", nil, fr, "UIPanelButtonTemplate")
+  fr.addBtn:SetPoint("LEFT", addEdit, "RIGHT", 8, 0); fr.addBtn:SetWidth(110); fr.addBtn:SetHeight(22)
+  fr.addBtn:SetText("Blacklist"); fr.addBtn:SetScript("OnClick", doAdd)
   addEdit:SetScript("OnEnterPressed", function() doAdd(); this:ClearFocus() end)
   addEdit:SetScript("OnEscapePressed", function() this:ClearFocus() end)
 
@@ -950,6 +950,8 @@ UpdateList = function()
   end
   FauxScrollFrame_Update(listFrame.scroll, n, NUM_ROWS, ROW_HEIGHT)
   listFrame.cycle:SetText("View: "..(LIST_TITLE[listMode] or listMode).."  ("..n..")")
+  -- the add box adds a phrase when viewing affirmatives, else blacklists a name
+  listFrame.addBtn:SetText(listMode == "affirmatives" and "Add phrase" or "Blacklist")
 end
 
 -- ---------------------------------------------------------------------------
@@ -1050,6 +1052,17 @@ local function Header(parent, text, x, y, w)
   return h
 end
 
+-- attach an explanatory tooltip to any control (skip edit boxes -- they take focus)
+local function Tip(frame, title, body)
+  frame:SetScript("OnEnter", function()
+    GameTooltip:SetOwner(this, "ANCHOR_RIGHT")
+    GameTooltip:SetText(title, 1, 1, 1)
+    if body then GameTooltip:AddLine(body, 0.82, 0.82, 0.82, 1) end
+    GameTooltip:Show()
+  end)
+  frame:SetScript("OnLeave", function() GameTooltip:Hide() end)
+end
+
 RefreshConfig = function()
   if not configFrame then return end
   local s = GuildRecruiter_Settings
@@ -1090,11 +1103,17 @@ local function BuildSettingsPanel(parent)
   fr.inviteSlider, fr.inviteEdit = MakeSlider(fr, "GuildRecruiterConfigInvite", "Invite/contact delay (s)", INVITE_MIN, INVITE_MAX, -82, ApplyInvite)
   fr.whoSlider,    fr.whoEdit    = MakeSlider(fr, "GuildRecruiterConfigWho",    "/who delay (s)",           WHO_MIN,    WHO_MAX,    -122, ApplyWho)
   fr.jitterCheck   = MakeCheck(fr, "GuildRecruiterConfigJitter", "Random delays (anti-detection)", 20, -150, "jitter")
+  Tip(fr.inviteSlider, "Invite/contact delay", "Seconds between each invite or whisper. Lower = faster, but too fast risks a flood-kick.")
+  Tip(fr.whoSlider, "/who delay", "Seconds between /who scans. /who is server-throttled; raise this if scans get dropped.")
+  Tip(fr.jitterCheck, "Random delays", "Varies each delay a little so the timing isn't perfectly regular.")
 
   Header(fr, "Safety", 18, -186, 250)
   fr.quietCheck    = MakeCheck(fr, "GuildRecruiterConfigQuiet",    "Quiet /who chat",    20, -214, "quietWho")
   fr.combatCheck   = MakeCheck(fr, "GuildRecruiterConfigCombat",   "Pause in combat",    20, -240, "skipCombat")
   fr.instanceCheck = MakeCheck(fr, "GuildRecruiterConfigInstance", "Pause in instances", 20, -266, "skipInstance")
+  Tip(fr.quietCheck, "Quiet /who chat", "Hides the '/who' result spam in your chat frame while a run is active.")
+  Tip(fr.combatCheck, "Pause in combat", "Holds invites/whispers while you're in combat.")
+  Tip(fr.instanceCheck, "Pause in instances", "Holds invites/whispers while you're inside a dungeon or raid.")
 
   -- RIGHT column ----------------------------------------------------------
   Header(fr, "Recruiting", 292, -44, 250)
@@ -1102,12 +1121,16 @@ local function BuildSettingsPanel(parent)
   fr.methodBtn = CreateFrame("Button", "GuildRecruiterConfigMethodBtn", fr, "UIPanelButtonTemplate")
   fr.methodBtn:SetPoint("TOPLEFT", 296, -94); fr.methodBtn:SetWidth(244); fr.methodBtn:SetHeight(22)
   fr.methodBtn:SetScript("OnClick", function() CycleMethod() end)
+  Tip(fr.methodBtn, "Invite method (click to cycle)", "Which guild-invite function to use. Auto picks the best one for your server.")
   Label(fr, "Mode:", 298, -122)
   fr.modeBtn = CreateFrame("Button", "GuildRecruiterConfigModeBtn", fr, "UIPanelButtonTemplate")
   fr.modeBtn:SetPoint("TOPLEFT", 296, -138); fr.modeBtn:SetWidth(244); fr.modeBtn:SetHeight(22)
   fr.modeBtn:SetScript("OnClick", function() CycleMode() end)
+  Tip(fr.modeBtn, "Contact mode (click to cycle)", "Invite only, whisper only, or whisper then invite on a 'yes' reply.")
   fr.affirmCheck = MakeCheck(fr, "GuildRecruiterConfigAffirm", "Invite only on a 'yes' reply", 294, -166, "affirmOnly")
   fr.syncCheck   = MakeCheck(fr, "GuildRecruiterConfigSync",   "Guild sync (dedup + split)",   294, -190, "guildSync")
+  Tip(fr.affirmCheck, "Invite only on 'yes'", "In whisper-then-invite mode, only invite when a reply clearly says yes.")
+  Tip(fr.syncCheck, "Guild sync", "Coordinate with guildmates running this addon: share who's been contacted and split the level sweep.")
   Label(fr, "Whisper (%p name, %g guild):", 298, -216)
   fr.whisperEdit = CreateFrame("EditBox", "GuildRecruiterConfigWhisper", fr, "InputBoxTemplate")
   fr.whisperEdit:SetPoint("TOPLEFT", 298, -232); fr.whisperEdit:SetWidth(240); fr.whisperEdit:SetHeight(20)
@@ -1136,19 +1159,19 @@ local function BuildSettingsPanel(parent)
   local barbg = fr.bar:CreateTexture(nil, "BACKGROUND")
   barbg:SetAllPoints(fr.bar); barbg:SetTexture(0, 0, 0, 0.4)
 
-  -- start / pause / stop (pause label flips to Resume while paused)
-  local startBtn = CreateFrame("Button", nil, fr, "UIPanelButtonTemplate")
-  startBtn:SetPoint("BOTTOMLEFT", 22, 16); startBtn:SetWidth(100); startBtn:SetHeight(22)
-  startBtn:SetText("Start"); startBtn:SetScript("OnClick", function() Start() end)
-  local pauseBtn = CreateFrame("Button", nil, fr, "UIPanelButtonTemplate")
-  pauseBtn:SetPoint("LEFT", startBtn, "RIGHT", 7, 0); pauseBtn:SetWidth(100); pauseBtn:SetHeight(22)
-  pauseBtn:SetText("Pause"); pauseBtn:SetScript("OnClick", function() if paused then Resume() else Pause() end end)
-  local stopBtn = CreateFrame("Button", nil, fr, "UIPanelButtonTemplate")
-  stopBtn:SetPoint("LEFT", pauseBtn, "RIGHT", 7, 0); stopBtn:SetWidth(100); stopBtn:SetHeight(22)
-  stopBtn:SetText("Stop"); stopBtn:SetScript("OnClick", function() Stop() end)
-  fr.pauseBtn = pauseBtn
+  -- start / pause / stop (pause label flips to Resume while paused; buttons
+  -- enable/disable to match run state so invalid actions aren't clickable)
+  fr.startBtn = CreateFrame("Button", nil, fr, "UIPanelButtonTemplate")
+  fr.startBtn:SetPoint("BOTTOMLEFT", 22, 16); fr.startBtn:SetWidth(100); fr.startBtn:SetHeight(22)
+  fr.startBtn:SetText("Start"); fr.startBtn:SetScript("OnClick", function() Start() end)
+  fr.pauseBtn = CreateFrame("Button", nil, fr, "UIPanelButtonTemplate")
+  fr.pauseBtn:SetPoint("LEFT", fr.startBtn, "RIGHT", 7, 0); fr.pauseBtn:SetWidth(100); fr.pauseBtn:SetHeight(22)
+  fr.pauseBtn:SetText("Pause"); fr.pauseBtn:SetScript("OnClick", function() if paused then Resume() else Pause() end end)
+  fr.stopBtn = CreateFrame("Button", nil, fr, "UIPanelButtonTemplate")
+  fr.stopBtn:SetPoint("LEFT", fr.pauseBtn, "RIGHT", 7, 0); fr.stopBtn:SetWidth(100); fr.stopBtn:SetHeight(22)
+  fr.stopBtn:SetText("Stop"); fr.stopBtn:SetScript("OnClick", function() Stop() end)
 
-  -- throttled live refresh of the status line + bar
+  -- throttled live refresh of the status line, bar, and button states
   fr.tick = 0
   fr:SetScript("OnUpdate", function()
     fr.tick = fr.tick - (arg1 or 0)
@@ -1156,6 +1179,9 @@ local function BuildSettingsPanel(parent)
     fr.tick = 0.3
     fr.status:SetText(StatusLine())
     fr.pauseBtn:SetText(paused and "Resume" or "Pause")
+    if running then fr.startBtn:Disable() else fr.startBtn:Enable() end
+    if running then fr.pauseBtn:Enable() else fr.pauseBtn:Disable() end
+    if running then fr.stopBtn:Enable() else fr.stopBtn:Disable() end
     local span = myHi - myLo + 1
     local prog = 1
     if running and scanning and span > 0 then prog = clamp((lo - myLo) / span, 0, 1) end
@@ -1221,6 +1247,18 @@ end
 
 local RefreshStats  -- forward decl
 
+-- confirm before wiping analytics (destructive, not undoable)
+StaticPopupDialogs["GUILDRECRUITER_RESETSTATS"] = {
+  text = "Reset all Guild Recruiter stats (lifetime, per-day, and A/B)? This cannot be undone.",
+  button1 = "Reset", button2 = "Cancel",
+  OnAccept = function()
+    GuildRecruiter_Settings.tally = { totals = { invited=0, whispered=0, joined=0, declined=0 }, days = {} }
+    GuildRecruiter_Settings.varStats = {}
+    RefreshStats()
+  end,
+  timeout = 0, whileDead = 1, hideOnEscape = 1,
+}
+
 local function BuildStatsPanel(parent)
   local fr = CreateFrame("Frame", "GuildRecruiterStats", parent)
   fr:SetAllPoints(parent)
@@ -1273,11 +1311,7 @@ local function BuildStatsPanel(parent)
 
   local resetB = CreateFrame("Button", nil, fr, "UIPanelButtonTemplate")
   resetB:SetPoint("BOTTOMRIGHT", -16, 16); resetB:SetWidth(110); resetB:SetHeight(22); resetB:SetText("Reset stats")
-  resetB:SetScript("OnClick", function()
-    GuildRecruiter_Settings.tally = { totals = { invited=0, whispered=0, joined=0, declined=0 }, days = {} }
-    GuildRecruiter_Settings.varStats = {}
-    RefreshStats()
-  end)
+  resetB:SetScript("OnClick", function() StaticPopup_Show("GUILDRECRUITER_RESETSTATS") end)
 
   fr.tick = 0
   fr:SetScript("OnUpdate", function()
@@ -1384,6 +1418,7 @@ local function BuildUI()
   m:SetScript("OnDragStart", function() this:StartMoving() end)
   m:SetScript("OnDragStop", function() this:StopMovingOrSizing() end)
   m:Hide()
+  tinsert(UISpecialFrames, "GuildRecruiterUI")  -- Escape closes the window
 
   local title = m:CreateFontString(nil, "ARTWORK", "GameFontNormal")
   title:SetPoint("TOP", 0, -16); title:SetText("Guild Recruiter  v"..VERSION)
