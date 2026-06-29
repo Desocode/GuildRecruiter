@@ -1,118 +1,123 @@
-GuildRecruiter  --  vanilla 1.12 guild recruitment helper
-==========================================================
+GuildRecruiter  --  vanilla 1.12 / Turtle WoW guild recruitment helper   (v2.0)
+==============================================================================
 
-Scans online players with /who and sends paced guild invites to players who are
-NOT already in a guild. Built for vanilla (1.12) clients / private servers.
+Scans online players with /who and sends paced guild contacts (invite and/or
+whisper) to players who are NOT already in a guild. Built for vanilla (1.12)
+clients and Turtle WoW.
 
 
 INSTALL
 -------
-1. Extract the "GuildRecruiter" folder into:
-      <WoW>\Interface\AddOns\
-   You should end up with:
+1. The "GuildRecruiter" folder goes in:
       <WoW>\Interface\AddOns\GuildRecruiter\GuildRecruiter.toc
-2. FULLY RESTART the game (or log out to the character-select screen) the first
-   time -- a /reload will NOT register a brand-new addon folder.
-3. Make sure "GuildRecruiter" is enabled in the AddOns list at character select.
+2. FULLY RESTART the game the first time (a /reload won't register a new addon,
+   and the .toc version bump needs a restart too).
+3. Enable "GuildRecruiter" in the AddOns list at character select.
+
+On load it prints which invite API it detected (e.g. "Invite API:
+GuildInviteByName" on Turtle). If /ginvite works manually, the addon works.
 
 
-FIRST, CONFIRM YOUR SERVER'S INVITE METHOD
-------------------------------------------
-Different cores expose guild invites differently. Check once:
+QUICK START
+-----------
+  /gr config     Open the settings window (recommended).
+  /gr start      Begin scanning + contacting (or click the minimap button).
+  /gr stop       Halt. /gr pause + /gr resume keep your place.
 
-  Type this and see if it invites:
-      /ginvite SomeName
-
-  And print which Lua API exists:
-      /script DEFAULT_CHAT_FRAME:AddMessage(tostring(GuildInvite).." / "..tostring(GuildInviteByName))
-
-The addon uses GuildInviteByName() if present (Turtle WoW's canonical invite),
-then GuildInvite(), and finally falls back to running the /ginvite chat command
--- so if /ginvite works for you manually, the addon will work too. On load it
-prints which API it detected ("Invite API: GuildInviteByName" on Turtle). If your
-server uses a different command, say so and it can be pointed at that instead.
+A minimap button is added: LEFT-click opens settings, RIGHT-click starts/stops,
+drag it around the minimap to reposition.
 
 
-COMMANDS  (slash:  /gr)
------------------------
-  /gr start                Begin scanning + inviting.
-  /gr stop                 Halt the current run.
-  /gr status               Show progress + history size.
-  /gr config               Open the settings window (sliders + method picker).
-  /gr reset                Clear THIS session's scan list (keeps history).
-  /gr forget               Wipe the persistent invite history (everyone
-                           becomes invitable again).
-  /gr set invite <sec>     Seconds between guild invites (default 1, 1-10).
-  /gr set who <sec>        Seconds between /who queries (default 3, 1-15).
-  /gr set reinvite <days>  Don't re-invite someone within this many days
-                           (default 14; 0 = never re-invite anyone twice).
-  /gr set method <m>       Which invite function to use:
-                             auto   - best available (recommended)
-                             byname - force GuildInviteByName()
-                             invite - force GuildInvite()
-                             chat   - force the /ginvite chat command
+CONTACT MODES  (/gr set mode ...)
+---------------------------------
+  invite          Send a guild invite (default; original behaviour).
+  whisper         Send only a whisper -- no invite. More polite / less spammy.
+  whisperinvite   Whisper first; if the player whispers back, THEN invite them.
+
+Whisper text is editable (/gr msg <text> or the settings window). Tokens:
+  %p = player name      %g = your guild name
+Default: "Hi %p! We're recruiting for %g -- whisper me back if you're
+interested and I'll send an invite. :)"
+
+NOTE: blind mass guild invites break many servers' rules (Turtle included).
+Whisper or whisper-on-reply modes are the safer, better-received options.
 
 
-SETTINGS WINDOW  (/gr config)
+GUILD COORDINATION  (multiple recruiters, /gr sync on)
+------------------------------------------------------
+If several guildmates run this addon at once it coordinates over guild addon
+messages (invisible to everyone else):
+  * DEDUP  -- every contact is shared, so two recruiters never hit the same
+             person, and the re-invite cooldown becomes guild-wide.
+  * SPLIT  -- active recruiters announce themselves and the 1-60 sweep is
+             divided evenly between them (by name order) so they cover
+             different level bands instead of overlapping.
+Best-effort: only works for guildmates online at the same time on the same
+addon version. Dedup guarantees no double-invites even if the split rebalances.
+
+
+ANTI-PATTERN / SAFETY OPTIONS
 -----------------------------
-Opens a small draggable panel with:
-  * a slider AND a numeric input box for the invite delay (1-10s),
-  * a slider AND a numeric input box for the /who delay (1-15s),
-  * a button that cycles the invite method (auto / byname / invite / chat).
-Slider and input box stay in sync, and everything mirrors the /gr set commands
--- change it in either place. Settings are saved account-wide.
+  Random delays (/gr jitter on)   Varies each delay instead of fixed intervals
+                                  (e.g. invite 1s -> 1-2.2s) so timing isn't
+                                  clockwork-regular.
+  Auto-backoff                    Watches for the server's "too many / too
+                                  quickly" throttle message and pauses sends a
+                                  few seconds automatically.
+  Pause in combat (/gr combat on) Holds contacts while you're in combat.
+  Pause in instances              Holds contacts while inside an instance
+                                  (where the API exists on your client).
+  Session cap (/gr set cap <n>)   Stop after N contacts in a run (0 = no cap).
+  Blacklist (/gr black ...)       Never contact specific names.
+  Class filter (/gr class ...)    Only contact certain classes
+                                  (e.g. /gr class mage,priest; "all" clears).
+  Level range (/gr set min/max)   Only sweep part of 1-60 (e.g. 60-60 for a
+                                  max-level raiding guild).
 
 
-REMEMBERS WHO IT INVITED
-------------------------
-Every invite is saved ACCOUNT-WIDE to SavedVariables, so it survives /reload
-and game restarts AND is shared across all your characters -- recruit from any
-alt and they won't re-invite people another character already hit. On later
-runs, anyone you invited within the re-invite cooldown is skipped automatically.
-Stale entries (past the cooldown) are pruned and become invitable again, so you
-can keep recruiting over time without re-pestering recent declines. Use
-"/gr forget" to start completely fresh.
+ALL COMMANDS  (slash:  /gr)
+---------------------------
+  start | stop | pause | resume | status | config
+  reset                 Clear THIS session's scan list (keeps history).
+  forget                Wipe the persistent invite history.
+  hide                  Toggle auto-hiding the Who window during scans.
+  msg <text>            Set the whisper message.
+  class <list|all>      Class filter (comma/space separated, or "all").
+  black add|remove|list <name>
+  set invite <s>        Seconds between contacts (1-10).
+  set who <s>           Seconds between /who queries (1-15).
+  set reinvite <days>   Don't re-contact within this many days (0 = never twice).
+  set cap <n>           Session contact cap (0 = unlimited).
+  set min <lvl> / set max <lvl>   Level range to sweep.
+  set method auto|byname|invite|chat   Which guild-invite function to use.
+  set mode invite|whisper|whisperinvite
+  jitter|sync|combat|instance [on|off]
 
 
-HOW IT WORKS  (and its limits)
-------------------------------
-* /who is the only way to enumerate players in 1.12, it returns at most ~49
-  results per query, and it is server-throttled. The addon sweeps level bands,
-  widening them when a query comes back light and narrowing (then splitting by
-  class, then race) only where the population is dense -- so it spends as few
-  /who queries as possible and each one comes back as full as it can.
-* It only invites players with NO guild (it never spams people already guilded).
-* It never re-invites the same person within a run.
+HOW THE SCAN WORKS  (and its limits)
+------------------------------------
+* /who is the only way to enumerate players in 1.12; it returns at most ~49
+  results per query (server-side cap, NOT bypassable even on Turtle) and is
+  server-throttled. The addon sweeps level bands, widening when a query comes
+  back light and narrowing (then splitting by class) where the population is
+  dense -- spending as few /who queries as possible.
+* On start it calls SetWhoToUI(1) so every /who returns a readable result event
+  (otherwise small result sets leak to chat text and get missed).
+* It only contacts players with NO guild, skips anyone contacted within the
+  re-invite cooldown, and never contacts the same person twice in a run.
 * /who is faction-locked in 1.12, so it only scans your own faction.
 * Any runtime error stops the run cleanly with a "Stopped on error" message.
 
-TURTLE WOW NOTES
-----------------
-* Defaults are tuned for Turtle (invite 1s, who 3s) -- much faster than the old
-  conservative defaults built for throttle-harsh cores like Kronos.
-* On start the addon calls SetWhoToUI(1) so EVERY /who comes back as a readable
-  result event; without it, small result sets (<=3 players) leak to chat as text
-  the addon can't read, and those players would be silently missed.
-* The /who 50-result cap is server-side and CANNOT be bypassed (true on Turtle
-  too), which is why the adaptive level/class/race subdivision still earns its
-  keep -- it's the only way to enumerate a dense population fully.
 
-SCANNING AND INVITING RUN IN PARALLEL (not 1-scan-1-invite)
------------------------------------------------------------
-A single /who returns up to 50 players and queues ALL the guildless ones at once;
-a separate timer drains that queue at the invite delay. So invites are NOT gated
-1-per-scan -- if it ever felt that way, it was the old 4s invite pacing trickling
-a big queue out slowly. At the new 1s default the queue drains quickly.
+REMEMBERS WHO IT CONTACTED
+--------------------------
+Every contact is saved ACCOUNT-WIDE (and, with sync on, shared guild-wide), so
+it survives /reload and restarts and is shared across your characters. Stale
+entries past the cooldown are pruned automatically. "/gr forget" starts fresh.
 
-TUNING FOR YOUR SERVER
-----------------------
-If /who scans get silently dropped (server throttle), raise the spacing:
-      /gr set who 6
-Invites drain once per timer tick, so 1s is the practical floor -- going lower
-(per-frame) would flood-kick you. If even 1s causes issues, raise it.
 
 PLEASE NOTE
 -----------
 Mass recruitment is against the rules on many servers even when limited to
-guildless players. It's your account -- check your server's policy before
-running a full sweep.
+guildless players. It's your account -- check your server's policy. Whisper or
+whisper-on-reply mode is far less likely to get you reported than blind invites.
