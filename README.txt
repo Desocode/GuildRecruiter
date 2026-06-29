@@ -20,12 +20,16 @@ GuildInviteByName" on Turtle). If /ginvite works manually, the addon works.
 
 QUICK START
 -----------
-  /gr config     Open the settings window (recommended).
-  /gr list       Open the list window: view/edit the contact queue, the
-                 blacklist, and the invite history (click a name to remove it;
-                 add names to the blacklist from the box at the bottom).
+Everything lives in ONE window with three tabs along the bottom -- Settings,
+Lists, and Stats. Open it on any tab:
+  /gr config     Open on the Settings tab (sliders, mode, filters, run buttons).
+  /gr list       Open on the Lists tab: view/edit the contact queue, blacklist,
+                 invite history, and affirmative library (click a row to remove;
+                 add via the box at the bottom).
+  /gr stats      Open on the Stats tab: profiles + join/decline analytics.
   /gr start      Begin scanning + contacting (or click the minimap button).
   /gr stop       Halt. /gr pause + /gr resume keep your place.
+The minimap button: LEFT-click opens the window, RIGHT-click starts/stops.
 
 The /who chat spam ("N players total" etc.) is hidden while a run is active
 (/gr quiet off to show it).

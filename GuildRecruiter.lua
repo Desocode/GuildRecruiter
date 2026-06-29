@@ -19,7 +19,7 @@
 
 GuildRecruiter_Settings = GuildRecruiter_Settings or {}
 
-local VERSION    = "3.0"
+local VERSION    = "3.1"
 local CAP_HINT   = 49      -- treat a query returning >= this many as truncated
 local START_WIDTH = 10     -- initial level-band width to try
 local WHO_TIMEOUT = 12     -- give up waiting on a reply after this many seconds
@@ -821,26 +821,10 @@ end
 
 local UpdateList  -- forward decl (handlers below capture it)
 
-local function BuildListWindow()
-  local fr = CreateFrame("Frame", "GuildRecruiterList", UIParent)
-  fr:SetWidth(300); fr:SetHeight(380)
-  fr:SetPoint("CENTER", 180, 0)
-  fr:SetFrameStrata("DIALOG")
-  fr:SetBackdrop({
-    bgFile = "Interface\\DialogFrame\\UI-DialogBox-Background",
-    edgeFile = "Interface\\DialogFrame\\UI-DialogBox-Border",
-    tile = true, tileSize = 32, edgeSize = 32,
-    insets = { left = 11, right = 12, top = 12, bottom = 11 },
-  })
-  fr:EnableMouse(true); fr:SetMovable(true); fr:RegisterForDrag("LeftButton")
-  fr:SetScript("OnDragStart", function() this:StartMoving() end)
-  fr:SetScript("OnDragStop", function() this:StopMovingOrSizing() end)
+local function BuildListsPanel(parent)
+  local fr = CreateFrame("Frame", "GuildRecruiterList", parent)
+  fr:SetAllPoints(parent)
   fr.rows = {}
-
-  local title = fr:CreateFontString(nil, "ARTWORK", "GameFontNormal")
-  title:SetPoint("TOP", 0, -16); title:SetText("Guild Recruiter -- Lists")
-  local close = CreateFrame("Button", nil, fr, "UIPanelCloseButton")
-  close:SetPoint("TOPRIGHT", -6, -6)
 
   fr.cycle = CreateFrame("Button", nil, fr, "UIPanelButtonTemplate")
   fr.cycle:SetPoint("TOP", 0, -38); fr.cycle:SetWidth(260); fr.cycle:SetHeight(22)
@@ -898,6 +882,7 @@ local function BuildListWindow()
   addEdit:SetScript("OnEscapePressed", function() this:ClearFocus() end)
 
   listFrame = fr
+  return fr
 end
 
 UpdateList = function()
@@ -916,12 +901,6 @@ UpdateList = function()
   end
   FauxScrollFrame_Update(listFrame.scroll, n, NUM_ROWS, ROW_HEIGHT)
   listFrame.cycle:SetText("View: "..(LIST_TITLE[listMode] or listMode).."  ("..n..")")
-end
-
-local function ToggleList()
-  Defaults()
-  if not listFrame then BuildListWindow() end
-  if listFrame:IsVisible() then listFrame:Hide() else UpdateList(); listFrame:Show() end
 end
 
 -- ---------------------------------------------------------------------------
@@ -1028,6 +1007,7 @@ RefreshConfig = function()
   configFrame.combatCheck:SetChecked(s.skipCombat)
   configFrame.instanceCheck:SetChecked(s.skipInstance)
   configFrame.quietCheck:SetChecked(s.quietWho)
+  configFrame.affirmCheck:SetChecked(s.affirmOnly)
   configFrame.updating = false
 end
 
@@ -1039,26 +1019,9 @@ local function StatusLine()
        .." | sent "..stats.contacted.." | peers "..(CountTable(recruiters))
 end
 
-local function BuildConfig()
-  local fr = CreateFrame("Frame", "GuildRecruiterConfig", UIParent)
-  fr:SetWidth(360); fr:SetHeight(470)
-  fr:SetPoint("CENTER", 0, 0)
-  fr:SetFrameStrata("DIALOG")
-  fr:SetBackdrop({
-    bgFile = "Interface\\DialogFrame\\UI-DialogBox-Background",
-    edgeFile = "Interface\\DialogFrame\\UI-DialogBox-Border",
-    tile = true, tileSize = 32, edgeSize = 32,
-    insets = { left = 11, right = 12, top = 12, bottom = 11 },
-  })
-  fr:EnableMouse(true); fr:SetMovable(true); fr:RegisterForDrag("LeftButton")
-  fr:SetScript("OnDragStart", function() this:StartMoving() end)
-  fr:SetScript("OnDragStop", function() this:StopMovingOrSizing() end)
-  fr:Hide()
-
-  local title = fr:CreateFontString(nil, "ARTWORK", "GameFontNormal")
-  title:SetPoint("TOP", 0, -16); title:SetText("Guild Recruiter  v"..VERSION)
-  local close = CreateFrame("Button", nil, fr, "UIPanelCloseButton")
-  close:SetPoint("TOPRIGHT", -6, -6)
+local function BuildSettingsPanel(parent)
+  local fr = CreateFrame("Frame", "GuildRecruiterConfig", parent)
+  fr:SetAllPoints(parent)
 
   fr.inviteSlider, fr.inviteEdit = MakeSlider(fr, "GuildRecruiterConfigInvite", "Invite/contact delay (s)", INVITE_MIN, INVITE_MAX, -48, ApplyInvite)
   fr.whoSlider,    fr.whoEdit    = MakeSlider(fr, "GuildRecruiterConfigWho",    "/who delay (s)",           WHO_MIN,    WHO_MAX,    -92, ApplyWho)
@@ -1092,12 +1055,7 @@ local function BuildConfig()
   fr.combatCheck   = MakeCheck(fr, "GuildRecruiterConfigCombat",   "Pause in combat",              22,  -300, "skipCombat")
   fr.quietCheck    = MakeCheck(fr, "GuildRecruiterConfigQuiet",    "Quiet /who chat",              186, -248, "quietWho")
   fr.instanceCheck = MakeCheck(fr, "GuildRecruiterConfigInstance", "Pause in instances",           186, -274, "skipInstance")
-  local listsBtn = CreateFrame("Button", nil, fr, "UIPanelButtonTemplate")
-  listsBtn:SetPoint("TOPLEFT", 188, -302); listsBtn:SetWidth(70); listsBtn:SetHeight(22)
-  listsBtn:SetText("Lists"); listsBtn:SetScript("OnClick", function() ToggleList() end)
-  local statsBtn = CreateFrame("Button", nil, fr, "UIPanelButtonTemplate")
-  statsBtn:SetPoint("LEFT", listsBtn, "RIGHT", 6, 0); statsBtn:SetWidth(72); statsBtn:SetHeight(22)
-  statsBtn:SetText("Stats"); statsBtn:SetScript("OnClick", function() GuildRecruiter_ToggleStats() end)
+  fr.affirmCheck   = MakeCheck(fr, "GuildRecruiterConfigAffirm",   "Invite only on 'yes' reply",   186, -300, "affirmOnly")
 
   -- live status + progress
   fr.status = fr:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
@@ -1139,13 +1097,7 @@ local function BuildConfig()
   end)
 
   configFrame = fr
-end
-
-local function ToggleConfig()
-  Defaults()
-  if not configFrame then BuildConfig() end
-  if configFrame:IsVisible() then configFrame:Hide()
-  else RefreshConfig(); configFrame:Show() end
+  return fr
 end
 
 -- ---------------------------------------------------------------------------
@@ -1202,26 +1154,9 @@ end
 
 local RefreshStats  -- forward decl
 
-local function BuildStatsWindow()
-  local fr = CreateFrame("Frame", "GuildRecruiterStats", UIParent)
-  fr:SetWidth(320); fr:SetHeight(360)
-  fr:SetPoint("CENTER", -180, 0)
-  fr:SetFrameStrata("DIALOG")
-  fr:SetBackdrop({
-    bgFile = "Interface\\DialogFrame\\UI-DialogBox-Background",
-    edgeFile = "Interface\\DialogFrame\\UI-DialogBox-Border",
-    tile = true, tileSize = 32, edgeSize = 32,
-    insets = { left = 11, right = 12, top = 12, bottom = 11 },
-  })
-  fr:EnableMouse(true); fr:SetMovable(true); fr:RegisterForDrag("LeftButton")
-  fr:SetScript("OnDragStart", function() this:StartMoving() end)
-  fr:SetScript("OnDragStop", function() this:StopMovingOrSizing() end)
-  fr:Hide()
-
-  local title = fr:CreateFontString(nil, "ARTWORK", "GameFontNormal")
-  title:SetPoint("TOP", 0, -16); title:SetText("Guild Recruiter -- Stats & Profiles")
-  local close = CreateFrame("Button", nil, fr, "UIPanelCloseButton")
-  close:SetPoint("TOPRIGHT", -6, -6)
+local function BuildStatsPanel(parent)
+  local fr = CreateFrame("Frame", "GuildRecruiterStats", parent)
+  fr:SetAllPoints(parent)
 
   local plabel = fr:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
   plabel:SetPoint("TOPLEFT", 18, -42); plabel:SetText("Profile:")
@@ -1261,6 +1196,7 @@ local function BuildStatsWindow()
   end)
 
   statsFrame = fr
+  return fr
 end
 
 RefreshStats = function()
@@ -1298,12 +1234,82 @@ RefreshStats = function()
     .."|r\nSaved: "..(table.getn(pnames) > 0 and table.concat(pnames, ", ") or "(none)"))
 end
 
--- global so the config window's Stats button can reach it regardless of load order
-function GuildRecruiter_ToggleStats()
-  Defaults()
-  if not statsFrame then BuildStatsWindow() end
-  if statsFrame:IsVisible() then statsFrame:Hide() else RefreshStats(); statsFrame:Show() end
+-- ---------------------------------------------------------------------------
+-- Main tabbed window (Settings / Lists / Stats) -- one frame, three panels
+-- ---------------------------------------------------------------------------
+local UI
+local activeTab = "settings"
+local tabPanels = {}
+local tabButtons = {}
+local TAB_DEFS = { { "settings", "Settings" }, { "lists", "Lists" }, { "stats", "Stats" } }
+
+local function ShowTab(name)
+  activeTab = name
+  for n, p in tabPanels do if n == name then p:Show() else p:Hide() end end
+  for n, b in tabButtons do
+    if n == name then b:LockHighlight() else b:UnlockHighlight() end
+  end
+  if name == "settings" then RefreshConfig()
+  elseif name == "lists" then UpdateList()
+  elseif name == "stats" then RefreshStats() end
 end
+
+local function BuildUI()
+  local m = CreateFrame("Frame", "GuildRecruiterUI", UIParent)
+  m:SetWidth(360); m:SetHeight(470)
+  m:SetPoint("CENTER", 0, 0)
+  m:SetFrameStrata("DIALOG")
+  m:SetBackdrop({
+    bgFile = "Interface\\DialogFrame\\UI-DialogBox-Background",
+    edgeFile = "Interface\\DialogFrame\\UI-DialogBox-Border",
+    tile = true, tileSize = 32, edgeSize = 32,
+    insets = { left = 11, right = 12, top = 12, bottom = 11 },
+  })
+  m:EnableMouse(true); m:SetMovable(true); m:RegisterForDrag("LeftButton")
+  m:SetScript("OnDragStart", function() this:StartMoving() end)
+  m:SetScript("OnDragStop", function() this:StopMovingOrSizing() end)
+  m:Hide()
+
+  local title = m:CreateFontString(nil, "ARTWORK", "GameFontNormal")
+  title:SetPoint("TOP", 0, -16); title:SetText("Guild Recruiter  v"..VERSION)
+  local close = CreateFrame("Button", nil, m, "UIPanelCloseButton")
+  close:SetPoint("TOPRIGHT", -6, -6)
+
+  tabPanels.settings = BuildSettingsPanel(m)
+  tabPanels.lists    = BuildListsPanel(m)
+  tabPanels.stats    = BuildStatsPanel(m)
+
+  -- tabs hang just below the frame
+  local prev
+  for i = 1, table.getn(TAB_DEFS) do
+    local id, label = TAB_DEFS[i][1], TAB_DEFS[i][2]
+    local b = CreateFrame("Button", "GuildRecruiterUITab"..i, m, "UIPanelButtonTemplate")
+    b:SetWidth(106); b:SetHeight(24)
+    if prev then b:SetPoint("LEFT", prev, "RIGHT", 6, 0)
+    else b:SetPoint("TOPLEFT", m, "BOTTOMLEFT", 12, 2) end
+    b:SetText(label)
+    b:SetScript("OnClick", function() ShowTab(id) end)
+    tabButtons[id] = b
+    prev = b
+  end
+
+  UI = m
+end
+
+local function OpenTab(tab)
+  Defaults()
+  if not UI then BuildUI() end
+  if UI:IsVisible() and activeTab == tab then
+    UI:Hide()
+  else
+    ShowTab(tab); UI:Show()
+  end
+end
+
+-- the three slash entry points now just open the relevant tab of the one window
+local function ToggleConfig() OpenTab("settings") end
+local function ToggleList()   OpenTab("lists") end
+function GuildRecruiter_ToggleStats() OpenTab("stats") end
 
 -- ---------------------------------------------------------------------------
 -- Minimap button
