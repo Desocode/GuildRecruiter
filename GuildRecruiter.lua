@@ -83,6 +83,23 @@ local function CountTable(t)
   return n
 end
 
+-- Stop the default UI's Who panel from popping during a run. We unregister
+-- WHO_LIST_UPDATE on FriendsFrame (our own frame still receives it) so the
+-- window never opens at all -- no open-then-hide flicker. Restored when we stop.
+local whoSuppressed = false
+local function SuppressWho(on)
+  if not FriendsFrame then return end
+  if on then
+    if not whoSuppressed and GuildRecruiter_Settings.hideWho then
+      FriendsFrame:UnregisterEvent("WHO_LIST_UPDATE")
+      whoSuppressed = true
+    end
+  elseif whoSuppressed then
+    FriendsFrame:RegisterEvent("WHO_LIST_UPDATE")
+    whoSuppressed = false
+  end
+end
+
 -- ---------------------------------------------------------------------------
 -- Settings defaults
 -- ---------------------------------------------------------------------------
@@ -414,6 +431,7 @@ end
 -- ---------------------------------------------------------------------------
 local function Abort(reason)
   running, scanning, awaiting, paused = false, false, false, false
+  SuppressWho(false)
   Print("|cffff4040Stopped on error:|r "..tostring(reason))
 end
 
@@ -549,6 +567,7 @@ local function GR_OnUpdate()
       -- keep waiting
     else
       running = false
+      SuppressWho(false)
       Broadcast("BYE")
       Print("Done. Contacted "..stats.contacted.." ("..stats.invited.." invited, "..stats.whispered.." whispered), skipped "..stats.guilded.." guilded, "..stats.queries.." queries.")
     end
@@ -580,6 +599,7 @@ local function Start()
   if not IsInGuild() then Print("You're not in a guild.") return end
   if running and not paused then Print("Already running. /gr stop to cancel, /gr pause to pause.") return end
   ForceWhoToEvent()
+  SuppressWho(true)
   FactionLists()
   running, scanning, awaiting, paused = true, true, false, false
   current = nil
@@ -595,6 +615,7 @@ end
 local function Stop()
   if not running then Print("Not running.") return end
   running, scanning, awaiting, paused = false, false, false, false
+  SuppressWho(false)
   Broadcast("BYE")
   Print("Stopped. Contacted "..stats.contacted.." this run; "..table.getn(contactQueue).." still queued.")
 end
@@ -603,6 +624,7 @@ local function Pause()
   if not running then Print("Not running.") return end
   if paused then Print("Already paused. /gr resume to continue.") return end
   paused = true
+  SuppressWho(false)  -- let manual /who work normally while paused
   Broadcast("BYE")  -- yield my band to others while paused
   Print("Paused at level "..lo..". "..table.getn(contactQueue).." queued. /gr resume to continue.")
 end
@@ -611,6 +633,7 @@ local function Resume()
   if not running then Print("Not running -- use /gr start.") return end
   if not paused then Print("Not paused.") return end
   paused = false
+  SuppressWho(true)
   RecomputeBand()
   if GuildRecruiter_Settings.guildSync and IsInGuild() then Broadcast("HI") end
   Print("Resumed.")
@@ -904,7 +927,10 @@ SlashCmdList["GUILDRECRUITER"] = function(msg)
     GuildRecruiter_Settings.history = {}; Print("Cleared persistent invite history.")
   elseif cmd == "hide" then
     GuildRecruiter_Settings.hideWho = not GuildRecruiter_Settings.hideWho
-    Print("Auto-hide Who window: "..(GuildRecruiter_Settings.hideWho and "ON" or "OFF"))
+    if running and not paused then
+      if GuildRecruiter_Settings.hideWho then SuppressWho(true) else SuppressWho(false) end
+    end
+    Print("Suppress Who window during scans: "..(GuildRecruiter_Settings.hideWho and "ON" or "OFF"))
   elseif cmd == "msg" then
     if arg and arg ~= "" then GuildRecruiter_Settings.whisperMsg = arg; RefreshConfig(); Print("Whisper message set.")
     else Print("Current whisper: "..(GuildRecruiter_Settings.whisperMsg or "")) end
