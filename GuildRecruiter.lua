@@ -19,7 +19,7 @@
 
 GuildRecruiter_Settings = GuildRecruiter_Settings or {}
 
-local VERSION    = "3.6"
+local VERSION    = "3.7"
 local CAP_HINT   = 49      -- treat a query returning >= this many as truncated
 local START_WIDTH = 10     -- initial level-band width to try
 local WHO_TIMEOUT = 12     -- give up waiting on a reply after this many seconds
@@ -1074,11 +1074,19 @@ end
 
 -- tooltip for a cycle button: lists every option with the current one marked,
 -- so the full choice set is visible without a dropdown
-local function CycleTip(frame, title, order, labels, getcur)
+-- kind is "method" or "mode"; the option tables are looked up here (rather than
+-- passed in) to keep the option tables OUT of the caller's upvalues -- Lua 5.0
+-- allows only 32 upvalues per function and the settings panel is near the limit
+local function CycleTip(frame, kind)
   frame:SetScript("OnEnter", function()
+    local title, order, labels, cur
+    if kind == "method" then
+      title, order, labels, cur = "Invite method", METHOD_ORDER, METHOD_LABEL, GuildRecruiter_Settings.inviteMethod
+    else
+      title, order, labels, cur = "Contact mode", MODE_ORDER, MODE_LABEL, GuildRecruiter_Settings.mode
+    end
     GameTooltip:SetOwner(this, "ANCHOR_RIGHT")
     GameTooltip:SetText(title, 1, 1, 1)
-    local cur = getcur()
     for i = 1, table.getn(order) do
       local k = order[i]
       if k == cur then GameTooltip:AddLine("> "..labels[k], 0.4, 1, 0.4)
@@ -1199,6 +1207,25 @@ local function OpenMsgEditor()
   msgEditor:Show()
 end
 
+-- settings-panel live refresh; a top-level function (not a closure) so its
+-- run-state references aren't upvalues of BuildSettingsPanel (Lua 5.0: max 32)
+local function SettingsTick()
+  local fr = this
+  fr.tick = fr.tick - (arg1 or 0)
+  if fr.tick > 0 then return end
+  fr.tick = 0.3
+  fr.status:SetText(StatusLine())
+  fr.pauseBtn:SetText(paused and "Resume" or "Pause")
+  if running then fr.startBtn:Disable() else fr.startBtn:Enable() end
+  if running then fr.pauseBtn:Enable() else fr.pauseBtn:Disable() end
+  if running then fr.stopBtn:Enable() else fr.stopBtn:Disable() end
+  local span = myHi - myLo + 1
+  local prog = 1
+  if running and scanning and span > 0 then prog = clamp((lo - myLo) / span, 0, 1) end
+  if not running then prog = 0 end
+  fr.bar:SetValue(prog)
+end
+
 local function BuildSettingsPanel(parent)
   local fr = CreateFrame("Frame", "GuildRecruiterConfig", parent)
   fr:SetAllPoints(parent)
@@ -1226,12 +1253,12 @@ local function BuildSettingsPanel(parent)
   fr.methodBtn = CreateFrame("Button", "GuildRecruiterConfigMethodBtn", fr, "UIPanelButtonTemplate")
   fr.methodBtn:SetPoint("TOPLEFT", 296, -94); fr.methodBtn:SetWidth(244); fr.methodBtn:SetHeight(22)
   fr.methodBtn:SetScript("OnClick", function() CycleMethod() end)
-  CycleTip(fr.methodBtn, "Invite method", METHOD_ORDER, METHOD_LABEL, function() return GuildRecruiter_Settings.inviteMethod end)
+  CycleTip(fr.methodBtn, "method")
   Label(fr, "Mode:", 298, -122)
   fr.modeBtn = CreateFrame("Button", "GuildRecruiterConfigModeBtn", fr, "UIPanelButtonTemplate")
   fr.modeBtn:SetPoint("TOPLEFT", 296, -138); fr.modeBtn:SetWidth(244); fr.modeBtn:SetHeight(22)
   fr.modeBtn:SetScript("OnClick", function() CycleMode() end)
-  CycleTip(fr.modeBtn, "Contact mode", MODE_ORDER, MODE_LABEL, function() return GuildRecruiter_Settings.mode end)
+  CycleTip(fr.modeBtn, "mode")
   fr.affirmCheck = MakeCheck(fr, "GuildRecruiterConfigAffirm", "Invite only on a 'yes' reply", 294, -166, "affirmOnly")
   fr.syncCheck   = MakeCheck(fr, "GuildRecruiterConfigSync",   "Guild sync (dedup + split)",   294, -190, "guildSync")
   Tip(fr.affirmCheck, "Invite only on 'yes'", "In whisper-then-invite mode, only invite when a reply clearly says yes.")
@@ -1280,21 +1307,7 @@ local function BuildSettingsPanel(parent)
 
   -- throttled live refresh of the status line, bar, and button states
   fr.tick = 0
-  fr:SetScript("OnUpdate", function()
-    fr.tick = fr.tick - (arg1 or 0)
-    if fr.tick > 0 then return end
-    fr.tick = 0.3
-    fr.status:SetText(StatusLine())
-    fr.pauseBtn:SetText(paused and "Resume" or "Pause")
-    if running then fr.startBtn:Disable() else fr.startBtn:Enable() end
-    if running then fr.pauseBtn:Enable() else fr.pauseBtn:Disable() end
-    if running then fr.stopBtn:Enable() else fr.stopBtn:Disable() end
-    local span = myHi - myLo + 1
-    local prog = 1
-    if running and scanning and span > 0 then prog = clamp((lo - myLo) / span, 0, 1) end
-    if not running then prog = 0 end
-    fr.bar:SetValue(prog)
-  end)
+  fr:SetScript("OnUpdate", SettingsTick)
 
   configFrame = fr
   return fr
