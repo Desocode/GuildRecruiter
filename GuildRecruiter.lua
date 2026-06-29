@@ -19,7 +19,7 @@
 
 GuildRecruiter_Settings = GuildRecruiter_Settings or {}
 
-local VERSION    = "2.0"
+local VERSION    = "2.1"
 local CAP_HINT   = 49      -- treat a query returning >= this many as truncated
 local START_WIDTH = 10     -- initial level-band width to try
 local WHO_TIMEOUT = 12     -- give up waiting on a reply after this many seconds
@@ -122,6 +122,7 @@ local function Defaults()
   if s.skipCombat == nil   then s.skipCombat   = true end
   if s.skipInstance == nil then s.skipInstance = true end
   if s.guildSync == nil    then s.guildSync    = true end
+  if s.quietWho == nil     then s.quietWho     = true end  -- hide /who chat spam during a run
   if not s.minimapAngle then s.minimapAngle = 210 end
   -- prune history past the cooldown so the saved table can't grow forever
   if s.reinviteDays > 0 then
@@ -579,6 +580,27 @@ f:SetScript("OnUpdate", function()
   if not ok then Abort(err) end
 end)
 
+-- Quiet the /who chat spam during a run. There's no message-filter API on 1.12,
+-- so we wrap ChatFrame_OnEvent and drop the /who summary/result system lines
+-- while we're scanning. Our own CHAT_MSG_SYSTEM handler (on frame f) is separate
+-- and still fires, so throttle-detection keeps working.
+local function IsWhoNoise(m)
+  if not m then return false end
+  if string.find(m, "[Pp]layers? [Tt]otal") then return true end  -- "3 Players Total"
+  if string.find(m, "^There are %d")          then return true end
+  if string.find(m, "[Nn]o players")          then return true end  -- "No players found"
+  return false
+end
+
+local Orig_ChatFrame_OnEvent = ChatFrame_OnEvent
+function ChatFrame_OnEvent(ev)
+  if running and GuildRecruiter_Settings.quietWho
+     and ev == "CHAT_MSG_SYSTEM" and IsWhoNoise(arg1) then
+    return
+  end
+  Orig_ChatFrame_OnEvent(ev)
+end
+
 -- ---------------------------------------------------------------------------
 -- Run control
 -- ---------------------------------------------------------------------------
@@ -637,6 +659,140 @@ local function Resume()
   RecomputeBand()
   if GuildRecruiter_Settings.guildSync and IsInGuild() then Broadcast("HI") end
   Print("Resumed.")
+end
+
+-- ---------------------------------------------------------------------------
+-- List window: view/edit the contact queue, blacklist, and invite history
+-- ---------------------------------------------------------------------------
+local listFrame, listMode = nil, "queue"
+local listData = {}
+local NUM_ROWS, ROW_HEIGHT = 13, 18
+local LIST_ORDER = { "queue", "blacklist", "history" }
+local LIST_TITLE = { queue = "Queue (this run)", blacklist = "Blacklist", history = "Invite history" }
+
+local function BuildListData()
+  listData = {}
+  if listMode == "queue" then
+    for i = 1, table.getn(contactQueue) do tinsert(listData, contactQueue[i]) end
+  elseif listMode == "blacklist" then
+    for n in GuildRecruiter_Settings.blacklist do tinsert(listData, n) end
+    table.sort(listData)
+  else
+    for n in GuildRecruiter_Settings.history do tinsert(listData, n) end
+    table.sort(listData)
+  end
+end
+
+local function RemoveListItem(name)
+  if listMode == "queue" then
+    for i = 1, table.getn(contactQueue) do
+      if contactQueue[i] == name then tremove(contactQueue, i); break end
+    end
+  elseif listMode == "blacklist" then
+    GuildRecruiter_Settings.blacklist[name] = nil
+  else
+    GuildRecruiter_Settings.history[name] = nil
+  end
+end
+
+local UpdateList  -- forward decl (handlers below capture it)
+
+local function BuildListWindow()
+  local fr = CreateFrame("Frame", "GuildRecruiterList", UIParent)
+  fr:SetWidth(300); fr:SetHeight(380)
+  fr:SetPoint("CENTER", 180, 0)
+  fr:SetFrameStrata("DIALOG")
+  fr:SetBackdrop({
+    bgFile = "Interface\\DialogFrame\\UI-DialogBox-Background",
+    edgeFile = "Interface\\DialogFrame\\UI-DialogBox-Border",
+    tile = true, tileSize = 32, edgeSize = 32,
+    insets = { left = 11, right = 12, top = 12, bottom = 11 },
+  })
+  fr:EnableMouse(true); fr:SetMovable(true); fr:RegisterForDrag("LeftButton")
+  fr:SetScript("OnDragStart", function() this:StartMoving() end)
+  fr:SetScript("OnDragStop", function() this:StopMovingOrSizing() end)
+  fr.rows = {}
+
+  local title = fr:CreateFontString(nil, "ARTWORK", "GameFontNormal")
+  title:SetPoint("TOP", 0, -16); title:SetText("Guild Recruiter -- Lists")
+  local close = CreateFrame("Button", nil, fr, "UIPanelCloseButton")
+  close:SetPoint("TOPRIGHT", -6, -6)
+
+  fr.cycle = CreateFrame("Button", nil, fr, "UIPanelButtonTemplate")
+  fr.cycle:SetPoint("TOP", 0, -38); fr.cycle:SetWidth(260); fr.cycle:SetHeight(22)
+  fr.cycle:SetScript("OnClick", function()
+    local idx = 1
+    for i = 1, table.getn(LIST_ORDER) do if LIST_ORDER[i] == listMode then idx = i end end
+    idx = idx + 1; if idx > table.getn(LIST_ORDER) then idx = 1 end
+    listMode = LIST_ORDER[idx]; UpdateList()
+  end)
+
+  fr.hint = fr:CreateFontString(nil, "ARTWORK", "GameFontDisableSmall")
+  fr.hint:SetPoint("TOP", 0, -62); fr.hint:SetText("click a name to remove it")
+
+  local scroll = CreateFrame("ScrollFrame", "GuildRecruiterListScroll", fr, "FauxScrollFrameTemplate")
+  scroll:SetPoint("TOPLEFT", 16, -78)
+  scroll:SetPoint("BOTTOMRIGHT", -34, 52)
+  scroll:SetScript("OnVerticalScroll", function() FauxScrollFrame_OnVerticalScroll(ROW_HEIGHT, UpdateList) end)
+  fr.scroll = scroll
+
+  for i = 1, NUM_ROWS do
+    local row = CreateFrame("Button", nil, fr)
+    row:SetHeight(ROW_HEIGHT)
+    row:SetPoint("TOPLEFT", scroll, "TOPLEFT", 0, -(i - 1) * ROW_HEIGHT)
+    row:SetPoint("RIGHT", scroll, "RIGHT", 0, 0)
+    local ht = row:CreateTexture(nil, "HIGHLIGHT")
+    ht:SetAllPoints(row); ht:SetTexture("Interface\\QuestFrame\\UI-QuestTitleHighlight")
+    ht:SetBlendMode("ADD"); ht:SetAlpha(0.4)
+    local t = row:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
+    t:SetPoint("LEFT", 6, 0); t:SetJustifyH("LEFT"); row.text = t
+    row:SetScript("OnClick", function() if this.pname then RemoveListItem(this.pname); UpdateList() end end)
+    row:Hide()
+    fr.rows[i] = row
+  end
+
+  -- add-to-blacklist box
+  local addEdit = CreateFrame("EditBox", "GuildRecruiterListAdd", fr, "InputBoxTemplate")
+  addEdit:SetPoint("BOTTOMLEFT", 18, 20); addEdit:SetWidth(150); addEdit:SetHeight(20)
+  addEdit:SetAutoFocus(false); addEdit:SetMaxLetters(40)
+  local function doAdd()
+    local n = addEdit:GetText()
+    if n and n ~= "" then
+      GuildRecruiter_Settings.blacklist[string.lower(n)] = true
+      addEdit:SetText(""); listMode = "blacklist"; UpdateList()
+    end
+  end
+  local addBtn = CreateFrame("Button", nil, fr, "UIPanelButtonTemplate")
+  addBtn:SetPoint("LEFT", addEdit, "RIGHT", 8, 0); addBtn:SetWidth(92); addBtn:SetHeight(22)
+  addBtn:SetText("Blacklist"); addBtn:SetScript("OnClick", doAdd)
+  addEdit:SetScript("OnEnterPressed", function() doAdd(); this:ClearFocus() end)
+  addEdit:SetScript("OnEscapePressed", function() this:ClearFocus() end)
+
+  listFrame = fr
+end
+
+UpdateList = function()
+  if not listFrame then return end
+  BuildListData()
+  local n = table.getn(listData)
+  local offset = FauxScrollFrame_GetOffset(listFrame.scroll)
+  for i = 1, NUM_ROWS do
+    local idx = offset + i
+    local row = listFrame.rows[i]
+    if idx <= n then
+      row.pname = listData[idx]; row.text:SetText(listData[idx]); row:Show()
+    else
+      row.pname = nil; row:Hide()
+    end
+  end
+  FauxScrollFrame_Update(listFrame.scroll, n, NUM_ROWS, ROW_HEIGHT)
+  listFrame.cycle:SetText("View: "..(LIST_TITLE[listMode] or listMode).."  ("..n..")")
+end
+
+local function ToggleList()
+  Defaults()
+  if not listFrame then BuildListWindow() end
+  if listFrame:IsVisible() then listFrame:Hide() else UpdateList(); listFrame:Show() end
 end
 
 -- ---------------------------------------------------------------------------
@@ -727,6 +883,7 @@ RefreshConfig = function()
   configFrame.syncCheck:SetChecked(s.guildSync)
   configFrame.combatCheck:SetChecked(s.skipCombat)
   configFrame.instanceCheck:SetChecked(s.skipInstance)
+  configFrame.quietCheck:SetChecked(s.quietWho)
   configFrame.updating = false
 end
 
@@ -787,7 +944,11 @@ local function BuildConfig()
   fr.jitterCheck   = MakeCheck(fr, "GuildRecruiterConfigJitter",   "Random delays (anti-pattern)", 22,  -248, "jitter")
   fr.syncCheck     = MakeCheck(fr, "GuildRecruiterConfigSync",     "Guild sync (dedup + split)",   22,  -274, "guildSync")
   fr.combatCheck   = MakeCheck(fr, "GuildRecruiterConfigCombat",   "Pause in combat",              22,  -300, "skipCombat")
-  fr.instanceCheck = MakeCheck(fr, "GuildRecruiterConfigInstance", "Pause in instances",           186, -300, "skipInstance")
+  fr.quietCheck    = MakeCheck(fr, "GuildRecruiterConfigQuiet",    "Quiet /who chat",              186, -248, "quietWho")
+  fr.instanceCheck = MakeCheck(fr, "GuildRecruiterConfigInstance", "Pause in instances",           186, -274, "skipInstance")
+  local listsBtn = CreateFrame("Button", nil, fr, "UIPanelButtonTemplate")
+  listsBtn:SetPoint("TOPLEFT", 188, -302); listsBtn:SetWidth(146); listsBtn:SetHeight(22)
+  listsBtn:SetText("Lists / blacklist..."); listsBtn:SetScript("OnClick", function() ToggleList() end)
 
   -- live status + progress
   fr.status = fr:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
@@ -801,16 +962,17 @@ local function BuildConfig()
   local barbg = fr.bar:CreateTexture(nil, "BACKGROUND")
   barbg:SetAllPoints(fr.bar); barbg:SetTexture(0, 0, 0, 0.4)
 
-  -- start / pause / stop
+  -- start / pause / stop (pause label flips to Resume while paused)
   local startBtn = CreateFrame("Button", nil, fr, "UIPanelButtonTemplate")
-  startBtn:SetPoint("BOTTOMLEFT", 22, 18); startBtn:SetWidth(96); startBtn:SetHeight(24)
+  startBtn:SetPoint("BOTTOMLEFT", 22, 18); startBtn:SetWidth(100); startBtn:SetHeight(22)
   startBtn:SetText("Start"); startBtn:SetScript("OnClick", function() Start() end)
   local pauseBtn = CreateFrame("Button", nil, fr, "UIPanelButtonTemplate")
-  pauseBtn:SetPoint("LEFT", startBtn, "RIGHT", 8, 0); pauseBtn:SetWidth(96); pauseBtn:SetHeight(24)
-  pauseBtn:SetText("Pause/Resume"); pauseBtn:SetScript("OnClick", function() if paused then Resume() else Pause() end end)
+  pauseBtn:SetPoint("LEFT", startBtn, "RIGHT", 7, 0); pauseBtn:SetWidth(100); pauseBtn:SetHeight(22)
+  pauseBtn:SetText("Pause"); pauseBtn:SetScript("OnClick", function() if paused then Resume() else Pause() end end)
   local stopBtn = CreateFrame("Button", nil, fr, "UIPanelButtonTemplate")
-  stopBtn:SetPoint("LEFT", pauseBtn, "RIGHT", 8, 0); stopBtn:SetWidth(96); stopBtn:SetHeight(24)
+  stopBtn:SetPoint("LEFT", pauseBtn, "RIGHT", 7, 0); stopBtn:SetWidth(100); stopBtn:SetHeight(22)
   stopBtn:SetText("Stop"); stopBtn:SetScript("OnClick", function() Stop() end)
+  fr.pauseBtn = pauseBtn
 
   -- throttled live refresh of the status line + bar
   fr.tick = 0
@@ -819,6 +981,7 @@ local function BuildConfig()
     if fr.tick > 0 then return end
     fr.tick = 0.3
     fr.status:SetText(StatusLine())
+    fr.pauseBtn:SetText(paused and "Resume" or "Pause")
     local span = myHi - myLo + 1
     local prog = 1
     if running and scanning and span > 0 then prog = clamp((lo - myLo) / span, 0, 1) end
@@ -921,6 +1084,7 @@ SlashCmdList["GUILDRECRUITER"] = function(msg)
   elseif cmd == "resume" then Resume()
   elseif cmd == "status" then Status()
   elseif cmd == "config" or cmd == "options" or cmd == "gui" then ToggleConfig()
+  elseif cmd == "list" or cmd == "lists" then ToggleList()
   elseif cmd == "reset" then
     seen = {}; Print("Cleared this session's scan list (history kept).")
   elseif cmd == "forget" then
@@ -977,18 +1141,18 @@ SlashCmdList["GUILDRECRUITER"] = function(msg)
     else
       Print("set invite|who|reinvite|cap|min|max <n> | set method auto|byname|invite|chat | set mode invite|whisper|whisperinvite")
     end
-  elseif cmd == "jitter" or cmd == "sync" or cmd == "combat" or cmd == "instance" then
-    local key = (cmd == "jitter" and "jitter") or (cmd == "sync" and "guildSync")
-             or (cmd == "combat" and "skipCombat") or "skipInstance"
+  elseif cmd == "jitter" or cmd == "sync" or cmd == "combat" or cmd == "instance" or cmd == "quiet" then
+    local keymap = { jitter="jitter", sync="guildSync", combat="skipCombat", instance="skipInstance", quiet="quietWho" }
+    local key = keymap[cmd]
     GuildRecruiter_Settings[key] = (larg == "on") or (larg ~= "off" and not GuildRecruiter_Settings[key])
     if cmd == "sync" then RecomputeBand() end
     RefreshConfig()
     Print(cmd.." "..(GuildRecruiter_Settings[key] and "ON" or "OFF"))
   else
-    Print("|cff33ff99GuildRecruiter v"..VERSION.."|r  --  /gr config for the settings window")
+    Print("|cff33ff99GuildRecruiter v"..VERSION.."|r  --  /gr config (settings), /gr list (queue/blacklist/history)")
     Print("start | stop | pause | resume | status | reset | forget | hide")
     Print("set invite/who/reinvite/cap/min/max/method/mode <v> | msg <text> | class <list|all>")
-    Print("black add/remove/list <name> | jitter/sync/combat/instance [on|off]")
+    Print("black add/remove/list <name> | jitter/sync/combat/instance/quiet [on|off]")
   end
 end
 

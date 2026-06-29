@@ -21,8 +21,14 @@ GuildInviteByName" on Turtle). If /ginvite works manually, the addon works.
 QUICK START
 -----------
   /gr config     Open the settings window (recommended).
+  /gr list       Open the list window: view/edit the contact queue, the
+                 blacklist, and the invite history (click a name to remove it;
+                 add names to the blacklist from the box at the bottom).
   /gr start      Begin scanning + contacting (or click the minimap button).
   /gr stop       Halt. /gr pause + /gr resume keep your place.
+
+The /who chat spam ("N players total" etc.) is hidden while a run is active
+(/gr quiet off to show it).
 
 A minimap button is added: LEFT-click opens settings, RIGHT-click starts/stops,
 drag it around the minimap to reposition.
@@ -83,6 +89,8 @@ ALL COMMANDS  (slash:  /gr)
   hide                  Toggle auto-hiding the Who window during scans.
   msg <text>            Set the whisper message.
   class <list|all>      Class filter (comma/space separated, or "all").
+  list                  Open the queue / blacklist / history window.
+  quiet [on|off]        Hide the /who chat spam during a run (default on).
   black add|remove|list <name>
   set invite <s>        Seconds between contacts (1-10).
   set who <s>           Seconds between /who queries (1-15).
