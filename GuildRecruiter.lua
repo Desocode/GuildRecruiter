@@ -19,7 +19,7 @@
 
 GuildRecruiter_Settings = GuildRecruiter_Settings or {}
 
-local VERSION    = "3.3.3"
+local VERSION    = "3.3.4"
 local CAP_HINT   = 49      -- treat a query returning >= this many as truncated
 local START_WIDTH = 10     -- initial level-band width to try
 local WHO_TIMEOUT = 12     -- give up waiting on a reply after this many seconds
@@ -178,12 +178,14 @@ local function Defaults()
   if not s.tally then s.tally = {} end
   if not s.tally.totals then s.tally.totals = { invited=0, whispered=0, joined=0, declined=0 } end
   if not s.tally.days   then s.tally.days   = {} end
+  if not s.varStats then s.varStats = {} end   -- [profile] = {contacted,joined,declined}
   if not s.minimapAngle then s.minimapAngle = 210 end
   -- prune history past the cooldown so the saved table can't grow forever
   if s.reinviteDays > 0 then
     local cutoff = time() - s.reinviteDays * 86400
-    for n, t in s.history do
-      if t < cutoff then s.history[n] = nil end
+    for n, e in s.history do
+      local et = (type(e) == "table") and e.t or e   -- entries are {t,p} now; tolerate old numbers
+      if (et or 0) < cutoff then s.history[n] = nil end
     end
   end
 end
@@ -258,11 +260,12 @@ local DECLINE_PAT = ToPattern(ERR_GUILD_DECLINE_S) or "^(.+) declines your guild
 -- ---------------------------------------------------------------------------
 local function RecentlyInvited(name)
   local s = GuildRecruiter_Settings
-  local h = s.history
-  if not h or not h[name] then return false end
+  local e = s.history and s.history[name]
+  if not e then return false end
   local days = s.reinviteDays
   if days <= 0 then return true end
-  return (time() - h[name]) < days * 86400
+  local t = (type(e) == "table") and e.t or e   -- {t,p} now; tolerate old numbers
+  return (time() - (t or 0)) < days * 86400
 end
 
 local function Blacklisted(name)
@@ -328,7 +331,7 @@ local function OnAddonMessage()
   if kind == "INV" then
     if rest and rest ~= "" then
       if not GuildRecruiter_Settings.history then GuildRecruiter_Settings.history = {} end
-      GuildRecruiter_Settings.history[rest] = time()  -- guild-wide dedup
+      GuildRecruiter_Settings.history[rest] = { t = time(), p = "(remote)" }  -- guild-wide dedup
       seen[rest] = true
     end
   elseif kind == "HI" then
@@ -390,9 +393,18 @@ local function WhisperBody(name)
   return msg
 end
 
+-- global so contact/event code adds no upvalues; per-profile conversion counters
+function GuildRecruiter_VarBump(profile, field)
+  profile = profile or "(live)"
+  local vs = GuildRecruiter_Settings.varStats
+  if not vs then return end
+  if not vs[profile] then vs[profile] = { contacted = 0, joined = 0, declined = 0 } end
+  vs[profile][field] = (vs[profile][field] or 0) + 1
+end
+
 local function RecordHandled(name)
   if not GuildRecruiter_Settings.history then GuildRecruiter_Settings.history = {} end
-  GuildRecruiter_Settings.history[name] = time()
+  GuildRecruiter_Settings.history[name] = { t = time(), p = GuildRecruiter_Settings.activeProfile }
   Broadcast("INV "..name)
 end
 
@@ -417,6 +429,7 @@ local function Contact(name)
     RecordHandled(name)
   end
   stats.contacted = stats.contacted + 1
+  GuildRecruiter_VarBump(GuildRecruiter_Settings.activeProfile, "contacted")
 end
 
 -- ---------------------------------------------------------------------------
@@ -589,15 +602,22 @@ local function GR_OnEvent()
     end
     -- analytics: attribute a join to us only if we contacted them; declines of
     -- our invitation are always ours
+    local hist = GuildRecruiter_Settings.history
     if JOIN_PAT then
       local _, _, jn = string.find(raw, JOIN_PAT)
-      if jn and GuildRecruiter_Settings.history and GuildRecruiter_Settings.history[jn] then
+      local e = jn and hist and hist[jn]
+      if e then
         TallyBump("joined")
+        GuildRecruiter_VarBump((type(e) == "table") and e.p or nil, "joined")
       end
     end
     if DECLINE_PAT then
       local _, _, dn = string.find(raw, DECLINE_PAT)
-      if dn then TallyBump("declined") end
+      if dn then
+        TallyBump("declined")
+        local e = hist and hist[dn]
+        if e then GuildRecruiter_VarBump((type(e) == "table") and e.p or nil, "declined") end
+      end
     end
   elseif event == "CHAT_MSG_WHISPER" then
     local sender = arg2
@@ -691,7 +711,8 @@ local function GR_OnUpdate()
         local name = tremove(replyQueue, 1)
         DoGuildInvite(name)
         if not GuildRecruiter_Settings.history then GuildRecruiter_Settings.history = {} end
-        GuildRecruiter_Settings.history[name] = time()
+        local pe = GuildRecruiter_Settings.history[name]   -- keep the profile that contacted them
+        GuildRecruiter_Settings.history[name] = { t = time(), p = (type(pe) == "table") and pe.p or GuildRecruiter_Settings.activeProfile }
         stats.invited = stats.invited + 1
         TallyBump("invited")
         Print("Invited (replied) "..name.." ("..stats.invited..")")
@@ -1247,6 +1268,7 @@ local function BuildStatsPanel(parent)
   resetB:SetPoint("BOTTOMRIGHT", -16, 16); resetB:SetWidth(110); resetB:SetHeight(22); resetB:SetText("Reset stats")
   resetB:SetScript("OnClick", function()
     GuildRecruiter_Settings.tally = { totals = { invited=0, whispered=0, joined=0, declined=0 }, days = {} }
+    GuildRecruiter_Settings.varStats = {}
     RefreshStats()
   end)
 
@@ -1277,7 +1299,7 @@ RefreshStats = function()
   table.sort(keys)
   local n = table.getn(keys)
   if n == 0 then tinsert(lines, "(no activity yet)") end
-  local first = n - 7; if first < 1 then first = 1 end
+  local first = n - 4; if first < 1 then first = 1 end
   for i = first, n do
     local d = keys[i]; local r = t.days[d]
     local label = d
@@ -1285,6 +1307,26 @@ RefreshStats = function()
     tinsert(lines, label..":  inv "..(r.invited or 0)..", wsp "..(r.whispered or 0)
                  ..", join "..(r.joined or 0)..", dec "..(r.declined or 0)
                  .."  ("..Rate(r.joined or 0, r.declined or 0)..")")
+  end
+
+  -- per-profile conversion comparison (for A/B): conv = joined / contacted
+  tinsert(lines, " ")
+  tinsert(lines, "|cffffd100By profile (A/B)|r")
+  local vs = GuildRecruiter_Settings.varStats or {}
+  local vnames = {}
+  for v in vs do tinsert(vnames, v) end
+  table.sort(vnames)
+  if table.getn(vnames) == 0 then
+    tinsert(lines, "no per-profile data yet -- load a profile, then recruit")
+  else
+    for i = 1, table.getn(vnames) do
+      if i > 6 then tinsert(lines, "(+"..(table.getn(vnames) - 6).." more)"); break end
+      local v = vnames[i]; local r = vs[v]
+      local c = r.contacted or 0
+      local conv = (c > 0) and (math.floor((r.joined or 0) / c * 100 + 0.5).."%") or "--"
+      tinsert(lines, v..":  contacted "..c..", joined "..(r.joined or 0)
+                   ..", declined "..(r.declined or 0).."  (conv "..conv..")")
+    end
   end
   statsFrame.text:SetText(table.concat(lines, "\n"))
 
