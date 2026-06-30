@@ -1,4 +1,4 @@
---[[ Guild Recruiter -- vanilla 1.12 / Turtle WoW   (v2.0)
+--[[ Guild Rawcruiter -- vanilla 1.12 / Turtle WoW   (v2.0)
 
   Scans online players with /who and sends paced guild contacts (invite and/or
   whisper) to players who are NOT already in a guild.
@@ -19,7 +19,7 @@
 
 GuildRecruiter_Settings = GuildRecruiter_Settings or {}
 
-local VERSION    = "3.14"
+local VERSION    = "3.15"
 local CAP_HINT   = 49      -- treat a query returning >= this many as truncated
 local START_WIDTH = 10     -- initial level-band width to try
 local WHO_TIMEOUT = 12     -- give up waiting on a reply after this many seconds
@@ -126,7 +126,7 @@ local whoTimer, inviteTimer, whoTimeout = 0, 0, 0
 local stats = { contacted=0, invited=0, whispered=0, guilded=0, scanned=0, queries=0, dropped=0, cooldown=0, collected=0 }
 
 local function Print(msg)
-  DEFAULT_CHAT_FRAME:AddMessage("|cff33ff99GuildRecruiter|r: "..msg)
+  DEFAULT_CHAT_FRAME:AddMessage("|cff33ff99Rawcruiter|r: "..msg)
 end
 
 local function clamp(v, a, b)
@@ -2102,7 +2102,7 @@ local function BuildUI()
   m:Hide()
 
   local title = m:CreateFontString(nil, "ARTWORK", "GameFontNormal")
-  title:SetPoint("TOP", 0, -16); title:SetText("Guild Recruiter  v"..VERSION)
+  title:SetPoint("TOP", 0, -16); title:SetText("Guild Rawcruiter  v"..VERSION)
   local close = CreateFrame("Button", nil, m, "UIPanelCloseButton")
   close:SetPoint("TOPRIGHT", -6, -6)
 
@@ -2203,7 +2203,7 @@ InitMinimap = function()
   mb:SetScript("OnDragStop", function() this:SetScript("OnUpdate", nil) end)
   mb:SetScript("OnEnter", function()
     GameTooltip:SetOwner(this, "ANCHOR_LEFT")
-    GameTooltip:AddLine("Guild Recruiter")
+    GameTooltip:AddLine("Guild Rawcruiter")
     GameTooltip:AddLine("Left-click: settings", 1, 1, 1)
     GameTooltip:AddLine("Right-click: start / stop", 1, 1, 1)
     GameTooltip:Show()
@@ -2388,7 +2388,7 @@ SlashCmdList["GUILDRECRUITER"] = function(msg)
     RefreshConfig()
     Print(cmd.." "..(GuildRecruiter_Settings[key] and "ON" or "OFF"))
   else
-    Print("|cff33ff99GuildRecruiter v"..VERSION.."|r  --  /gr config, /gr list, /gr stats")
+    Print("|cff33ff99Guild Rawcruiter v"..VERSION.."|r  --  /gr config, /gr list, /gr stats")
     Print("start | stop | pause | resume | status | reset | forget | hide")
     Print("collect on|off (scan into a list) | inviteall (fast) | send (paced) | invite <name> | candidates | clearlist")
     Print("set invite/who/reinvite/cap/min/max/method/mode <v> | msg <text> | class <list|all>")

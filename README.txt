@@ -1,4 +1,4 @@
-GuildRecruiter  --  vanilla 1.12 / Turtle WoW guild recruitment helper   (v2.0)
+Guild Rawcruiter  --  vanilla 1.12 / Turtle WoW guild recruitment helper
 ==============================================================================
 
 Scans online players with /who and sends paced guild contacts (invite and/or
@@ -12,7 +12,9 @@ INSTALL
       <WoW>\Interface\AddOns\GuildRecruiter\GuildRecruiter.toc
 2. FULLY RESTART the game the first time (a /reload won't register a new addon,
    and the .toc version bump needs a restart too).
-3. Enable "GuildRecruiter" in the AddOns list at character select.
+3. Enable "Guild Rawcruiter" in the AddOns list at character select.
+   (The install folder stays named "GuildRecruiter" -- that's intentional, so
+    your saved settings carry over.)
 
 On load it prints which invite API it detected (e.g. "Invite API:
 GuildInviteByName" on Turtle). If /ginvite works manually, the addon works.

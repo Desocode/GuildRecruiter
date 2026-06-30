@@ -1,7 +1,7 @@
 ## Interface: 11200
-## Title: Guild Recruiter
+## Title: Guild Rawcruiter
 ## Notes: Paced guild recruitment via /who scanning (vanilla 1.12 / Turtle WoW)
 ## Author: Alex
-## Version: 3.14
+## Version: 3.15
 ## SavedVariables: GuildRecruiter_Settings
 GuildRecruiter.lua
