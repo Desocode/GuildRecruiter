@@ -19,7 +19,7 @@
 
 GuildRecruiter_Settings = GuildRecruiter_Settings or {}
 
-local VERSION    = "3.8"
+local VERSION    = "3.9"
 local CAP_HINT   = 49      -- treat a query returning >= this many as truncated
 local START_WIDTH = 10     -- initial level-band width to try
 local WHO_TIMEOUT = 12     -- give up waiting on a reply after this many seconds
@@ -183,6 +183,7 @@ local function Defaults()
   if not s.tally.days   then s.tally.days   = {} end
   if not s.varStats then s.varStats = {} end   -- [profile] = {contacted,joined,declined}
   if s.abOn == nil  then s.abOn = false end     -- simultaneous A/B: deal each contact a variant
+  if not s.abWeightA then s.abWeightA = 1 end   -- frequency weight of the control (variant A)
   -- abVariants are the CHALLENGERS only (B/C/D). Variant A is always the live
   -- Settings tab (the control), so it is never stored here.
   if not s.abVariants then s.abVariants = {} end
@@ -440,13 +441,33 @@ function GuildRecruiter_ABActive()
   return s.abOn and s.abVariants and table.getn(s.abVariants) >= 1
 end
 
--- deal a variant to a contact: nil = control A (live), else a challenger table.
+-- deal a variant to a contact, weighted by each variant's frequency. nil =
+-- control A (live). A's weight is s.abWeightA; each challenger has v.weight.
 function GuildRecruiter_PickVariant()
   if not GuildRecruiter_ABActive() then return nil end
-  local av = GuildRecruiter_Settings.abVariants
-  local r = random(0, table.getn(av))   -- 0 = control A (live settings)
-  if r == 0 then return nil end
-  return av[r]
+  local s = GuildRecruiter_Settings
+  local av = s.abVariants
+  local wA = s.abWeightA or 1
+  local total = wA
+  for i = 1, table.getn(av) do total = total + (av[i].weight or 1) end
+  local r = random(1, total)
+  if r <= wA then return nil end        -- landed in the control's share
+  r = r - wA
+  for i = 1, table.getn(av) do
+    local w = av[i].weight or 1
+    if r <= w then return av[i] end
+    r = r - w
+  end
+  return nil
+end
+
+-- adjust a variant's frequency weight (variant=nil means the control A). Clamped
+-- 1..9. GLOBAL so the A/B weight buttons add no upvalue to the panel builder.
+function GuildRecruiter_BumpWeight(variant, delta)
+  local s = GuildRecruiter_Settings
+  if variant then variant.weight = clamp((variant.weight or 1) + delta, 1, 9)
+  else s.abWeightA = clamp((s.abWeightA or 1) + delta, 1, 9) end
+  GuildRecruiter_RefreshOpen()
 end
 
 -- per-contact settings for a variant table (blank fields fall back to live)
@@ -947,11 +968,9 @@ local function BuildListsPanel(parent)
   fr.cycle = CreateFrame("Button", nil, fr, "UIPanelButtonTemplate")
   fr.cycle:SetPoint("TOP", 0, -38); fr.cycle:SetWidth(260); fr.cycle:SetHeight(22)
   fr.cycle:SetScript("OnClick", function()
-    local idx = 1
-    for i = 1, table.getn(LIST_ORDER) do if LIST_ORDER[i] == listMode then idx = i end end
-    idx = idx + 1; if idx > table.getn(LIST_ORDER) then idx = 1 end
-    listMode = LIST_ORDER[idx]; UpdateList()
+    GuildRecruiter_OpenMenu(this, LIST_ORDER, LIST_TITLE, function(v) listMode = v; UpdateList() end)
   end)
+  GuildRecruiter_DDArrow(fr.cycle)
 
   fr.hint = fr:CreateFontString(nil, "ARTWORK", "GameFontDisableSmall")
   fr.hint:SetPoint("TOP", 0, -62); fr.hint:SetText("click a name to remove it")
@@ -1155,7 +1174,7 @@ RefreshConfig = function()
   setBtn(configFrame.replyBtn,  mode == "whisperinvite")
   setBtn(configFrame.whisperBtn, mode == "whisper" or mode == "whisperinvite")
   configFrame.abNote:SetText(GuildRecruiter_ABActive()
-    and "|cff40ff40A/B on: this is variant A (control). Challengers: A/B tab.|r" or "")
+    and "|cff40ff40A/B on: this is variant A (control). Other variants: A/B tab.|r" or "")
 
   configFrame.updating = false
 end
@@ -1212,12 +1231,23 @@ local function BuildDDPopup()
     local t = ob:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
     t:SetPoint("LEFT", 4, 0); t:SetPoint("RIGHT", -4, 0); t:SetJustifyH("LEFT"); ob.text = t
     ob:SetScript("OnClick", function()
-      this.target[this.key] = this.value
+      if this.cb then this.cb(this.value)          -- generic menu (e.g. Lists view)
+      else this.target[this.key] = this.value end  -- settings/variant dropdown
       p:Hide(); GuildRecruiter_RefreshOpen()
     end)
     p.opts[i] = ob
   end
   ddPopup = p
+end
+
+-- a real dropdown is a button + a down-arrow; add the vanilla dropdown arrow so
+-- these read as comboboxes, not plain buttons. GLOBAL -> adds no panel upvalue.
+function GuildRecruiter_DDArrow(btn)
+  local a = btn:CreateTexture(nil, "OVERLAY")
+  -- scrollbar down-arrow: guaranteed present in 1.12 (FauxScrollFrame uses it)
+  a:SetTexture("Interface\\Buttons\\UI-ScrollBar-ScrollDownButton-Up")
+  a:SetWidth(18); a:SetHeight(18)
+  a:SetPoint("RIGHT", btn, "RIGHT", -3, 0)
 end
 
 -- refresh whichever panels are open (called after any dropdown pick)
@@ -1230,18 +1260,24 @@ end
 -- open the option list for `kind`, writing the picked value into `target`
 -- (defaults to the live settings table; pass a variant table for A/B rows)
 function GuildRecruiter_OpenDD(btn, kind, target)
-  if not ddPopup then BuildDDPopup() end
-  if ddPopup:IsShown() and ddPopup.kind == kind and ddPopup.target == target then ddPopup:Hide(); return end
   target = target or GuildRecruiter_Settings
   local def = DD_DEF[kind]
-  local order, label, key = def[1], def[2], def[3]
-  ddPopup.kind = kind; ddPopup.target = target
+  GuildRecruiter_OpenMenu(btn, def[1], def[2], nil, target, def[3])
+end
+
+-- open a list popup anchored under `btn`. Either supply (target,key) to write the
+-- picked value into a table, or a `cb(value)` to handle the pick yourself.
+function GuildRecruiter_OpenMenu(btn, order, label, cb, target, key)
+  if not ddPopup then BuildDDPopup() end
+  if ddPopup:IsShown() and ddPopup.owner == btn then ddPopup:Hide(); return end
+  ddPopup.owner = btn
   local n = table.getn(order)
   for i = 1, 6 do
     local ob = ddPopup.opts[i]
     if i <= n then
       local k = order[i]
-      ob.value = k; ob.target = target; ob.key = key; ob.text:SetText(label[k] or k); ob:Show()
+      ob.value = k; ob.cb = cb; ob.target = target; ob.key = key
+      ob.text:SetText(label[k] or k); ob:Show()
     else
       ob:Hide()
     end
@@ -1356,14 +1392,17 @@ local function BuildSettingsPanel(parent)
   fr.methodBtn = CreateFrame("Button", "GuildRecruiterConfigMethodBtn", fr, "UIPanelButtonTemplate")
   fr.methodBtn:SetPoint("TOPLEFT", 352, -78); fr.methodBtn:SetWidth(186); fr.methodBtn:SetHeight(22)
   fr.methodBtn:SetScript("OnClick", function() GuildRecruiter_OpenDD(this, "method") end)
+  GuildRecruiter_DDArrow(fr.methodBtn)
   Label(fr, "Mode:", 298, -108)
   fr.modeBtn = CreateFrame("Button", "GuildRecruiterConfigModeBtn", fr, "UIPanelButtonTemplate")
   fr.modeBtn:SetPoint("TOPLEFT", 352, -104); fr.modeBtn:SetWidth(186); fr.modeBtn:SetHeight(22)
   fr.modeBtn:SetScript("OnClick", function() GuildRecruiter_OpenDD(this, "mode") end)
+  GuildRecruiter_DDArrow(fr.modeBtn)
   Label(fr, "Reply:", 298, -134)
   fr.replyBtn = CreateFrame("Button", "GuildRecruiterConfigReplyBtn", fr, "UIPanelButtonTemplate")
   fr.replyBtn:SetPoint("TOPLEFT", 352, -130); fr.replyBtn:SetWidth(186); fr.replyBtn:SetHeight(22)
   fr.replyBtn:SetScript("OnClick", function() GuildRecruiter_OpenDD(this, "reply") end)
+  GuildRecruiter_DDArrow(fr.replyBtn)
   fr.syncCheck   = MakeCheck(fr, "GuildRecruiterConfigSync",   "Guild sync (dedup + split)",   298, -160, "guildSync")
   Label(fr, "Whisper message:", 298, -188)
   fr.whisperPreview = fr:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
@@ -1558,7 +1597,7 @@ RefreshStats = function()
   local s = GuildRecruiter_Settings
   tinsert(lines, " ")
   tinsert(lines, "|cffffd100By variant / profile|r   A/B test: "..(GuildRecruiter_ABActive() and "|cff40ff40ON|r" or "off")
-               .."  ("..table.getn(s.abVariants or {}).." challenger(s), * = active)")
+               .."  (A + "..table.getn(s.abVariants or {}).." variant(s), * = active)")
   -- names currently in the live A/B test: "A" (control) + each challenger
   local active = {}
   if GuildRecruiter_ABActive() then
@@ -1601,12 +1640,20 @@ local abFrame
 local AB_MAX = 4                 -- A + 3 challengers
 local MAX_CHAL = AB_MAX - 1
 
--- one-line conversion blurb for a variant name, from saved varStats
+-- compact per-variant conversion (joined / that variant's own contacted). This
+-- is the FAIR A/B metric -- it's a rate, so a variant shown less often (lower
+-- weight) is not penalised vs one shown more.
 local function ConvBlurb(name)
   local vs = GuildRecruiter_Settings.varStats and GuildRecruiter_Settings.varStats[name]
   local c = (vs and vs.contacted) or 0
   local conv = (c > 0) and (math.floor(((vs.joined or 0) / c) * 100 + 0.5).."%") or "--"
-  return "conv "..conv.."   ("..((vs and vs.joined) or 0).." joined / "..c.." contacted)"
+  return "|cff40ff40"..conv.."|r conv  ("..((vs and vs.joined) or 0).."/"..c..")"
+end
+
+-- a variant's share of the contact stream given its weight and the pool total
+local function WeightPct(w, total)
+  if total <= 0 then return "--" end
+  return math.floor(w / total * 100 + 0.5).."%"
 end
 
 -- short, truncated preview of a message (blank shows a hint)
@@ -1627,7 +1674,7 @@ local function BuildABPanel(parent)
     GuildRecruiter_Settings.abOn = not GuildRecruiter_Settings.abOn; GuildRecruiter_RefreshOpen()
   end)
   fr.addBtn = CreateFrame("Button", nil, fr, "UIPanelButtonTemplate")
-  fr.addBtn:SetPoint("LEFT", fr.toggle, "RIGHT", 8, 0); fr.addBtn:SetWidth(140); fr.addBtn:SetHeight(22); fr.addBtn:SetText("+ Add challenger")
+  fr.addBtn:SetPoint("LEFT", fr.toggle, "RIGHT", 8, 0); fr.addBtn:SetWidth(120); fr.addBtn:SetHeight(22); fr.addBtn:SetText("+ Add variant")
   fr.addBtn:SetScript("OnClick", function()
     local av = GuildRecruiter_Settings.abVariants
     if table.getn(av) >= MAX_CHAL then return end
@@ -1643,18 +1690,22 @@ local function BuildABPanel(parent)
   fr.hint = fr:CreateFontString(nil, "ARTWORK", "GameFontDisableSmall")
   fr.hint:SetPoint("TOPLEFT", 18, -90); fr.hint:SetWidth(524); fr.hint:SetJustifyH("LEFT")
 
-  -- control row (variant A = the Settings tab), read-only here
+  -- control row (variant A = the Settings tab), read-only here except its weight
   local cr = CreateFrame("Frame", nil, fr)
-  cr:SetPoint("TOPLEFT", 16, -116); cr:SetPoint("RIGHT", fr, "RIGHT", -16, 0); cr:SetHeight(40)
+  cr:SetPoint("TOPLEFT", 16, -116); cr:SetPoint("RIGHT", fr, "RIGHT", -16, 0); cr:SetHeight(44)
   cr.nameFS = cr:CreateFontString(nil, "ARTWORK", "GameFontNormal")
-  cr.nameFS:SetPoint("TOPLEFT", 2, 0); cr.nameFS:SetText("Variant A  |cff999999(control -- your Settings tab)|r")
+  cr.nameFS:SetPoint("TOPLEFT", 2, 0); cr.nameFS:SetText("Variant A  |cff999999(control = Settings)|r")
   cr.convFS = cr:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
   cr.convFS:SetPoint("LEFT", cr.nameFS, "RIGHT", 12, 0)
-  cr.msgFS = cr:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
-  cr.msgFS:SetPoint("TOPLEFT", 14, -20); cr.msgFS:SetWidth(380); cr.msgFS:SetJustifyH("LEFT")
   cr.editBtn = CreateFrame("Button", nil, cr, "UIPanelButtonTemplate")
   cr.editBtn:SetPoint("TOPRIGHT", 0, 0); cr.editBtn:SetWidth(110); cr.editBtn:SetHeight(20); cr.editBtn:SetText("Open Settings")
   cr.editBtn:SetScript("OnClick", function() GuildRecruiter_GotoSettings() end)
+  cr.wtBtn = CreateFrame("Button", nil, cr, "UIPanelButtonTemplate")
+  cr.wtBtn:SetPoint("TOPLEFT", 14, -22); cr.wtBtn:SetWidth(132); cr.wtBtn:SetHeight(20)
+  cr.wtBtn:RegisterForClicks("LeftButtonUp", "RightButtonUp")
+  cr.wtBtn:SetScript("OnClick", function() GuildRecruiter_BumpWeight(nil, arg1 == "RightButton" and -1 or 1) end)
+  cr.msgFS = cr:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
+  cr.msgFS:SetPoint("TOPLEFT", 154, -24); cr.msgFS:SetWidth(236); cr.msgFS:SetJustifyH("LEFT")
   fr.ctrl = cr
 
   fr.rows = {}
@@ -1671,17 +1722,22 @@ local function BuildABPanel(parent)
     local md = CreateFrame("Button", nil, row, "UIPanelButtonTemplate")
     md:SetPoint("TOPLEFT", 14, -22); md:SetWidth(150); md:SetHeight(20)
     md:SetScript("OnClick", function() GuildRecruiter_OpenDD(this, "mode", this.variant) end)
-    row.modeBtn = md
+    GuildRecruiter_DDArrow(md); row.modeBtn = md
     local rp = CreateFrame("Button", nil, row, "UIPanelButtonTemplate")
     rp:SetPoint("LEFT", md, "RIGHT", 8, 0); rp:SetWidth(150); rp:SetHeight(20)
     rp:SetScript("OnClick", function() GuildRecruiter_OpenDD(this, "reply", this.variant) end)
-    row.replyBtn = rp
+    GuildRecruiter_DDArrow(rp); row.replyBtn = rp
     local mb = CreateFrame("Button", nil, row, "UIPanelButtonTemplate")
     mb:SetPoint("LEFT", rp, "RIGHT", 8, 0); mb:SetWidth(140); mb:SetHeight(20); mb:SetText("Edit message...")
     mb:SetScript("OnClick", function() GuildRecruiter_EditMessage(this.variant) end)
     row.msgBtn = mb
+    local wb = CreateFrame("Button", nil, row, "UIPanelButtonTemplate")
+    wb:SetPoint("TOPLEFT", 16, -44); wb:SetWidth(132); wb:SetHeight(20)
+    wb:RegisterForClicks("LeftButtonUp", "RightButtonUp")
+    wb:SetScript("OnClick", function() GuildRecruiter_BumpWeight(this.variant, arg1 == "RightButton" and -1 or 1) end)
+    row.wtBtn = wb
     row.msgFS = row:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
-    row.msgFS:SetPoint("TOPLEFT", 16, -44); row.msgFS:SetWidth(500); row.msgFS:SetJustifyH("LEFT")
+    row.msgFS:SetPoint("TOPLEFT", 156, -46); row.msgFS:SetWidth(350); row.msgFS:SetJustifyH("LEFT")
     row:Hide()
     fr.rows[i] = row
   end
@@ -1697,24 +1753,31 @@ RefreshABPanel = function()
   local n = table.getn(av)               -- challenger count
   abFrame.toggle:SetText("A/B: "..(s.abOn and "|cff40ff40Running|r" or "Off"))
   if s.abOn and n < 1 then
-    abFrame.hint:SetText("A/B is on but has no challenger yet -- click '+ Add challenger' to test a variant against A (your Settings).")
+    abFrame.hint:SetText("A/B is on but has no other variant yet -- click '+ Add variant' to test one against A (your Settings).")
   else
-    abFrame.hint:SetText("Each contact is randomly dealt variant A (your Settings tab) or one of the challengers below. Blank challenger fields inherit A.")
+    abFrame.hint:SetText("Each contact is dealt a variant by Weight (left-click +, right-click -). Blank variant fields inherit A. Compare the green conv% -- it's a rate, so weight doesn't skew it.")
   end
   if n >= MAX_CHAL then abFrame.addBtn:Disable() else abFrame.addBtn:Enable() end
 
+  local wA = s.abWeightA or 1
+  local totalW = wA
+  for i = 1, n do totalW = totalW + (av[i].weight or 1) end
+
   abFrame.ctrl.convFS:SetText(ConvBlurb("A"))
   abFrame.ctrl.msgFS:SetText(MsgPreview(s.whisperMsg, "(no message)"))
+  abFrame.ctrl.wtBtn:SetText("Weight "..wA.."  ("..WeightPct(wA, totalW)..")")
 
   for i = 1, MAX_CHAL do
     local row = abFrame.rows[i]
     if i <= n then
       local v = av[i]
+      local w = v.weight or 1
       row.nameFS:SetText("Variant "..(v.name or "?"))
       row.convFS:SetText(ConvBlurb(v.name))
       row.modeBtn.variant = v;  row.modeBtn:SetText(MODE_LABEL[v.mode or s.mode] or "?")
       row.replyBtn.variant = v; row.replyBtn:SetText(REPLY_LABEL[v.replyMode or s.replyMode] or "?")
       row.msgBtn.variant = v
+      row.wtBtn.variant = v;    row.wtBtn:SetText("Weight "..w.."  ("..WeightPct(w, totalW)..")")
       row.msgFS:SetText(MsgPreview(v.whisperMsg, "(same message as A)"))
       row:Show()
     else
@@ -1946,9 +2009,9 @@ SlashCmdList["GUILDRECRUITER"] = function(msg)
     local sub = string.lower(larg or "")
     if sub == "on" or sub == "off" then
       GuildRecruiter_Settings.abOn = (sub == "on"); GuildRecruiter_RefreshOpen()
-      Print("Simultaneous A/B "..(GuildRecruiter_Settings.abOn and "ON" or "OFF").."  ("..table.getn(GuildRecruiter_Settings.abVariants).." challenger(s) vs A).")
+      Print("Simultaneous A/B "..(GuildRecruiter_Settings.abOn and "ON" or "OFF").."  (A + "..table.getn(GuildRecruiter_Settings.abVariants).." variant(s)).")
     elseif sub == "clear" then
-      GuildRecruiter_Settings.abVariants = {}; GuildRecruiter_RefreshOpen(); Print("A/B challengers cleared (variant A = your Settings is unaffected).")
+      GuildRecruiter_Settings.abVariants = {}; GuildRecruiter_RefreshOpen(); Print("A/B variants cleared (variant A = your Settings is unaffected).")
     else
       GuildRecruiter_ToggleAB()   -- open the A/B tab to set variants up
     end
