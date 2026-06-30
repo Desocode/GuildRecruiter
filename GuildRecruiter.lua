@@ -19,7 +19,7 @@
 
 GuildRecruiter_Settings = GuildRecruiter_Settings or {}
 
-local VERSION    = "3.7"
+local VERSION    = "3.8"
 local CAP_HINT   = 49      -- treat a query returning >= this many as truncated
 local START_WIDTH = 10     -- initial level-band width to try
 local WHO_TIMEOUT = 12     -- give up waiting on a reply after this many seconds
@@ -49,10 +49,13 @@ local MODE_LABEL = {
 local METHOD_SHORT = { auto = "Auto", byname = "GuildInviteByName", invite = "GuildInvite", chat = "/ginvite" }
 local MODE_SHORT   = { invite = "Invite only", whisper = "Whisper only", whisperinvite = "Whisper, then invite" }
 
--- default whisper; OLD_WHISPER is migrated to NEW_WHISPER so testers on the old
--- default pick up the better one (custom messages are left untouched)
-local OLD_WHISPER = "Hi %p! We're recruiting for %g -- whisper me back if you're interested and I'll send an invite. :)"
-local NEW_WHISPER = "Hi %p! :) I'm recruiting for <%g>, a friendly and active guild that loves grouping up for quests, dungeons and raids. If you're after a guild, just whisper me back and I'll send an invite -- no pressure either way!"
+-- default whisper. Kept short and plain on purpose -- a one-line, low-pressure
+-- ask reads as a person, not an ad, and fits the message box without scrolling.
+-- Any earlier built-in default (OLD/LONG) is migrated forward; a message the
+-- user actually customised is never touched.
+local OLD_WHISPER  = "Hi %p! We're recruiting for %g -- whisper me back if you're interested and I'll send an invite. :)"
+local LONG_WHISPER = "Hi %p! :) I'm recruiting for <%g>, a friendly and active guild that loves grouping up for quests, dungeons and raids. If you're after a guild, just whisper me back and I'll send an invite -- no pressure either way!"
+local NEW_WHISPER  = "Hi %p! Want an invite to <%g>? Just whisper back. :)"
 
 -- a reply matching any of these is treated as a refusal (no invite). Everything
 -- else -- "sure", "y", "ok", "yea", typos, even a question -- counts as interest.
@@ -152,7 +155,7 @@ local function Defaults()
   if s.hideWho == nil   then s.hideWho      = true end
   if not s.inviteMethod then s.inviteMethod = "auto" end
   if not s.mode         then s.mode         = "invite" end  -- invite|whisper|whisperinvite
-  if not s.whisperMsg or s.whisperMsg == OLD_WHISPER then s.whisperMsg = NEW_WHISPER end
+  if not s.whisperMsg or s.whisperMsg == OLD_WHISPER or s.whisperMsg == LONG_WHISPER then s.whisperMsg = NEW_WHISPER end
   if not s.minLevel     then s.minLevel     = 1 end
   if not s.maxLevel     then s.maxLevel     = 60 end
   if not s.classFilter  then s.classFilter  = nil end  -- nil = all classes; else set of lowercase names
@@ -180,15 +183,31 @@ local function Defaults()
   if not s.tally.days   then s.tally.days   = {} end
   if not s.varStats then s.varStats = {} end   -- [profile] = {contacted,joined,declined}
   if s.abOn == nil  then s.abOn = false end     -- simultaneous A/B: deal each contact a variant
-  if not s.abVariants then s.abVariants = {} end -- inline variants {name,mode,whisperMsg,inviteMethod,replyMode}
-  for i = 1, table.getn(s.abVariants) do        -- migrate old flagged-profile-name strings -> tables
+  -- abVariants are the CHALLENGERS only (B/C/D). Variant A is always the live
+  -- Settings tab (the control), so it is never stored here.
+  if not s.abVariants then s.abVariants = {} end
+  local chal, used = {}, {}                       -- max 3 challengers; names B/C/D, kept stable
+  for i = 1, table.getn(s.abVariants) do
     local v = s.abVariants[i]
-    if type(v) == "string" then
+    if type(v) == "string" then                   -- legacy: flagged-profile-name string -> table
       local p = s.profiles and s.profiles[v]
-      s.abVariants[i] = { name = v, mode = p and p.mode, whisperMsg = p and p.whisperMsg,
-                          inviteMethod = p and p.inviteMethod, replyMode = p and p.replyMode }
+      v = { mode = p and p.mode, whisperMsg = p and p.whisperMsg,
+            inviteMethod = p and p.inviteMethod, replyMode = p and p.replyMode }
+    end
+    -- "A" used to be a stored variant; it's the control now, so drop it. Keep an
+    -- already-valid, unused B/C/D name as-is (so stats stay attached); only mint
+    -- a new name for a bad/missing/duplicate one. Never reshuffle on load.
+    if v.name ~= "A" and table.getn(chal) < 3 then
+      local nm = v.name
+      if (nm ~= "B" and nm ~= "C" and nm ~= "D") or used[nm] then
+        nm = nil
+        for k = 1, 3 do local c = string.sub("BCD", k, k); if not used[c] then nm = c; break end end
+      end
+      v.name = nm; used[nm] = true
+      tinsert(chal, v)
     end
   end
+  s.abVariants = chal
   if not s.minimapAngle then s.minimapAngle = 210 end
   -- prune history past the cooldown so the saved table can't grow forever
   if s.reinviteDays > 0 then
@@ -413,14 +432,21 @@ function GuildRecruiter_VarBump(profile, field)
   vs[profile][field] = (vs[profile][field] or 0) + 1
 end
 
--- A/B variants are inline tables {name, mode, whisperMsg, inviteMethod, replyMode}.
--- PickVariant returns the variant table dealt to this contact (nil = use live).
-function GuildRecruiter_PickVariant()
+-- A/B model: variant "A" is the live Settings config (the control) and is NOT
+-- stored; s.abVariants holds only the challengers (B/C/D). A/B is "active" once
+-- it's switched on AND at least one challenger exists (so the pool is A + >=1).
+function GuildRecruiter_ABActive()
   local s = GuildRecruiter_Settings
-  if s.abOn and s.abVariants and table.getn(s.abVariants) >= 2 then
-    return s.abVariants[random(1, table.getn(s.abVariants))]
-  end
-  return nil
+  return s.abOn and s.abVariants and table.getn(s.abVariants) >= 1
+end
+
+-- deal a variant to a contact: nil = control A (live), else a challenger table.
+function GuildRecruiter_PickVariant()
+  if not GuildRecruiter_ABActive() then return nil end
+  local av = GuildRecruiter_Settings.abVariants
+  local r = random(0, table.getn(av))   -- 0 = control A (live settings)
+  if r == 0 then return nil end
+  return av[r]
 end
 
 -- per-contact settings for a variant table (blank fields fall back to live)
@@ -452,9 +478,11 @@ end
 
 -- perform the configured contact action for one name (variant chosen per A/B)
 local function Contact(name)
-  local v = GuildRecruiter_PickVariant()                 -- variant table or nil (live)
+  local v = GuildRecruiter_PickVariant()                 -- challenger table, or nil = control A
   local cfg = GuildRecruiter_CfgOf(v)
-  local vname = (v and v.name) or GuildRecruiter_Settings.activeProfile
+  -- during an A/B test a nil pick is the control, credited as "A"; otherwise
+  -- (A/B off) it's just the active profile, for sequential profile comparison.
+  local vname = (v and v.name) or (GuildRecruiter_ABActive() and "A") or GuildRecruiter_Settings.activeProfile
   if cfg.mode == "whisper" then
     SendChatMessage(WhisperBody(name, cfg.whisperMsg), "WHISPER", nil, name)
     stats.whispered = stats.whispered + 1; TallyBump("whispered")
@@ -1103,7 +1131,9 @@ RefreshConfig = function()
   configFrame.whoEdit:SetText(tostring(s.whoDelay))
   configFrame.methodBtn:SetText(METHOD_LABEL[s.inviteMethod] or s.inviteMethod)
   configFrame.modeBtn:SetText(MODE_LABEL[s.mode] or s.mode)
-  configFrame.whisperEdit:SetText(s.whisperMsg or "")
+  local msg = s.whisperMsg or ""
+  if string.len(msg) > 84 then msg = string.sub(msg, 1, 82).."..." end
+  configFrame.whisperPreview:SetText(msg ~= "" and ("|cffd0d0d0"..msg.."|r") or "|cff808080(empty)|r")
   configFrame.minEdit:SetText(tostring(s.minLevel))
   configFrame.maxEdit:SetText(tostring(s.maxLevel))
   configFrame.capEdit:SetText(tostring(s.sessionCap))
@@ -1114,21 +1144,18 @@ RefreshConfig = function()
   configFrame.quietCheck:SetChecked(s.quietWho)
   configFrame.replyBtn:SetText(REPLY_LABEL[s.replyMode] or s.replyMode)
 
-  -- enable controls only where they make sense in the current combination:
-  --   A/B on  -> per-contact settings come from the variant profiles, so the
-  --              live mode/method/reply/whisper are overridden (greyed out)
+  -- This tab is always variant A (the control) and never locks. We only enable
+  -- controls where they make sense for the current MODE:
   --   method  -> only matters when we actually invite (not whisper-only mode)
   --   reply   -> only matters in whisper-then-invite mode
   --   whisper -> only matters when a whisper is sent (whisper or whisperinvite)
-  local ab, mode = s.abOn, s.mode
+  local mode = s.mode
   local function setBtn(b, on) if on then b:Enable() else b:Disable() end end
-  setBtn(configFrame.modeBtn,   not ab)
-  setBtn(configFrame.methodBtn, not ab and mode ~= "whisper")
-  setBtn(configFrame.replyBtn,  not ab and mode == "whisperinvite")
-  local wOn = not ab and (mode == "whisper" or mode == "whisperinvite")
-  if wOn then configFrame.whisperEdit:EnableMouse(true); configFrame.whisperEdit:SetTextColor(1, 1, 1)
-  else configFrame.whisperEdit:EnableMouse(false); configFrame.whisperEdit:SetTextColor(0.5, 0.5, 0.5) end
-  configFrame.abNote:SetText(ab and "|cff40ff40A/B on -- mode/method/reply/message come from the variant profiles|r" or "")
+  setBtn(configFrame.methodBtn, mode ~= "whisper")
+  setBtn(configFrame.replyBtn,  mode == "whisperinvite")
+  setBtn(configFrame.whisperBtn, mode == "whisper" or mode == "whisperinvite")
+  configFrame.abNote:SetText(GuildRecruiter_ABActive()
+    and "|cff40ff40A/B on: this is variant A (control). Challengers: A/B tab.|r" or "")
 
   configFrame.updating = false
 end
@@ -1226,6 +1253,87 @@ function GuildRecruiter_OpenDD(btn, kind, target)
   ddPopup:Show()
 end
 
+-- ---------------------------------------------------------------------------
+-- Shared multi-line message editor. A single-line box can't show a 200-char
+-- whisper; this popup wraps the whole message so you can read while editing.
+-- Opened by the Settings tab (variant A) and each A/B challenger row; it writes
+-- back to whichever target table it was opened for. GLOBAL open handler so the
+-- caller buttons add no upvalue.
+-- ---------------------------------------------------------------------------
+local msgEditor
+
+local function BuildMsgEditor()
+  local f = CreateFrame("Frame", "GuildRecruiterMsgEditor", UIParent)
+  f:SetFrameStrata("FULLSCREEN_DIALOG")
+  f:SetWidth(430); f:SetHeight(200); f:SetPoint("CENTER", 0, 80)
+  f:SetBackdrop({
+    bgFile = "Interface\\DialogFrame\\UI-DialogBox-Background",
+    edgeFile = "Interface\\DialogFrame\\UI-DialogBox-Border",
+    tile = true, tileSize = 32, edgeSize = 24,
+    insets = { left = 8, right = 8, top = 8, bottom = 8 },
+  })
+  f:EnableMouse(true); f:Hide()
+  tinsert(UISpecialFrames, "GuildRecruiterMsgEditor")   -- Escape closes (house rule)
+
+  f.titleFS = f:CreateFontString(nil, "ARTWORK", "GameFontNormal")
+  f.titleFS:SetPoint("TOP", 0, -16)
+  local hint = f:CreateFontString(nil, "ARTWORK", "GameFontNormalSmall")
+  hint:SetPoint("TOPLEFT", 20, -40); hint:SetText("|cff999999%p = player name    %g = guild name|r")
+
+  local box = CreateFrame("Frame", nil, f)
+  box:SetPoint("TOPLEFT", 18, -58); box:SetPoint("TOPRIGHT", -18, -58); box:SetHeight(80)
+  box:SetBackdrop({
+    bgFile = "Interface\\ChatFrame\\ChatFrameBackground",
+    edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
+    tile = true, tileSize = 16, edgeSize = 14,
+    insets = { left = 4, right = 4, top = 4, bottom = 4 },
+  })
+  box:SetBackdropColor(0, 0, 0, 0.6)
+
+  local eb = CreateFrame("EditBox", "GuildRecruiterMsgEditBox", box)
+  eb:SetPoint("TOPLEFT", 8, -6); eb:SetPoint("BOTTOMRIGHT", -8, 6)
+  if eb.SetMultiLine then eb:SetMultiLine(true) end
+  eb:SetFont("Fonts\\FRIZQT__.TTF", 12)
+  eb:SetMaxLetters(255); eb:SetAutoFocus(false); eb:SetTextInsets(2, 2, 2, 2)
+  eb:SetScript("OnEscapePressed", function() f:Hide() end)
+  f.eb = eb
+
+  f.countFS = f:CreateFontString(nil, "ARTWORK", "GameFontDisableSmall")
+  f.countFS:SetPoint("TOPRIGHT", box, "BOTTOMRIGHT", 0, -4)
+  eb:SetScript("OnTextChanged", function() f.countFS:SetText(string.len(this:GetText()).."/255") end)
+
+  local save = CreateFrame("Button", nil, f, "UIPanelButtonTemplate")
+  save:SetWidth(96); save:SetHeight(24); save:SetPoint("BOTTOMRIGHT", -18, 14); save:SetText("Save")
+  save:SetScript("OnClick", function()
+    local t = f.eb:GetText() or ""
+    t = string.gsub(t, "\n", " "); t = string.gsub(t, "\r", "")   -- whispers are one line
+    t = string.gsub(t, "^%s+", ""); t = string.gsub(t, "%s+$", "")
+    if f.target == GuildRecruiter_Settings then
+      f.target.whisperMsg = t                       -- control: keep exactly what was typed
+    else
+      f.target.whisperMsg = (t ~= "" and t) or nil  -- challenger: blank = inherit variant A
+    end
+    f:Hide(); GuildRecruiter_RefreshOpen()
+  end)
+  local cancel = CreateFrame("Button", nil, f, "UIPanelButtonTemplate")
+  cancel:SetWidth(96); cancel:SetHeight(24); cancel:SetPoint("RIGHT", save, "LEFT", -8, 0); cancel:SetText("Cancel")
+  cancel:SetScript("OnClick", function() f:Hide() end)
+
+  msgEditor = f
+end
+
+-- open the editor bound to `target` (GuildRecruiter_Settings for variant A, or a
+-- challenger table). Blank in a challenger means "inherit variant A's message".
+function GuildRecruiter_EditMessage(target)
+  if not msgEditor then BuildMsgEditor() end
+  msgEditor.target = target
+  local ctrl = (target == GuildRecruiter_Settings)
+  msgEditor.titleFS:SetText(ctrl and "Whisper message -- Variant A (control)"
+                                  or ("Whisper message -- Variant "..(target.name or "?").." (blank = same as A)"))
+  msgEditor.eb:SetText(target.whisperMsg or "")
+  msgEditor:Show(); msgEditor.eb:SetFocus(); msgEditor.eb:SetCursorPosition(0)
+end
+
 local function BuildSettingsPanel(parent)
   local fr = CreateFrame("Frame", "GuildRecruiterConfig", parent)
   fr:SetAllPoints(parent)
@@ -1257,14 +1365,16 @@ local function BuildSettingsPanel(parent)
   fr.replyBtn:SetPoint("TOPLEFT", 352, -130); fr.replyBtn:SetWidth(186); fr.replyBtn:SetHeight(22)
   fr.replyBtn:SetScript("OnClick", function() GuildRecruiter_OpenDD(this, "reply") end)
   fr.syncCheck   = MakeCheck(fr, "GuildRecruiterConfigSync",   "Guild sync (dedup + split)",   298, -160, "guildSync")
-  Label(fr, "Whisper (%p name, %g guild):", 298, -188)
-  fr.whisperEdit = CreateFrame("EditBox", "GuildRecruiterConfigWhisper", fr, "InputBoxTemplate")
-  fr.whisperEdit:SetPoint("TOPLEFT", 298, -204); fr.whisperEdit:SetWidth(240); fr.whisperEdit:SetHeight(20)
-  fr.whisperEdit:SetAutoFocus(false); fr.whisperEdit:SetMaxLetters(255)
-  fr.whisperEdit:SetScript("OnEnterPressed", function() GuildRecruiter_Settings.whisperMsg = this:GetText(); this:ClearFocus() end)
-  fr.whisperEdit:SetScript("OnEscapePressed", function() this:ClearFocus() end)
+  Label(fr, "Whisper message:", 298, -188)
+  fr.whisperPreview = fr:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
+  fr.whisperPreview:SetPoint("TOPLEFT", 298, -204); fr.whisperPreview:SetWidth(240)
+  fr.whisperPreview:SetJustifyH("LEFT"); fr.whisperPreview:SetJustifyV("TOP"); fr.whisperPreview:SetHeight(30)
+  fr.whisperBtn = CreateFrame("Button", "GuildRecruiterConfigWhisperBtn", fr, "UIPanelButtonTemplate")
+  fr.whisperBtn:SetPoint("TOPLEFT", 298, -238); fr.whisperBtn:SetWidth(130); fr.whisperBtn:SetHeight(22)
+  fr.whisperBtn:SetText("Edit message...")
+  fr.whisperBtn:SetScript("OnClick", function() GuildRecruiter_EditMessage(GuildRecruiter_Settings) end)
   fr.abNote = fr:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
-  fr.abNote:SetPoint("TOPLEFT", 298, -226); fr.abNote:SetWidth(240); fr.abNote:SetJustifyH("LEFT")
+  fr.abNote:SetPoint("TOPLEFT", 298, -264); fr.abNote:SetWidth(240); fr.abNote:SetJustifyH("LEFT")
 
   Header(fr, "Targets", 292, -284, 250)
   Label(fr, "Levels", 298, -314)
@@ -1447,22 +1557,27 @@ RefreshStats = function()
   -- per-profile conversion comparison (for A/B): conv = joined / contacted
   local s = GuildRecruiter_Settings
   tinsert(lines, " ")
-  tinsert(lines, "|cffffd100By profile|r   A/B test: "..(s.abOn and "|cff40ff40ON|r" or "off")
-               .."  ("..table.getn(s.abVariants or {}).." variants, * below)")
+  tinsert(lines, "|cffffd100By variant / profile|r   A/B test: "..(GuildRecruiter_ABActive() and "|cff40ff40ON|r" or "off")
+               .."  ("..table.getn(s.abVariants or {}).." challenger(s), * = active)")
+  -- names currently in the live A/B test: "A" (control) + each challenger
+  local active = {}
+  if GuildRecruiter_ABActive() then
+    active["A"] = true
+    for j = 1, table.getn(s.abVariants) do active[s.abVariants[j].name] = true end
+  end
   local vs = s.varStats or {}
   local vnames = {}
   for v in vs do tinsert(vnames, v) end
   table.sort(vnames)
   if table.getn(vnames) == 0 then
-    tinsert(lines, "no per-profile data yet -- load a profile (or /gr ab add), then recruit")
+    tinsert(lines, "no per-variant data yet -- run an A/B test (A/B tab) or load profiles, then recruit")
   else
     for i = 1, table.getn(vnames) do
       if i > 6 then tinsert(lines, "(+"..(table.getn(vnames) - 6).." more)"); break end
       local v = vnames[i]; local r = vs[v]
       local c = r.contacted or 0
       local conv = (c > 0) and (math.floor((r.joined or 0) / c * 100 + 0.5).."%") or "--"
-      local flag = ""
-      for j = 1, table.getn(s.abVariants or {}) do if s.abVariants[j] == v then flag = " |cff40ff40*|r" end end
+      local flag = active[v] and " |cff40ff40*|r" or ""
       tinsert(lines, v..flag..":  contacted "..c..", joined "..(r.joined or 0)
                    ..", declined "..(r.declined or 0).."  (conv "..conv..")")
     end
@@ -1479,10 +1594,27 @@ RefreshStats = function()
 end
 
 -- ---------------------------------------------------------------------------
--- A/B tab: first-class variants you edit in place
+-- A/B tab: variant A is the live Settings tab (the control); this tab adds the
+-- challengers (B/C/D) to test against it. Up to AB_MAX variants total = 1 + 3.
 -- ---------------------------------------------------------------------------
 local abFrame
-local AB_MAX = 4
+local AB_MAX = 4                 -- A + 3 challengers
+local MAX_CHAL = AB_MAX - 1
+
+-- one-line conversion blurb for a variant name, from saved varStats
+local function ConvBlurb(name)
+  local vs = GuildRecruiter_Settings.varStats and GuildRecruiter_Settings.varStats[name]
+  local c = (vs and vs.contacted) or 0
+  local conv = (c > 0) and (math.floor(((vs.joined or 0) / c) * 100 + 0.5).."%") or "--"
+  return "conv "..conv.."   ("..((vs and vs.joined) or 0).." joined / "..c.." contacted)"
+end
+
+-- short, truncated preview of a message (blank shows a hint)
+local function MsgPreview(msg, blankHint)
+  if not msg or msg == "" then return "|cff808080"..(blankHint or "(empty)").."|r" end
+  if string.len(msg) > 86 then msg = string.sub(msg, 1, 84).."..." end
+  return "|cffd0d0d0"..msg.."|r"
+end
 
 local function BuildABPanel(parent)
   local fr = CreateFrame("Frame", "GuildRecruiterAB", parent)
@@ -1492,28 +1624,43 @@ local function BuildABPanel(parent)
   fr.toggle = CreateFrame("Button", nil, fr, "UIPanelButtonTemplate")
   fr.toggle:SetPoint("TOPLEFT", 18, -62); fr.toggle:SetWidth(150); fr.toggle:SetHeight(22)
   fr.toggle:SetScript("OnClick", function()
-    GuildRecruiter_Settings.abOn = not GuildRecruiter_Settings.abOn; RefreshABPanel()
+    GuildRecruiter_Settings.abOn = not GuildRecruiter_Settings.abOn; GuildRecruiter_RefreshOpen()
   end)
   fr.addBtn = CreateFrame("Button", nil, fr, "UIPanelButtonTemplate")
-  fr.addBtn:SetPoint("LEFT", fr.toggle, "RIGHT", 8, 0); fr.addBtn:SetWidth(120); fr.addBtn:SetHeight(22); fr.addBtn:SetText("+ Add variant")
+  fr.addBtn:SetPoint("LEFT", fr.toggle, "RIGHT", 8, 0); fr.addBtn:SetWidth(140); fr.addBtn:SetHeight(22); fr.addBtn:SetText("+ Add challenger")
   fr.addBtn:SetScript("OnClick", function()
     local av = GuildRecruiter_Settings.abVariants
-    if table.getn(av) >= AB_MAX then return end
+    if table.getn(av) >= MAX_CHAL then return end
     local s = GuildRecruiter_Settings
     local used = {}
     for i = 1, table.getn(av) do used[av[i].name] = true end
-    local letter                                   -- first free letter (so removing A then adding gives A, not a dupe)
-    for i = 1, AB_MAX do local c = string.sub("ABCD", i, i); if not used[c] then letter = c; break end end
+    local letter                          -- first free challenger letter B/C/D
+    for i = 1, MAX_CHAL do local c = string.sub("BCD", i, i); if not used[c] then letter = c; break end end
+    -- seeded from A (live) so a new challenger starts identical, then you tweak
     tinsert(av, { name = letter, mode = s.mode, whisperMsg = s.whisperMsg, inviteMethod = s.inviteMethod, replyMode = s.replyMode })
     RefreshABPanel()
   end)
   fr.hint = fr:CreateFontString(nil, "ARTWORK", "GameFontDisableSmall")
   fr.hint:SetPoint("TOPLEFT", 18, -90); fr.hint:SetWidth(524); fr.hint:SetJustifyH("LEFT")
 
+  -- control row (variant A = the Settings tab), read-only here
+  local cr = CreateFrame("Frame", nil, fr)
+  cr:SetPoint("TOPLEFT", 16, -116); cr:SetPoint("RIGHT", fr, "RIGHT", -16, 0); cr:SetHeight(40)
+  cr.nameFS = cr:CreateFontString(nil, "ARTWORK", "GameFontNormal")
+  cr.nameFS:SetPoint("TOPLEFT", 2, 0); cr.nameFS:SetText("Variant A  |cff999999(control -- your Settings tab)|r")
+  cr.convFS = cr:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
+  cr.convFS:SetPoint("LEFT", cr.nameFS, "RIGHT", 12, 0)
+  cr.msgFS = cr:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
+  cr.msgFS:SetPoint("TOPLEFT", 14, -20); cr.msgFS:SetWidth(380); cr.msgFS:SetJustifyH("LEFT")
+  cr.editBtn = CreateFrame("Button", nil, cr, "UIPanelButtonTemplate")
+  cr.editBtn:SetPoint("TOPRIGHT", 0, 0); cr.editBtn:SetWidth(110); cr.editBtn:SetHeight(20); cr.editBtn:SetText("Open Settings")
+  cr.editBtn:SetScript("OnClick", function() GuildRecruiter_GotoSettings() end)
+  fr.ctrl = cr
+
   fr.rows = {}
-  for i = 1, AB_MAX do
+  for i = 1, MAX_CHAL do
     local row = CreateFrame("Frame", nil, fr)
-    row:SetPoint("TOPLEFT", 16, -112 - (i - 1) * 76); row:SetPoint("RIGHT", fr, "RIGHT", -16, 0); row:SetHeight(70)
+    row:SetPoint("TOPLEFT", 16, -168 - (i - 1) * 70); row:SetPoint("RIGHT", fr, "RIGHT", -16, 0); row:SetHeight(62)
     local nm = row:CreateFontString(nil, "ARTWORK", "GameFontNormal")
     nm:SetPoint("TOPLEFT", 2, 0); row.nameFS = nm
     local cv = row:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
@@ -1522,21 +1669,19 @@ local function BuildABPanel(parent)
     rm:SetPoint("TOPRIGHT", 0, 0); rm:SetWidth(72); rm:SetHeight(20); rm:SetText("Remove"); rm.idx = i
     rm:SetScript("OnClick", function() tremove(GuildRecruiter_Settings.abVariants, this.idx); RefreshABPanel() end)
     local md = CreateFrame("Button", nil, row, "UIPanelButtonTemplate")
-    md:SetPoint("TOPLEFT", 14, -22); md:SetWidth(172); md:SetHeight(20)
+    md:SetPoint("TOPLEFT", 14, -22); md:SetWidth(150); md:SetHeight(20)
     md:SetScript("OnClick", function() GuildRecruiter_OpenDD(this, "mode", this.variant) end)
     row.modeBtn = md
     local rp = CreateFrame("Button", nil, row, "UIPanelButtonTemplate")
-    rp:SetPoint("LEFT", md, "RIGHT", 8, 0); rp:SetWidth(172); rp:SetHeight(20)
+    rp:SetPoint("LEFT", md, "RIGHT", 8, 0); rp:SetWidth(150); rp:SetHeight(20)
     rp:SetScript("OnClick", function() GuildRecruiter_OpenDD(this, "reply", this.variant) end)
     row.replyBtn = rp
-    local msg = CreateFrame("EditBox", "GuildRecruiterABMsg"..i, row, "InputBoxTemplate")
-    msg:SetPoint("TOPLEFT", 16, -46); msg:SetWidth(496); msg:SetHeight(20)
-    msg:SetAutoFocus(false); msg:SetMaxLetters(255)
-    msg:SetScript("OnEnterPressed", function()
-      local txt = this:GetText(); this.variant.whisperMsg = (txt ~= "" and txt) or nil; this:ClearFocus()
-    end)
-    msg:SetScript("OnEscapePressed", function() this:ClearFocus() end)
-    row.msgEdit = msg
+    local mb = CreateFrame("Button", nil, row, "UIPanelButtonTemplate")
+    mb:SetPoint("LEFT", rp, "RIGHT", 8, 0); mb:SetWidth(140); mb:SetHeight(20); mb:SetText("Edit message...")
+    mb:SetScript("OnClick", function() GuildRecruiter_EditMessage(this.variant) end)
+    row.msgBtn = mb
+    row.msgFS = row:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
+    row.msgFS:SetPoint("TOPLEFT", 16, -44); row.msgFS:SetWidth(500); row.msgFS:SetJustifyH("LEFT")
     row:Hide()
     fr.rows[i] = row
   end
@@ -1549,26 +1694,28 @@ RefreshABPanel = function()
   if not abFrame then return end
   local s = GuildRecruiter_Settings
   local av = s.abVariants
-  local n = table.getn(av)
+  local n = table.getn(av)               -- challenger count
   abFrame.toggle:SetText("A/B: "..(s.abOn and "|cff40ff40Running|r" or "Off"))
-  if s.abOn and n < 2 then
-    abFrame.hint:SetText("A/B needs 2+ variants to split contacts -- add another, or it just uses your live settings.")
+  if s.abOn and n < 1 then
+    abFrame.hint:SetText("A/B is on but has no challenger yet -- click '+ Add challenger' to test a variant against A (your Settings).")
   else
-    abFrame.hint:SetText("Each contact is randomly dealt a variant. Edit a field to make it differ; blank = your live setting. Press Enter in the message box to save it.")
+    abFrame.hint:SetText("Each contact is randomly dealt variant A (your Settings tab) or one of the challengers below. Blank challenger fields inherit A.")
   end
-  if n >= AB_MAX then abFrame.addBtn:Disable() else abFrame.addBtn:Enable() end
-  for i = 1, AB_MAX do
+  if n >= MAX_CHAL then abFrame.addBtn:Disable() else abFrame.addBtn:Enable() end
+
+  abFrame.ctrl.convFS:SetText(ConvBlurb("A"))
+  abFrame.ctrl.msgFS:SetText(MsgPreview(s.whisperMsg, "(no message)"))
+
+  for i = 1, MAX_CHAL do
     local row = abFrame.rows[i]
     if i <= n then
       local v = av[i]
-      local vs = s.varStats and s.varStats[v.name]
-      local c = (vs and vs.contacted) or 0
-      local conv = (c > 0) and (math.floor(((vs.joined or 0) / c) * 100 + 0.5).."%") or "--"
       row.nameFS:SetText("Variant "..(v.name or "?"))
-      row.convFS:SetText("conv "..conv.."   ("..((vs and vs.joined) or 0).." joined / "..c.." contacted)")
+      row.convFS:SetText(ConvBlurb(v.name))
       row.modeBtn.variant = v;  row.modeBtn:SetText(MODE_LABEL[v.mode or s.mode] or "?")
       row.replyBtn.variant = v; row.replyBtn:SetText(REPLY_LABEL[v.replyMode or s.replyMode] or "?")
-      row.msgEdit.variant = v;  row.msgEdit:SetText(v.whisperMsg or "")
+      row.msgBtn.variant = v
+      row.msgFS:SetText(MsgPreview(v.whisperMsg, "(same message as A)"))
       row:Show()
     else
       row:Hide()
@@ -1657,6 +1804,7 @@ local function ToggleConfig() OpenTab("settings") end
 local function ToggleList()   OpenTab("lists") end
 function GuildRecruiter_ToggleStats() OpenTab("stats") end
 function GuildRecruiter_ToggleAB() OpenTab("ab") end
+function GuildRecruiter_GotoSettings() OpenTab("settings") end  -- A/B control row -> Settings
 
 -- ---------------------------------------------------------------------------
 -- Minimap button
@@ -1798,9 +1946,9 @@ SlashCmdList["GUILDRECRUITER"] = function(msg)
     local sub = string.lower(larg or "")
     if sub == "on" or sub == "off" then
       GuildRecruiter_Settings.abOn = (sub == "on"); GuildRecruiter_RefreshOpen()
-      Print("Simultaneous A/B "..(GuildRecruiter_Settings.abOn and "ON" or "OFF").."  ("..table.getn(GuildRecruiter_Settings.abVariants).." variants).")
+      Print("Simultaneous A/B "..(GuildRecruiter_Settings.abOn and "ON" or "OFF").."  ("..table.getn(GuildRecruiter_Settings.abVariants).." challenger(s) vs A).")
     elseif sub == "clear" then
-      GuildRecruiter_Settings.abVariants = {}; GuildRecruiter_RefreshOpen(); Print("A/B variants cleared.")
+      GuildRecruiter_Settings.abVariants = {}; GuildRecruiter_RefreshOpen(); Print("A/B challengers cleared (variant A = your Settings is unaffected).")
     else
       GuildRecruiter_ToggleAB()   -- open the A/B tab to set variants up
     end
