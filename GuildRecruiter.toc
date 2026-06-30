@@ -2,6 +2,6 @@
 ## Title: Guild Recruiter
 ## Notes: Paced guild recruitment via /who scanning (vanilla 1.12 / Turtle WoW)
 ## Author: Alex
-## Version: 3.11
+## Version: 3.12
 ## SavedVariables: GuildRecruiter_Settings
 GuildRecruiter.lua

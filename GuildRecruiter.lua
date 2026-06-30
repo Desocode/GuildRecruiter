@@ -19,7 +19,7 @@
 
 GuildRecruiter_Settings = GuildRecruiter_Settings or {}
 
-local VERSION    = "3.11"
+local VERSION    = "3.12"
 local CAP_HINT   = 49      -- treat a query returning >= this many as truncated
 local START_WIDTH = 10     -- initial level-band width to try
 local WHO_TIMEOUT = 12     -- give up waiting on a reply after this many seconds
@@ -363,8 +363,11 @@ RecomputeBand = function()
     if myHi > hiL then myHi = hiL end
     if myLo > hiL then myLo = hiL + 1 end  -- nothing left for me
   end
-  -- if my band grew while idle but the run is alive, resume the sweep
-  if running and not scanning and lo <= myHi then scanning = true end
+  -- if my band grew while idle but the run is alive, resume the sweep -- but
+  -- ONLY for a scan run. A send/invite-all run is running with scanning=false on
+  -- purpose; without this guard Resume() (or a peer's HI/BYE) would flip it into
+  -- a /who scan.
+  if running and GuildRecruiter_runKind == "scan" and not scanning and lo <= myHi then scanning = true end
 end
 
 local function OnAddonMessage()
@@ -847,7 +850,7 @@ local function GR_OnUpdate()
         inviteTimer = Pace(GuildRecruiter_Settings.inviteDelay)
       elseif not CapReached() then
         local name = tremove(contactQueue, 1)
-        if GuildRecruiter_blast then                 -- invite-all: straight guild invite, fast
+        if GuildRecruiter_runKind == "blast" then    -- invite-all: straight guild invite, fast
           DoGuildInvite(name)
           if not GuildRecruiter_Settings.history then GuildRecruiter_Settings.history = {} end
           GuildRecruiter_Settings.history[name] = { t = time(), p = GuildRecruiter_Settings.activeProfile }
@@ -859,7 +862,7 @@ local function GR_OnUpdate()
           Print("Contacted "..name.." ("..stats.contacted..")")
         end
         if GuildRecruiter_Settings.candidates then GuildRecruiter_Settings.candidates[name] = nil end  -- collected -> contacted
-        inviteTimer = GuildRecruiter_blast and INVITE_MIN or Pace(GuildRecruiter_Settings.inviteDelay)
+        inviteTimer = (GuildRecruiter_runKind == "blast") and INVITE_MIN or Pace(GuildRecruiter_Settings.inviteDelay)
       end
     end
   elseif not scanning then
@@ -868,10 +871,13 @@ local function GR_OnUpdate()
       -- keep waiting
     else
       running = false
-      GuildRecruiter_blast = false
+      local kind = GuildRecruiter_runKind
+      GuildRecruiter_runKind = nil
       SuppressWho(false)
       Broadcast("BYE")
-      if GuildRecruiter_Settings.collectOnly and stats.contacted == 0 then
+      if kind == "blast" or kind == "send" then
+        Print("Done. "..(kind == "blast" and "Invited " or "Contacted ")..stats.contacted.." of "..(GuildRecruiter_runTotal or stats.contacted)..". "..CountTable(GuildRecruiter_Settings.candidates).." candidate(s) remain.")
+      elseif GuildRecruiter_Settings.collectOnly and stats.contacted == 0 then
         Print("Done collecting. List now has "..CountTable(GuildRecruiter_Settings.candidates).." candidate(s). Send them from the Lists tab.")
       else
         Print("Done. Contacted "..stats.contacted.." ("..stats.invited.." invited, "..stats.whispered.." whispered), skipped "..stats.guilded.." guilded, "..stats.queries.." queries.")
@@ -924,12 +930,12 @@ end
 
 local function Start()
   if not IsInGuild() then Print("You're not in a guild.") return end
-  if running and not paused then Print("Already running. /gr stop to cancel, /gr pause to pause.") return end
+  if running then Print("Already running. /gr stop to cancel"..(paused and ", /gr resume to continue." or ", /gr pause to pause.")) return end
   ForceWhoToEvent()
   SuppressWho(true)
   FactionLists()
   running, scanning, awaiting, paused = true, true, false, false
-  GuildRecruiter_blast = false
+  GuildRecruiter_runKind = "scan"; GuildRecruiter_runTotal = 0
   current = nil
   pending, contactQueue, replyQueue, seen, whispered = {}, {}, {}, {}, {}
   whoTimer, inviteTimer, whoTimeout, presenceTimer = 0, 0, 0, 0
@@ -942,11 +948,16 @@ end
 
 local function Stop()
   if not running then Print("Not running.") return end
+  local wasSend = (GuildRecruiter_runKind ~= "scan")
   running, scanning, awaiting, paused = false, false, false, false
-  GuildRecruiter_blast = false
+  GuildRecruiter_runKind = nil
   SuppressWho(false)
   Broadcast("BYE")
-  Print("Stopped. Contacted "..stats.contacted.." this run; "..table.getn(contactQueue).." still queued.")
+  if wasSend then
+    Print("Stopped. Invited "..stats.contacted.." this run; "..CountTable(GuildRecruiter_Settings.candidates).." candidate(s) remain on the list.")
+  else
+    Print("Stopped. Contacted "..stats.contacted.." this run; "..table.getn(contactQueue).." still queued.")
+  end
 end
 
 -- Drain the persistent candidate list (built by Collect-only scans) through the
@@ -955,14 +966,15 @@ end
 -- GLOBAL so the slash + Lists buttons reach it.
 function GuildRecruiter_SendToCandidates(blast)
   if not IsInGuild() then Print("You're not in a guild.") return end
-  if running and not paused then Print("Already running. /gr stop first.") return end
+  if running then Print("Already running -- /gr stop first"..(paused and " (or resume)." or ".")) return end
   Defaults()
   local s = GuildRecruiter_Settings
   local names = {}
   for n in s.candidates do tinsert(names, n) end
   if table.getn(names) == 0 then Print("No collected candidates. Turn on Collect (Settings) and scan first.") return end
   running, scanning, awaiting, paused = true, false, false, false
-  GuildRecruiter_blast = blast and true or false   -- fast invite-all vs paced send
+  GuildRecruiter_runKind = blast and "blast" or "send"   -- fast invite-all vs paced send
+  GuildRecruiter_runTotal = table.getn(names)            -- for N-of-M progress
   current = nil
   pending, contactQueue, replyQueue, seen, whispered = {}, {}, {}, {}, {}
   whoTimer, inviteTimer, whoTimeout, presenceTimer = 0, 0, 0, 0
@@ -984,11 +996,14 @@ function GuildRecruiter_HeaderTick(m, elapsed)
   if m.htick > 0 then return end
   m.htick = 0.3
   if running then
-    if paused then m.runStatus:SetText("|cffffcc00Paused|r  "..stats.contacted.." sent")
-    else m.runStatus:SetText("|cff40ff40Running|r  "..stats.contacted.." sent") end
-    m.stopBtn:Show()
+    local total = GuildRecruiter_runTotal or 0
+    local prog = (total > 0) and ("  "..stats.contacted.."/"..total) or ("  "..stats.contacted.." sent")
+    if paused then m.runStatus:SetText("|cffffcc00Paused|r"..prog)
+    else m.runStatus:SetText("|cff40ff40Running|r"..prog) end
+    m.pauseBtn:SetText(paused and "Resume" or "Pause")
+    m.stopBtn:Show(); m.pauseBtn:Show()
   else
-    m.runStatus:SetText(""); m.stopBtn:Hide()
+    m.runStatus:SetText(""); m.stopBtn:Hide(); m.pauseBtn:Hide()
   end
 end
 
@@ -996,20 +1011,28 @@ local function Pause()
   if not running then Print("Not running.") return end
   if paused then Print("Already paused. /gr resume to continue.") return end
   paused = true
-  SuppressWho(false)  -- let manual /who work normally while paused
-  Broadcast("BYE")  -- yield my band to others while paused
-  Print("Paused at level "..lo..". "..table.getn(contactQueue).." queued. /gr resume to continue.")
+  if GuildRecruiter_runKind == "scan" then
+    SuppressWho(false)  -- let manual /who work normally while paused
+    Broadcast("BYE")    -- yield my band to others while paused
+  end
+  Print("Paused. "..table.getn(contactQueue).." left. /gr resume to continue.")
 end
 
 local function Resume()
   if not running then Print("Not running -- use /gr start.") return end
   if not paused then Print("Not paused.") return end
   paused = false
-  SuppressWho(true)
-  RecomputeBand()
-  if GuildRecruiter_Settings.guildSync and IsInGuild() then Broadcast("HI") end
+  if GuildRecruiter_runKind == "scan" then
+    -- only scan runs have a level band / who suppression to restore
+    SuppressWho(true)
+    RecomputeBand()
+    if GuildRecruiter_Settings.guildSync and IsInGuild() then Broadcast("HI") end
+  end
   Print("Resumed.")
 end
+
+-- GLOBAL so header / Lists play-pause buttons add no upvalues to their builders
+function GuildRecruiter_TogglePause() if paused then Resume() else Pause() end end
 
 -- ---------------------------------------------------------------------------
 -- List window: view/edit the contact queue, blacklist, and invite history
@@ -1061,6 +1084,30 @@ local function RemoveListItem(name)
 end
 
 local UpdateList  -- forward decl (handlers below capture it)
+local LIST_HINT = "click a name to remove it (Blacklist / History ask first)"
+
+-- GLOBAL (no upvalue cost to the panel): swap the Lists bottom row between the
+-- idle launch buttons and a live run-control strip (progress + pause/resume/stop),
+-- so an invite-all run is controllable right where it was launched.
+function GuildRecruiter_ListControls(fr)
+  if not fr or not fr.inviteBtn then return end
+  if running then
+    fr.inviteBtn:Hide(); fr.sendBtn:Hide()
+    fr.lpauseBtn:Show(); fr.lstopBtn:Show()
+    fr.lpauseBtn:SetText(paused and "Resume" or "Pause")
+    local total = GuildRecruiter_runTotal or 0
+    local verb = (GuildRecruiter_runKind == "blast" or GuildRecruiter_runKind == "send") and "Inviting" or "Working"
+    local prog = (total > 0) and (stats.contacted.." of "..total) or (stats.contacted.." sent")
+    fr.hint:SetText((paused and "|cffffcc00Paused|r -- " or ("|cff40ff40"..verb.."|r  "))..prog)
+  else
+    fr.lpauseBtn:Hide(); fr.lstopBtn:Hide()
+    fr.inviteBtn:Show(); fr.sendBtn:Show()
+    local cc = CountTable(GuildRecruiter_Settings.candidates or {})
+    fr.inviteBtn:SetText("Invite all ("..cc..")")
+    if cc > 0 then fr.inviteBtn:Enable(); fr.sendBtn:Enable() else fr.inviteBtn:Disable(); fr.sendBtn:Disable() end
+    fr.hint:SetText(LIST_HINT)
+  end
+end
 
 local function BuildListsPanel(parent)
   local fr = CreateFrame("Frame", "GuildRecruiterList", parent)
@@ -1075,7 +1122,7 @@ local function BuildListsPanel(parent)
   GuildRecruiter_DDArrow(fr.cycle)
 
   fr.hint = fr:CreateFontString(nil, "ARTWORK", "GameFontDisableSmall")
-  fr.hint:SetPoint("TOP", 0, -62); fr.hint:SetText("click a name to remove it (Blacklist / History ask first)")
+  fr.hint:SetPoint("TOP", 0, -62); fr.hint:SetText(LIST_HINT)
 
   local scroll = CreateFrame("ScrollFrame", "GuildRecruiterListScroll", fr, "FauxScrollFrameTemplate")
   scroll:SetPoint("TOPLEFT", 16, -78)
@@ -1149,6 +1196,23 @@ local function BuildListsPanel(parent)
     GuildRecruiter_Confirm("Send to "..cnt.." candidate(s) at your paced rate ("..(MODE_LABEL[GuildRecruiter_Settings.mode] or "?").. ")?",
       function() GuildRecruiter_SendToCandidates(false) end)
   end)
+  -- run controls (swap in for the launch buttons while a run is active)
+  fr.lpauseBtn = CreateFrame("Button", nil, fr, "UIPanelButtonTemplate")
+  fr.lpauseBtn:SetPoint("BOTTOMRIGHT", -16, 18); fr.lpauseBtn:SetWidth(104); fr.lpauseBtn:SetHeight(22); fr.lpauseBtn:SetText("Pause")
+  fr.lpauseBtn:SetScript("OnClick", function() GuildRecruiter_TogglePause() end)
+  fr.lpauseBtn:Hide()
+  fr.lstopBtn = CreateFrame("Button", nil, fr, "UIPanelButtonTemplate")
+  fr.lstopBtn:SetPoint("RIGHT", fr.lpauseBtn, "LEFT", -8, 0); fr.lstopBtn:SetWidth(70); fr.lstopBtn:SetHeight(22); fr.lstopBtn:SetText("|cffff6060Stop|r")
+  fr.lstopBtn:SetScript("OnClick", function() GuildRecruiter_StopRun() end)
+  fr.lstopBtn:Hide()
+  -- keep the run strip / launch buttons live while this tab is shown
+  fr.ltick = 0
+  fr:SetScript("OnUpdate", function()
+    fr.ltick = fr.ltick - (arg1 or 0)
+    if fr.ltick > 0 then return end
+    fr.ltick = 0.3
+    GuildRecruiter_ListControls(fr)
+  end)
 
   listFrame = fr
   return fr
@@ -1170,11 +1234,7 @@ UpdateList = function()
   end
   FauxScrollFrame_Update(listFrame.scroll, n, NUM_ROWS, ROW_HEIGHT)
   listFrame.cycle:SetText("View: "..(LIST_TITLE[listMode] or listMode).."  ("..n..")")
-  local cc = CountTable(GuildRecruiter_Settings.candidates or {})
-  listFrame.inviteBtn:SetText("Invite all ("..cc..")")
-  local canSend = (cc > 0 and not running)
-  if canSend then listFrame.inviteBtn:Enable(); listFrame.sendBtn:Enable()
-  else listFrame.inviteBtn:Disable(); listFrame.sendBtn:Disable() end
+  GuildRecruiter_ListControls(listFrame)   -- idle launch buttons vs live run strip
 end
 
 -- ---------------------------------------------------------------------------
@@ -2022,9 +2082,13 @@ local function BuildUI()
   m.runStatus = m:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
   m.runStatus:SetPoint("TOPLEFT", 16, -16)
   m.stopBtn = CreateFrame("Button", nil, m, "UIPanelButtonTemplate")
-  m.stopBtn:SetPoint("RIGHT", close, "LEFT", -2, 0); m.stopBtn:SetWidth(70); m.stopBtn:SetHeight(20); m.stopBtn:SetText("Stop")
+  m.stopBtn:SetPoint("RIGHT", close, "LEFT", -2, 0); m.stopBtn:SetWidth(64); m.stopBtn:SetHeight(20); m.stopBtn:SetText("|cffff6060Stop|r")
   m.stopBtn:SetScript("OnClick", function() GuildRecruiter_StopRun() end)
   m.stopBtn:Hide()
+  m.pauseBtn = CreateFrame("Button", nil, m, "UIPanelButtonTemplate")
+  m.pauseBtn:SetPoint("RIGHT", m.stopBtn, "LEFT", -4, 0); m.pauseBtn:SetWidth(74); m.pauseBtn:SetHeight(20); m.pauseBtn:SetText("Pause")
+  m.pauseBtn:SetScript("OnClick", function() GuildRecruiter_TogglePause() end)
+  m.pauseBtn:Hide()
 
   tabPanels.settings = BuildSettingsPanel(m)
   tabPanels.lists    = BuildListsPanel(m)
