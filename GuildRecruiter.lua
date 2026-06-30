@@ -19,7 +19,7 @@
 
 GuildRecruiter_Settings = GuildRecruiter_Settings or {}
 
-local VERSION    = "3.6"
+local VERSION    = "3.6.1"
 local CAP_HINT   = 49      -- treat a query returning >= this many as truncated
 local START_WIDTH = 10     -- initial level-band width to try
 local WHO_TIMEOUT = 12     -- give up waiting on a reply after this many seconds
@@ -1204,14 +1204,14 @@ local function BuildSettingsPanel(parent)
 
   -- LEFT column ----------------------------------------------------------
   Header(fr, "Speed", 18, -44, 250)
-  fr.inviteSlider, fr.inviteEdit = MakeSlider(fr, "GuildRecruiterConfigInvite", "Invite/contact delay (s)", INVITE_MIN, INVITE_MAX, -82, ApplyInvite)
-  fr.whoSlider,    fr.whoEdit    = MakeSlider(fr, "GuildRecruiterConfigWho",    "/who delay (s)",           WHO_MIN,    WHO_MAX,    -122, ApplyWho)
-  fr.jitterCheck   = MakeCheck(fr, "GuildRecruiterConfigJitter", "Random delays (anti-detection)", 20, -150, "jitter")
+  fr.inviteSlider, fr.inviteEdit = MakeSlider(fr, "GuildRecruiterConfigInvite", "Invite/contact delay (s)", INVITE_MIN, INVITE_MAX, -84, ApplyInvite)
+  fr.whoSlider,    fr.whoEdit    = MakeSlider(fr, "GuildRecruiterConfigWho",    "/who delay (s)",           WHO_MIN,    WHO_MAX,    -132, ApplyWho)
+  fr.jitterCheck   = MakeCheck(fr, "GuildRecruiterConfigJitter", "Random delays (anti-detection)", 20, -162, "jitter")
 
-  Header(fr, "Safety", 18, -186, 250)
-  fr.quietCheck    = MakeCheck(fr, "GuildRecruiterConfigQuiet",    "Quiet /who chat",    20, -214, "quietWho")
-  fr.combatCheck   = MakeCheck(fr, "GuildRecruiterConfigCombat",   "Pause in combat",    20, -240, "skipCombat")
-  fr.instanceCheck = MakeCheck(fr, "GuildRecruiterConfigInstance", "Pause in instances", 20, -266, "skipInstance")
+  Header(fr, "Safety", 18, -196, 250)
+  fr.quietCheck    = MakeCheck(fr, "GuildRecruiterConfigQuiet",    "Quiet /who chat",    20, -224, "quietWho")
+  fr.combatCheck   = MakeCheck(fr, "GuildRecruiterConfigCombat",   "Pause in combat",    20, -250, "skipCombat")
+  fr.instanceCheck = MakeCheck(fr, "GuildRecruiterConfigInstance", "Pause in instances", 20, -276, "skipInstance")
 
   -- RIGHT column ----------------------------------------------------------
   Header(fr, "Invites", 292, -44, 250)
@@ -1228,7 +1228,7 @@ local function BuildSettingsPanel(parent)
   fr.replyBtn = CreateFrame("Button", "GuildRecruiterConfigReplyBtn", fr, "UIPanelButtonTemplate")
   fr.replyBtn:SetPoint("TOPLEFT", 352, -130); fr.replyBtn:SetWidth(186); fr.replyBtn:SetHeight(22)
   fr.replyBtn:SetScript("OnClick", function() GuildRecruiter_OpenDD(this, "reply") end)
-  fr.syncCheck   = MakeCheck(fr, "GuildRecruiterConfigSync",   "Guild sync (dedup + split)",   294, -160, "guildSync")
+  fr.syncCheck   = MakeCheck(fr, "GuildRecruiterConfigSync",   "Guild sync (dedup + split)",   298, -160, "guildSync")
   Label(fr, "Whisper (%p name, %g guild):", 298, -188)
   fr.whisperEdit = CreateFrame("EditBox", "GuildRecruiterConfigWhisper", fr, "InputBoxTemplate")
   fr.whisperEdit:SetPoint("TOPLEFT", 298, -204); fr.whisperEdit:SetWidth(240); fr.whisperEdit:SetHeight(20)
@@ -1384,11 +1384,11 @@ local function BuildStatsPanel(parent)
   end)
 
   fr.profileText = fr:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
-  fr.profileText:SetPoint("TOPLEFT", 18, -138); fr.profileText:SetWidth(524); fr.profileText:SetJustifyH("LEFT")
+  fr.profileText:SetPoint("TOPLEFT", 18, -136); fr.profileText:SetWidth(524); fr.profileText:SetJustifyH("LEFT")
 
-  Header(fr, "Statistics", 18, -184, 524)
+  Header(fr, "Statistics", 18, -174, 524)
   fr.text = fr:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
-  fr.text:SetPoint("TOPLEFT", 18, -206); fr.text:SetWidth(524); fr.text:SetJustifyH("LEFT")
+  fr.text:SetPoint("TOPLEFT", 18, -194); fr.text:SetWidth(524); fr.text:SetJustifyH("LEFT")
 
   local resetB = CreateFrame("Button", nil, fr, "UIPanelButtonTemplate")
   resetB:SetPoint("BOTTOMRIGHT", -16, 16); resetB:SetWidth(110); resetB:SetHeight(22); resetB:SetText("Reset stats")
@@ -1425,7 +1425,7 @@ RefreshStats = function()
   table.sort(keys)
   local n = table.getn(keys)
   if n == 0 then tinsert(lines, "(no activity yet)") end
-  local first = n - 4; if first < 1 then first = 1 end
+  local first = n - 2; if first < 1 then first = 1 end
   for i = first, n do
     local d = keys[i]; local r = t.days[d]
     local label = d
@@ -1481,6 +1481,7 @@ local TAB_DEFS = { { "settings", "Settings" }, { "lists", "Lists" }, { "stats", 
 
 local function ShowTab(name)
   activeTab = name
+  if ddPopup then ddPopup:Hide() end   -- don't leave a dropdown list floating across tabs
   for n, p in tabPanels do if n == name then p:Show() else p:Hide() end end
   for n, b in tabButtons do
     if n == name then b:LockHighlight() else b:UnlockHighlight() end
@@ -1504,6 +1505,7 @@ local function BuildUI()
   m:EnableMouse(true); m:SetMovable(true); m:RegisterForDrag("LeftButton")
   m:SetScript("OnDragStart", function() this:StartMoving() end)
   m:SetScript("OnDragStop", function() this:StopMovingOrSizing() end)
+  m:SetScript("OnHide", function() if ddPopup then ddPopup:Hide() end end)  -- no orphan dropdown
   m:Hide()
 
   local title = m:CreateFontString(nil, "ARTWORK", "GameFontNormal")
