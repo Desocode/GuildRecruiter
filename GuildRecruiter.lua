@@ -19,7 +19,7 @@
 
 GuildRecruiter_Settings = GuildRecruiter_Settings or {}
 
-local VERSION    = "3.13"
+local VERSION    = "3.14"
 local CAP_HINT   = 49      -- treat a query returning >= this many as truncated
 local START_WIDTH = 10     -- initial level-band width to try
 local WHO_TIMEOUT = 12     -- give up waiting on a reply after this many seconds
@@ -1097,6 +1097,20 @@ local LIST_HINT = "click a name to remove it (Blacklist / History ask first)"
 -- GLOBAL (no upvalue cost to the panel): swap the Lists bottom row between the
 -- idle launch buttons and a live run-control strip (progress + pause/resume/stop),
 -- so an invite-all run is controllable right where it was launched.
+-- invite a single candidate on demand (left-click in the Candidates view).
+-- GLOBAL so the list-row handler adds no upvalues to BuildListsPanel.
+function GuildRecruiter_InviteOne(name)
+  if not name then return end
+  if not IsInGuild() then Print("You're not in a guild.") return end
+  if running then Print("A run is active -- stop it first to invite individually.") return end
+  DoGuildInvite(name)
+  if not GuildRecruiter_Settings.history then GuildRecruiter_Settings.history = {} end
+  GuildRecruiter_Settings.history[name] = { t = time(), p = GuildRecruiter_Settings.activeProfile }
+  if GuildRecruiter_Settings.candidates then GuildRecruiter_Settings.candidates[name] = nil end
+  TallyBump("invited")
+  Print("Invited "..name..".")
+end
+
 function GuildRecruiter_ListControls(fr)
   if not fr or not fr.inviteBtn then return end
   if running then
@@ -1113,7 +1127,8 @@ function GuildRecruiter_ListControls(fr)
     local cc = CountTable(GuildRecruiter_Settings.candidates or {})
     fr.inviteBtn:SetText("Invite all ("..cc..")")
     if cc > 0 then fr.inviteBtn:Enable(); fr.sendBtn:Enable() else fr.inviteBtn:Disable(); fr.sendBtn:Disable() end
-    fr.hint:SetText(LIST_HINT)
+    fr.hint:SetText(listMode == "candidates"
+      and "left-click a name to invite it -- right-click to drop it" or LIST_HINT)
   end
 end
 
@@ -1148,10 +1163,15 @@ local function BuildListsPanel(parent)
     ht:SetBlendMode("ADD"); ht:SetAlpha(0.4)
     local t = row:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
     t:SetPoint("LEFT", 6, 0); t:SetJustifyH("LEFT"); row.text = t
+    row:RegisterForClicks("LeftButtonUp", "RightButtonUp")
     row:SetScript("OnClick", function()
       if not this.pname then return end
       local nm = this.pname
-      if listMode == "blacklist" or listMode == "history" then   -- persistent: confirm
+      if listMode == "candidates" then
+        if arg1 == "RightButton" then RemoveListItem(nm)               -- drop a false positive
+        else GuildRecruiter_InviteOne(nm) end                          -- left-click invites this one
+        UpdateList()
+      elseif listMode == "blacklist" or listMode == "history" then     -- persistent: confirm
         GuildRecruiter_Confirm("Remove |cffffffff"..nm.."|r from the "..(LIST_TITLE[listMode] or listMode).."?",
           function() RemoveListItem(nm); UpdateList() end)
       else
@@ -2228,6 +2248,8 @@ SlashCmdList["GUILDRECRUITER"] = function(msg)
     GuildRecruiter_SendToCandidates(false)
   elseif cmd == "inviteall" then
     GuildRecruiter_SendToCandidates(true)
+  elseif cmd == "invite" then
+    if arg and arg ~= "" then GuildRecruiter_InviteOne(arg) else Print("Usage: /gr invite <name>") end
   elseif cmd == "candidates" then
     Print("Collected candidates: "..CountTable(GuildRecruiter_Settings.candidates)..".  (Lists tab to view, /gr send to invite, /gr clearlist to empty.)")
   elseif cmd == "clearlist" then
@@ -2368,7 +2390,7 @@ SlashCmdList["GUILDRECRUITER"] = function(msg)
   else
     Print("|cff33ff99GuildRecruiter v"..VERSION.."|r  --  /gr config, /gr list, /gr stats")
     Print("start | stop | pause | resume | status | reset | forget | hide")
-    Print("collect on|off (scan into a list) | inviteall (fast) | send (paced) | candidates | clearlist")
+    Print("collect on|off (scan into a list) | inviteall (fast) | send (paced) | invite <name> | candidates | clearlist")
     Print("set invite/who/reinvite/cap/min/max/method/mode <v> | msg <text> | class <list|all>")
     Print("profile save/load/delete/list <name> | replymode notno/yesonly/any | ab (open tab) /on/off/clear")
     Print("noword/yesword add/remove/list <phrase>")
