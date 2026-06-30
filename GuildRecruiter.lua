@@ -19,7 +19,7 @@
 
 GuildRecruiter_Settings = GuildRecruiter_Settings or {}
 
-local VERSION    = "3.3.2"
+local VERSION    = "3.3.3"
 local CAP_HINT   = 49      -- treat a query returning >= this many as truncated
 local START_WIDTH = 10     -- initial level-band width to try
 local WHO_TIMEOUT = 12     -- give up waiting on a reply after this many seconds
@@ -63,11 +63,27 @@ local NEGATIVES = {
   "already in", "already in a guild", "have a guild", "got a guild",
   "busy", "fuck off", "piss off", "reported", "report",
 }
+-- whitelist used by the "yesonly" reply policy (invite only if a reply matches)
+local AFFIRM_DEFAULTS = {
+  "yes", "yeah", "yep", "yup", "ya", "yea", "yess", "yas", "y", "yes please",
+  "sure", "ok", "okay", "kk", "alright", "aight", "of course", "ofc",
+  "definitely", "absolutely", "sounds good", "why not", "go ahead", "go for it",
+  "please", "pls", "plz", "im in", "count me in", "sign me up", "lets go",
+  "do it", "send it", "invite me", "inv me", "add me", "invite", "inv",
+  "for sure", "id love to", "love to", "happy to",
+}
+-- how a whisper reply is judged in whisper-then-invite mode
+local REPLY_ORDER = { "notno", "yesonly", "any" }
+local REPLY_LABEL = {
+  notno   = "Unless they say no",   -- invite unless reply hits the refusal list
+  yesonly = "Only on a yes word",   -- invite only if reply hits the yes list
+  any     = "Any reply at all",     -- invite on any reply, no filtering
+}
 -- which settings a profile snapshots (history/blacklist/stats/negatives stay global)
 local PROFILE_KEYS = {
   "inviteDelay", "whoDelay", "reinviteDays", "mode", "whisperMsg", "minLevel",
   "maxLevel", "sessionCap", "jitter", "skipCombat", "skipInstance", "guildSync",
-  "quietWho", "inviteMethod", "affirmOnly", "classFilter",
+  "quietWho", "inviteMethod", "replyMode", "classFilter",
 }
 
 local f = CreateFrame("Frame", "GuildRecruiterFrame")
@@ -147,10 +163,16 @@ local function Defaults()
   if s.skipInstance == nil then s.skipInstance = true end
   if s.guildSync == nil    then s.guildSync    = true end
   if s.quietWho == nil     then s.quietWho     = true end  -- hide /who chat spam during a run
-  if s.affirmOnly == nil   then s.affirmOnly   = true end  -- only auto-invite on an affirmative reply
-  if not s.negatives then   -- editable "refusal" word list (whisper replies to skip)
+  if not s.replyMode then   -- how whisper replies are judged: notno|yesonly|any
+    s.replyMode = (s.affirmOnly == false) and "any" or "notno"  -- migrate old affirmOnly
+  end
+  if not s.negatives then   -- editable refusal-word list ("notno" mode skips these)
     s.negatives = {}
     for i = 1, table.getn(NEGATIVES) do s.negatives[NEGATIVES[i]] = true end
+  end
+  if not s.affirmatives then   -- editable yes-word list ("yesonly" mode requires these)
+    s.affirmatives = {}
+    for i = 1, table.getn(AFFIRM_DEFAULTS) do s.affirmatives[AFFIRM_DEFAULTS[i]] = true end
   end
   if not s.profiles then s.profiles = {} end
   if not s.tally then s.tally = {} end
@@ -198,8 +220,18 @@ end
 -- Treat a whisper reply as interest UNLESS it's a clear refusal. Requiring an
 -- exact "yes" missed "sure", "y", "ok", typos, etc., so we invert: any reply
 -- that doesn't contain a negative phrase counts (they bothered to whisper back).
-local function IsAffirmative(reply)
+-- decide whether a whisper reply should trigger an invite, per the reply policy
+local function ShouldInvite(reply)
+  local mode = GuildRecruiter_Settings.replyMode or "notno"
+  if mode == "any" then return true end
   local norm = Normalize(reply)
+  if mode == "yesonly" then
+    for phrase in (GuildRecruiter_Settings.affirmatives or {}) do
+      if string.find(norm, " " .. phrase .. " ", 1, true) then return true end
+    end
+    return false
+  end
+  -- "notno": invite unless a refusal word appears
   for phrase in (GuildRecruiter_Settings.negatives or {}) do
     if string.find(norm, " " .. phrase .. " ", 1, true) then return false end
   end
@@ -570,9 +602,9 @@ local function GR_OnEvent()
   elseif event == "CHAT_MSG_WHISPER" then
     local sender = arg2
     if sender and whispered[sender] then
-      if not GuildRecruiter_Settings.affirmOnly or IsAffirmative(arg1) then
+      if ShouldInvite(arg1) then
         whispered[sender] = nil
-        tinsert(replyQueue, sender)   -- said yes: invite them (paced, ~1 invite delay)
+        tinsert(replyQueue, sender)   -- reply passes the policy: invite (paced)
       end
       -- otherwise keep waiting -- a later, clearer "yes" still triggers it
     end
@@ -776,8 +808,9 @@ end
 local listFrame, listMode = nil, "queue"
 local listData = {}
 local NUM_ROWS, ROW_HEIGHT = 13, 18
-local LIST_ORDER = { "queue", "blacklist", "history", "negatives" }
-local LIST_TITLE = { queue = "Queue (this run)", blacklist = "Blacklist", history = "Invite history", negatives = "Refusal words (replies to skip)" }
+local LIST_ORDER = { "queue", "blacklist", "history", "negatives", "affirmatives" }
+local LIST_TITLE = { queue = "Queue (this run)", blacklist = "Blacklist", history = "Invite history",
+  negatives = "Refusal words (no)", affirmatives = "Yes words (yesonly mode)" }
 
 local function BuildListData()
   listData = {}
@@ -788,6 +821,8 @@ local function BuildListData()
     table.sort(listData)
   elseif listMode == "negatives" then
     for n in GuildRecruiter_Settings.negatives do tinsert(listData, n) end
+  elseif listMode == "affirmatives" then
+    for n in GuildRecruiter_Settings.affirmatives do tinsert(listData, n) end
     table.sort(listData)
   else
     for n in GuildRecruiter_Settings.history do tinsert(listData, n) end
@@ -804,6 +839,8 @@ local function RemoveListItem(name)
     GuildRecruiter_Settings.blacklist[name] = nil
   elseif listMode == "negatives" then
     GuildRecruiter_Settings.negatives[name] = nil
+  elseif listMode == "affirmatives" then
+    GuildRecruiter_Settings.affirmatives[name] = nil
   else
     GuildRecruiter_Settings.history[name] = nil
   end
@@ -858,6 +895,8 @@ local function BuildListsPanel(parent)
     if n and n ~= "" then
       if listMode == "negatives" then
         GuildRecruiter_Settings.negatives[string.lower(n)] = true
+      elseif listMode == "affirmatives" then
+        GuildRecruiter_Settings.affirmatives[string.lower(n)] = true
       else
         GuildRecruiter_Settings.blacklist[string.lower(n)] = true
         listMode = "blacklist"
@@ -1010,7 +1049,7 @@ RefreshConfig = function()
   configFrame.combatCheck:SetChecked(s.skipCombat)
   configFrame.instanceCheck:SetChecked(s.skipInstance)
   configFrame.quietCheck:SetChecked(s.quietWho)
-  configFrame.affirmCheck:SetChecked(s.affirmOnly)
+  configFrame.replyBtn:SetText(REPLY_LABEL[s.replyMode] or s.replyMode)
   configFrame.updating = false
 end
 
@@ -1020,6 +1059,17 @@ local function StatusLine()
   local where = scanning and ("scanning lvl "..lo) or "draining"
   return where.." | band "..myLo.."-"..myHi.." | queued "..table.getn(contactQueue)
        .." | sent "..stats.contacted.." | peers "..(CountTable(recruiters))
+end
+
+-- GLOBAL on purpose: the settings-tab reply-mode button calls this, so its
+-- OnClick closure references a global (not a local) and adds no upvalue to
+-- BuildSettingsPanel, which sits near Lua 5.0's 32-upvalue-per-function limit.
+function GuildRecruiter_CycleReplyMode()
+  local cur, idx = GuildRecruiter_Settings.replyMode or "notno", 1
+  for i = 1, table.getn(REPLY_ORDER) do if REPLY_ORDER[i] == cur then idx = i end end
+  idx = idx + 1; if idx > table.getn(REPLY_ORDER) then idx = 1 end
+  GuildRecruiter_Settings.replyMode = REPLY_ORDER[idx]
+  RefreshConfig()
 end
 
 local function BuildSettingsPanel(parent)
@@ -1047,7 +1097,10 @@ local function BuildSettingsPanel(parent)
   fr.modeBtn = CreateFrame("Button", "GuildRecruiterConfigModeBtn", fr, "UIPanelButtonTemplate")
   fr.modeBtn:SetPoint("TOPLEFT", 298, -140); fr.modeBtn:SetWidth(222); fr.modeBtn:SetHeight(22)
   fr.modeBtn:SetScript("OnClick", function() CycleMode() end)
-  fr.affirmCheck = MakeCheck(fr, "GuildRecruiterConfigAffirm", "Invite on reply unless they say no", 294, -166, "affirmOnly")
+  Label(fr, "On reply:", 298, -166)
+  fr.replyBtn = CreateFrame("Button", "GuildRecruiterConfigReplyBtn", fr, "UIPanelButtonTemplate")
+  fr.replyBtn:SetPoint("TOPLEFT", 360, -162); fr.replyBtn:SetWidth(160); fr.replyBtn:SetHeight(22)
+  fr.replyBtn:SetScript("OnClick", function() GuildRecruiter_CycleReplyMode() end)
   fr.syncCheck   = MakeCheck(fr, "GuildRecruiterConfigSync",   "Guild sync (dedup + split)",   294, -190, "guildSync")
   Label(fr, "Whisper (%p name, %g guild):", 298, -216)
   fr.whisperEdit = CreateFrame("EditBox", "GuildRecruiterConfigWhisper", fr, "InputBoxTemplate")
@@ -1437,6 +1490,26 @@ SlashCmdList["GUILDRECRUITER"] = function(msg)
     else
       Print("Usage: /gr noword add|remove <phrase> | noword list")
     end
+  elseif cmd == "yesword" then
+    local _, _, sub, phrase = string.find(larg, "^(%a+)%s*(.*)$")
+    if sub == "add" and phrase ~= "" then
+      GuildRecruiter_Settings.affirmatives[phrase] = true; Print("Added yes word '"..phrase.."' (used by 'yesonly' reply mode).")
+    elseif sub == "remove" and phrase ~= "" then
+      GuildRecruiter_Settings.affirmatives[phrase] = nil; Print("Removed yes word '"..phrase.."'.")
+    elseif sub == "list" then
+      local a = ""
+      for p in GuildRecruiter_Settings.affirmatives do a = a..p..", " end
+      Print("Yes words: "..a)
+    else
+      Print("Usage: /gr yesword add|remove <phrase> | yesword list")
+    end
+  elseif cmd == "replymode" then
+    if REPLY_LABEL[larg] then
+      GuildRecruiter_Settings.replyMode = larg; RefreshConfig()
+      Print("Reply mode: "..larg.." ("..REPLY_LABEL[larg]..").")
+    else
+      Print("Usage: /gr replymode notno|yesonly|any  (current: "..(GuildRecruiter_Settings.replyMode or "notno")..")")
+    end
   elseif cmd == "reset" then
     seen = {}; Print("Cleared this session's scan list (history kept).")
   elseif cmd == "forget" then
@@ -1494,8 +1567,8 @@ SlashCmdList["GUILDRECRUITER"] = function(msg)
     else
       Print("set invite|who|reinvite|cap|min|max <n> | set method auto|byname|invite|chat | set mode invite|whisper|whisperinvite")
     end
-  elseif cmd == "jitter" or cmd == "sync" or cmd == "combat" or cmd == "instance" or cmd == "quiet" or cmd == "affirmonly" then
-    local keymap = { jitter="jitter", sync="guildSync", combat="skipCombat", instance="skipInstance", quiet="quietWho", affirmonly="affirmOnly" }
+  elseif cmd == "jitter" or cmd == "sync" or cmd == "combat" or cmd == "instance" or cmd == "quiet" then
+    local keymap = { jitter="jitter", sync="guildSync", combat="skipCombat", instance="skipInstance", quiet="quietWho" }
     local key = keymap[cmd]
     GuildRecruiter_Settings[key] = (larg == "on") or (larg ~= "off" and not GuildRecruiter_Settings[key])
     if cmd == "sync" then RecomputeBand() end
@@ -1505,8 +1578,9 @@ SlashCmdList["GUILDRECRUITER"] = function(msg)
     Print("|cff33ff99GuildRecruiter v"..VERSION.."|r  --  /gr config, /gr list, /gr stats")
     Print("start | stop | pause | resume | status | reset | forget | hide")
     Print("set invite/who/reinvite/cap/min/max/method/mode <v> | msg <text> | class <list|all>")
-    Print("profile save/load/delete/list <name> | noword add/remove/list <phrase>")
-    Print("black add/remove/list <name> | jitter/sync/combat/instance/quiet/affirmonly [on|off]")
+    Print("profile save/load/delete/list <name> | replymode notno/yesonly/any")
+    Print("noword/yesword add/remove/list <phrase>")
+    Print("black add/remove/list <name> | jitter/sync/combat/instance/quiet [on|off]")
   end
 end
 
