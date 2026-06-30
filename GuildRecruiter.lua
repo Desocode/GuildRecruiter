@@ -19,7 +19,7 @@
 
 GuildRecruiter_Settings = GuildRecruiter_Settings or {}
 
-local VERSION    = "3.10"
+local VERSION    = "3.11"
 local CAP_HINT   = 49      -- treat a query returning >= this many as truncated
 local START_WIDTH = 10     -- initial level-band width to try
 local WHO_TIMEOUT = 12     -- give up waiting on a reply after this many seconds
@@ -847,10 +847,19 @@ local function GR_OnUpdate()
         inviteTimer = Pace(GuildRecruiter_Settings.inviteDelay)
       elseif not CapReached() then
         local name = tremove(contactQueue, 1)
-        Contact(name)
+        if GuildRecruiter_blast then                 -- invite-all: straight guild invite, fast
+          DoGuildInvite(name)
+          if not GuildRecruiter_Settings.history then GuildRecruiter_Settings.history = {} end
+          GuildRecruiter_Settings.history[name] = { t = time(), p = GuildRecruiter_Settings.activeProfile }
+          stats.invited = stats.invited + 1; stats.contacted = stats.contacted + 1
+          TallyBump("invited")
+          Print("Invited "..name.." ("..stats.invited..")")
+        else
+          Contact(name)
+          Print("Contacted "..name.." ("..stats.contacted..")")
+        end
         if GuildRecruiter_Settings.candidates then GuildRecruiter_Settings.candidates[name] = nil end  -- collected -> contacted
-        Print("Contacted "..name.." ("..stats.contacted..")")
-        inviteTimer = Pace(GuildRecruiter_Settings.inviteDelay)
+        inviteTimer = GuildRecruiter_blast and INVITE_MIN or Pace(GuildRecruiter_Settings.inviteDelay)
       end
     end
   elseif not scanning then
@@ -859,6 +868,7 @@ local function GR_OnUpdate()
       -- keep waiting
     else
       running = false
+      GuildRecruiter_blast = false
       SuppressWho(false)
       Broadcast("BYE")
       if GuildRecruiter_Settings.collectOnly and stats.contacted == 0 then
@@ -919,6 +929,7 @@ local function Start()
   SuppressWho(true)
   FactionLists()
   running, scanning, awaiting, paused = true, true, false, false
+  GuildRecruiter_blast = false
   current = nil
   pending, contactQueue, replyQueue, seen, whispered = {}, {}, {}, {}, {}
   whoTimer, inviteTimer, whoTimeout, presenceTimer = 0, 0, 0, 0
@@ -932,15 +943,17 @@ end
 local function Stop()
   if not running then Print("Not running.") return end
   running, scanning, awaiting, paused = false, false, false, false
+  GuildRecruiter_blast = false
   SuppressWho(false)
   Broadcast("BYE")
   Print("Stopped. Contacted "..stats.contacted.." this run; "..table.getn(contactQueue).." still queued.")
 end
 
--- Send (paced) to the persistent candidate list built by Collect-only scans.
--- No scanning: just load the list into the contact queue and drain it through
--- the normal paced/safety pipeline. GLOBAL so the slash + Lists button reach it.
-function GuildRecruiter_SendToCandidates()
+-- Drain the persistent candidate list (built by Collect-only scans) through the
+-- contact pipeline -- no scanning. blast=true => guild-invite EVERYONE as fast as
+-- the server safely allows (ignores Mode); blast=false => paced, respects Mode.
+-- GLOBAL so the slash + Lists buttons reach it.
+function GuildRecruiter_SendToCandidates(blast)
   if not IsInGuild() then Print("You're not in a guild.") return end
   if running and not paused then Print("Already running. /gr stop first.") return end
   Defaults()
@@ -949,13 +962,18 @@ function GuildRecruiter_SendToCandidates()
   for n in s.candidates do tinsert(names, n) end
   if table.getn(names) == 0 then Print("No collected candidates. Turn on Collect (Settings) and scan first.") return end
   running, scanning, awaiting, paused = true, false, false, false
+  GuildRecruiter_blast = blast and true or false   -- fast invite-all vs paced send
   current = nil
   pending, contactQueue, replyQueue, seen, whispered = {}, {}, {}, {}, {}
   whoTimer, inviteTimer, whoTimeout, presenceTimer = 0, 0, 0, 0
   stats = { contacted=0, invited=0, whispered=0, guilded=0, scanned=0, queries=0, dropped=0, cooldown=0, collected=0 }
   for i = 1, table.getn(names) do tinsert(contactQueue, names[i]) end
   if s.guildSync and IsInGuild() then Broadcast("HI") end
-  Print("Sending to "..table.getn(names).." collected candidate(s) ("..(MODE_LABEL[s.mode] or "?").."). /gr stop to cancel.")
+  if blast then
+    Print("Inviting all "..table.getn(names).." candidate(s) as fast as the server allows (auto-backs-off if throttled). /gr stop to cancel.")
+  else
+    Print("Sending to "..table.getn(names).." collected candidate(s) ("..(MODE_LABEL[s.mode] or "?").."). /gr stop to cancel.")
+  end
 end
 
 -- GLOBALS so the main-window header (shown on every tab) can show run state and
@@ -1113,14 +1131,23 @@ local function BuildListsPanel(parent)
   addEdit:SetScript("OnEnterPressed", function() doAdd(); this:ClearFocus() end)
   addEdit:SetScript("OnEscapePressed", function() this:ClearFocus() end)
 
-  -- send the collected candidate list (paced) through the normal contact pipeline
+  -- act on the collected candidate list: Invite all (fast guild invites) or
+  -- Send (paced, respects Mode -- e.g. a whisper campaign)
+  fr.inviteBtn = CreateFrame("Button", nil, fr, "UIPanelButtonTemplate")
+  fr.inviteBtn:SetPoint("BOTTOMRIGHT", -16, 18); fr.inviteBtn:SetWidth(160); fr.inviteBtn:SetHeight(22)
+  fr.inviteBtn:SetScript("OnClick", function()
+    local cnt = CountTable(GuildRecruiter_Settings.candidates)
+    if cnt == 0 then Print("No collected candidates yet. Turn on Collect (Settings) and scan.") return end
+    GuildRecruiter_Confirm("Invite all "..cnt.." collected candidate(s) now? Guild invites go out as fast as the server allows.",
+      function() GuildRecruiter_SendToCandidates(true) end)
+  end)
   fr.sendBtn = CreateFrame("Button", nil, fr, "UIPanelButtonTemplate")
-  fr.sendBtn:SetPoint("BOTTOMRIGHT", -16, 18); fr.sendBtn:SetWidth(210); fr.sendBtn:SetHeight(22)
+  fr.sendBtn:SetPoint("RIGHT", fr.inviteBtn, "LEFT", -8, 0); fr.sendBtn:SetWidth(104); fr.sendBtn:SetHeight(22); fr.sendBtn:SetText("Send (paced)")
   fr.sendBtn:SetScript("OnClick", function()
     local cnt = CountTable(GuildRecruiter_Settings.candidates)
     if cnt == 0 then Print("No collected candidates yet. Turn on Collect (Settings) and scan.") return end
-    GuildRecruiter_Confirm("Send to "..cnt.." collected candidate(s) now? They'll be contacted at your usual paced rate.",
-      function() GuildRecruiter_SendToCandidates() end)
+    GuildRecruiter_Confirm("Send to "..cnt.." candidate(s) at your paced rate ("..(MODE_LABEL[GuildRecruiter_Settings.mode] or "?").. ")?",
+      function() GuildRecruiter_SendToCandidates(false) end)
   end)
 
   listFrame = fr
@@ -1144,8 +1171,10 @@ UpdateList = function()
   FauxScrollFrame_Update(listFrame.scroll, n, NUM_ROWS, ROW_HEIGHT)
   listFrame.cycle:SetText("View: "..(LIST_TITLE[listMode] or listMode).."  ("..n..")")
   local cc = CountTable(GuildRecruiter_Settings.candidates or {})
-  listFrame.sendBtn:SetText("Send to candidates ("..cc..")")
-  if cc > 0 and not running then listFrame.sendBtn:Enable() else listFrame.sendBtn:Disable() end
+  listFrame.inviteBtn:SetText("Invite all ("..cc..")")
+  local canSend = (cc > 0 and not running)
+  if canSend then listFrame.inviteBtn:Enable(); listFrame.sendBtn:Enable()
+  else listFrame.inviteBtn:Disable(); listFrame.sendBtn:Disable() end
 end
 
 -- ---------------------------------------------------------------------------
@@ -2124,7 +2153,9 @@ SlashCmdList["GUILDRECRUITER"] = function(msg)
     if larg == "on" or larg == "off" then GuildRecruiter_Settings.collectOnly = (larg == "on"); RefreshConfig() end
     Print("Collect-only "..(GuildRecruiter_Settings.collectOnly and "ON -- scans build a list (send with /gr send)" or "off -- scans contact immediately")..".")
   elseif cmd == "send" then
-    GuildRecruiter_SendToCandidates()
+    GuildRecruiter_SendToCandidates(false)
+  elseif cmd == "inviteall" then
+    GuildRecruiter_SendToCandidates(true)
   elseif cmd == "candidates" then
     Print("Collected candidates: "..CountTable(GuildRecruiter_Settings.candidates)..".  (Lists tab to view, /gr send to invite, /gr clearlist to empty.)")
   elseif cmd == "clearlist" then
@@ -2265,7 +2296,7 @@ SlashCmdList["GUILDRECRUITER"] = function(msg)
   else
     Print("|cff33ff99GuildRecruiter v"..VERSION.."|r  --  /gr config, /gr list, /gr stats")
     Print("start | stop | pause | resume | status | reset | forget | hide")
-    Print("collect on|off (scan into a list) | send (invite the list) | candidates | clearlist")
+    Print("collect on|off (scan into a list) | inviteall (fast) | send (paced) | candidates | clearlist")
     Print("set invite/who/reinvite/cap/min/max/method/mode <v> | msg <text> | class <list|all>")
     Print("profile save/load/delete/list <name> | replymode notno/yesonly/any | ab (open tab) /on/off/clear")
     Print("noword/yesword add/remove/list <phrase>")
