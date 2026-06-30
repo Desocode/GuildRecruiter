@@ -19,7 +19,7 @@
 
 GuildRecruiter_Settings = GuildRecruiter_Settings or {}
 
-local VERSION    = "3.15"
+local VERSION    = "3.16"
 local CAP_HINT   = 49      -- treat a query returning >= this many as truncated
 local START_WIDTH = 10     -- initial level-band width to try
 local WHO_TIMEOUT = 12     -- give up waiting on a reply after this many seconds
@@ -1255,7 +1255,17 @@ UpdateList = function()
     local idx = offset + i
     local row = listFrame.rows[i]
     if idx <= n then
-      row.pname = listData[idx]; row.text:SetText(listData[idx]); row:Show()
+      local nm = listData[idx]
+      row.pname = nm
+      local disp = nm
+      if listMode == "history" then
+        local e = GuildRecruiter_Settings.history[nm]
+        if type(e) == "table" and e.p == "(remote)" then disp = nm.."  |cff7f9fffguild|r" end  -- shared by a guildmate
+      elseif listMode == "candidates" then
+        local c = GuildRecruiter_Settings.candidates[nm]
+        if type(c) == "table" and c.level then disp = nm.."  |cff999999("..c.level..(c.class and (" "..c.class) or "")..")|r" end
+      end
+      row.text:SetText(disp); row:Show()
     else
       row.pname = nil; row:Hide()
     end
