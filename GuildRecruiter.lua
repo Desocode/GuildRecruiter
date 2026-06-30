@@ -19,7 +19,7 @@
 
 GuildRecruiter_Settings = GuildRecruiter_Settings or {}
 
-local VERSION    = "3.9"
+local VERSION    = "3.10"
 local CAP_HINT   = 49      -- treat a query returning >= this many as truncated
 local START_WIDTH = 10     -- initial level-band width to try
 local WHO_TIMEOUT = 12     -- give up waiting on a reply after this many seconds
@@ -34,10 +34,10 @@ local INVITE_MIN, INVITE_MAX = 1, 10
 local WHO_MIN,    WHO_MAX    = 1, 15
 local METHOD_ORDER = { "auto", "byname", "invite", "chat" }
 local METHOD_LABEL = {
-  auto   = "Auto (best available)",
-  byname = "GuildInviteByName()",
-  invite = "GuildInvite()",
-  chat   = "/ginvite (chat command)",
+  auto   = "Auto (recommended)",
+  byname = "Invite by name",
+  invite = "Invite my target",
+  chat   = "Use /ginvite command",
 }
 local MODE_ORDER = { "invite", "whisper", "whisperinvite" }
 local MODE_LABEL = {
@@ -48,6 +48,19 @@ local MODE_LABEL = {
 -- shorter text for the compact config buttons (full labels above are for chat)
 local METHOD_SHORT = { auto = "Auto", byname = "GuildInviteByName", invite = "GuildInvite", chat = "/ginvite" }
 local MODE_SHORT   = { invite = "Invite only", whisper = "Whisper only", whisperinvite = "Whisper, then invite" }
+
+-- one shared yes/cancel popup for destructive actions; GuildRecruiter_Confirm(msg, fn)
+-- runs fn only if the player confirms.
+StaticPopupDialogs["GUILDRECRUITER_CONFIRM"] = {
+  text = "%s", button1 = "Yes", button2 = "Cancel",
+  OnAccept = function() local f = GuildRecruiter_confirmFn; GuildRecruiter_confirmFn = nil; if f then f() end end,
+  OnCancel = function() GuildRecruiter_confirmFn = nil end,
+  timeout = 0, whileDead = 1, hideOnEscape = 1,
+}
+function GuildRecruiter_Confirm(msg, fn)
+  GuildRecruiter_confirmFn = fn
+  StaticPopup_Show("GUILDRECRUITER_CONFIRM", msg)
+end
 
 -- default whisper. Kept short and plain on purpose -- a one-line, low-pressure
 -- ask reads as a person, not an ad, and fits the message box without scrolling.
@@ -110,7 +123,7 @@ local backoffUntil = 0
 local presenceTimer = 0
 
 local whoTimer, inviteTimer, whoTimeout = 0, 0, 0
-local stats = { contacted=0, invited=0, whispered=0, guilded=0, scanned=0, queries=0, dropped=0, cooldown=0 }
+local stats = { contacted=0, invited=0, whispered=0, guilded=0, scanned=0, queries=0, dropped=0, cooldown=0, collected=0 }
 
 local function Print(msg)
   DEFAULT_CHAT_FRAME:AddMessage("|cff33ff99GuildRecruiter|r: "..msg)
@@ -184,6 +197,8 @@ local function Defaults()
   if not s.varStats then s.varStats = {} end   -- [profile] = {contacted,joined,declined}
   if s.abOn == nil  then s.abOn = false end     -- simultaneous A/B: deal each contact a variant
   if not s.abWeightA then s.abWeightA = 1 end   -- frequency weight of the control (variant A)
+  if s.collectOnly == nil then s.collectOnly = false end  -- scan into a list instead of contacting
+  if not s.candidates then s.candidates = {} end          -- [name] = {t, level, class}; persists across logout
   -- abVariants are the CHALLENGERS only (B/C/D). Variant A is always the live
   -- Settings tab (the control), so it is never stored here.
   if not s.abVariants then s.abVariants = {} end
@@ -470,6 +485,15 @@ function GuildRecruiter_BumpWeight(variant, delta)
   GuildRecruiter_RefreshOpen()
 end
 
+-- tooltip for the A/B weight buttons (so right-click-to-decrement is discoverable)
+function GuildRecruiter_WeightTip(btn)
+  GameTooltip:SetOwner(btn, "ANCHOR_RIGHT")
+  GameTooltip:SetText("Frequency weight")
+  GameTooltip:AddLine("Left-click: +1     Right-click: -1", 1, 1, 1)
+  GameTooltip:AddLine("Higher weight = dealt to a larger share of contacts.", 0.7, 0.7, 0.7, 1)
+  GameTooltip:Show()
+end
+
 -- per-contact settings for a variant table (blank fields fall back to live)
 function GuildRecruiter_CfgOf(v)
   local s = GuildRecruiter_Settings
@@ -552,7 +576,11 @@ end
 local function SendNextWho()
   if not NextQuery() then
     scanning = false
-    Print("Scan complete: "..stats.queries.." queries, "..table.getn(contactQueue).." left to contact.")
+    if GuildRecruiter_Settings.collectOnly then
+      Print("Scan complete: "..stats.queries.." queries, collected "..stats.collected.." (list now "..CountTable(GuildRecruiter_Settings.candidates).."). Send from the Lists tab.")
+    else
+      Print("Scan complete: "..stats.queries.." queries, "..table.getn(contactQueue).." left to contact.")
+    end
     return
   end
   awaiting = true
@@ -572,7 +600,7 @@ local function ProcessWho()
   local num = GetNumWhoResults()
   for i = 1, num do
     -- 1.12: name, guild, level, race, class, zone
-    local name, guild, _, _, class = GetWhoInfo(i)
+    local name, guild, level, _, class = GetWhoInfo(i)
     if name then
       stats.scanned = stats.scanned + 1
       if name == me or seen[name] then
@@ -587,7 +615,14 @@ local function ProcessWho()
         stats.cooldown = stats.cooldown + 1; seen[name] = true
       else
         seen[name] = true
-        tinsert(contactQueue, name)
+        if GuildRecruiter_Settings.collectOnly then        -- build a list now, contact later
+          if not GuildRecruiter_Settings.candidates[name] then
+            GuildRecruiter_Settings.candidates[name] = { t = time(), level = level, class = class }
+            stats.collected = stats.collected + 1
+          end
+        else
+          tinsert(contactQueue, name)
+        end
       end
     end
   end
@@ -698,7 +733,8 @@ local function GR_OnEvent()
       local e = jn and hist and hist[jn]
       if e then
         TallyBump("joined")
-        GuildRecruiter_VarBump((type(e) == "table") and e.p or nil, "joined")
+        local p = (type(e) == "table") and e.p or nil
+        if p ~= "(remote)" then GuildRecruiter_VarBump(p, "joined") end  -- a peer's contact isn't our variant
       end
     end
     if DECLINE_PAT then
@@ -706,7 +742,8 @@ local function GR_OnEvent()
       if dn then
         TallyBump("declined")
         local e = hist and hist[dn]
-        if e then GuildRecruiter_VarBump((type(e) == "table") and e.p or nil, "declined") end
+        local p = (type(e) == "table") and e.p or nil
+        if e and p ~= "(remote)" then GuildRecruiter_VarBump(p, "declined") end
       end
     end
   elseif event == "CHAT_MSG_WHISPER" then
@@ -811,6 +848,7 @@ local function GR_OnUpdate()
       elseif not CapReached() then
         local name = tremove(contactQueue, 1)
         Contact(name)
+        if GuildRecruiter_Settings.candidates then GuildRecruiter_Settings.candidates[name] = nil end  -- collected -> contacted
         Print("Contacted "..name.." ("..stats.contacted..")")
         inviteTimer = Pace(GuildRecruiter_Settings.inviteDelay)
       end
@@ -823,7 +861,11 @@ local function GR_OnUpdate()
       running = false
       SuppressWho(false)
       Broadcast("BYE")
-      Print("Done. Contacted "..stats.contacted.." ("..stats.invited.." invited, "..stats.whispered.." whispered), skipped "..stats.guilded.." guilded, "..stats.queries.." queries.")
+      if GuildRecruiter_Settings.collectOnly and stats.contacted == 0 then
+        Print("Done collecting. List now has "..CountTable(GuildRecruiter_Settings.candidates).." candidate(s). Send them from the Lists tab.")
+      else
+        Print("Done. Contacted "..stats.contacted.." ("..stats.invited.." invited, "..stats.whispered.." whispered), skipped "..stats.guilded.." guilded, "..stats.queries.." queries.")
+      end
     end
   end
 end
@@ -880,7 +922,7 @@ local function Start()
   current = nil
   pending, contactQueue, replyQueue, seen, whispered = {}, {}, {}, {}, {}
   whoTimer, inviteTimer, whoTimeout, presenceTimer = 0, 0, 0, 0
-  stats = { contacted=0, invited=0, whispered=0, guilded=0, scanned=0, queries=0, dropped=0, cooldown=0 }
+  stats = { contacted=0, invited=0, whispered=0, guilded=0, scanned=0, queries=0, dropped=0, cooldown=0, collected=0 }
   RecomputeBand()
   lo, width = myLo, START_WIDTH
   if GuildRecruiter_Settings.guildSync and IsInGuild() then Broadcast("HI") end
@@ -893,6 +935,43 @@ local function Stop()
   SuppressWho(false)
   Broadcast("BYE")
   Print("Stopped. Contacted "..stats.contacted.." this run; "..table.getn(contactQueue).." still queued.")
+end
+
+-- Send (paced) to the persistent candidate list built by Collect-only scans.
+-- No scanning: just load the list into the contact queue and drain it through
+-- the normal paced/safety pipeline. GLOBAL so the slash + Lists button reach it.
+function GuildRecruiter_SendToCandidates()
+  if not IsInGuild() then Print("You're not in a guild.") return end
+  if running and not paused then Print("Already running. /gr stop first.") return end
+  Defaults()
+  local s = GuildRecruiter_Settings
+  local names = {}
+  for n in s.candidates do tinsert(names, n) end
+  if table.getn(names) == 0 then Print("No collected candidates. Turn on Collect (Settings) and scan first.") return end
+  running, scanning, awaiting, paused = true, false, false, false
+  current = nil
+  pending, contactQueue, replyQueue, seen, whispered = {}, {}, {}, {}, {}
+  whoTimer, inviteTimer, whoTimeout, presenceTimer = 0, 0, 0, 0
+  stats = { contacted=0, invited=0, whispered=0, guilded=0, scanned=0, queries=0, dropped=0, cooldown=0, collected=0 }
+  for i = 1, table.getn(names) do tinsert(contactQueue, names[i]) end
+  if s.guildSync and IsInGuild() then Broadcast("HI") end
+  Print("Sending to "..table.getn(names).." collected candidate(s) ("..(MODE_LABEL[s.mode] or "?").."). /gr stop to cancel.")
+end
+
+-- GLOBALS so the main-window header (shown on every tab) can show run state and
+-- a Stop button without adding upvalues to BuildUI.
+function GuildRecruiter_StopRun() Stop() end
+function GuildRecruiter_HeaderTick(m, elapsed)
+  m.htick = (m.htick or 0) - (elapsed or 0)
+  if m.htick > 0 then return end
+  m.htick = 0.3
+  if running then
+    if paused then m.runStatus:SetText("|cffffcc00Paused|r  "..stats.contacted.." sent")
+    else m.runStatus:SetText("|cff40ff40Running|r  "..stats.contacted.." sent") end
+    m.stopBtn:Show()
+  else
+    m.runStatus:SetText(""); m.stopBtn:Hide()
+  end
 end
 
 local function Pause()
@@ -920,13 +999,16 @@ end
 local listFrame, listMode = nil, "queue"
 local listData = {}
 local NUM_ROWS, ROW_HEIGHT = 13, 18
-local LIST_ORDER = { "queue", "blacklist", "history", "negatives", "affirmatives" }
-local LIST_TITLE = { queue = "Queue (this run)", blacklist = "Blacklist", history = "Invite history",
-  negatives = "Refusal words (no)", affirmatives = "Yes words (yesonly mode)" }
+local LIST_ORDER = { "candidates", "queue", "blacklist", "history", "negatives", "affirmatives" }
+local LIST_TITLE = { candidates = "Candidates (collected)", queue = "Queue (this run)", blacklist = "Blacklist",
+  history = "Invite history", negatives = "Refusal words (no)", affirmatives = "Yes words (yesonly mode)" }
 
 local function BuildListData()
   listData = {}
-  if listMode == "queue" then
+  if listMode == "candidates" then
+    for n in GuildRecruiter_Settings.candidates do tinsert(listData, n) end
+    table.sort(listData)
+  elseif listMode == "queue" then
     for i = 1, table.getn(contactQueue) do tinsert(listData, contactQueue[i]) end
   elseif listMode == "blacklist" then
     for n in GuildRecruiter_Settings.blacklist do tinsert(listData, n) end
@@ -943,7 +1025,9 @@ local function BuildListData()
 end
 
 local function RemoveListItem(name)
-  if listMode == "queue" then
+  if listMode == "candidates" then
+    GuildRecruiter_Settings.candidates[name] = nil
+  elseif listMode == "queue" then
     for i = 1, table.getn(contactQueue) do
       if contactQueue[i] == name then tremove(contactQueue, i); break end
     end
@@ -973,7 +1057,7 @@ local function BuildListsPanel(parent)
   GuildRecruiter_DDArrow(fr.cycle)
 
   fr.hint = fr:CreateFontString(nil, "ARTWORK", "GameFontDisableSmall")
-  fr.hint:SetPoint("TOP", 0, -62); fr.hint:SetText("click a name to remove it")
+  fr.hint:SetPoint("TOP", 0, -62); fr.hint:SetText("click a name to remove it (Blacklist / History ask first)")
 
   local scroll = CreateFrame("ScrollFrame", "GuildRecruiterListScroll", fr, "FauxScrollFrameTemplate")
   scroll:SetPoint("TOPLEFT", 16, -78)
@@ -991,7 +1075,16 @@ local function BuildListsPanel(parent)
     ht:SetBlendMode("ADD"); ht:SetAlpha(0.4)
     local t = row:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
     t:SetPoint("LEFT", 6, 0); t:SetJustifyH("LEFT"); row.text = t
-    row:SetScript("OnClick", function() if this.pname then RemoveListItem(this.pname); UpdateList() end end)
+    row:SetScript("OnClick", function()
+      if not this.pname then return end
+      local nm = this.pname
+      if listMode == "blacklist" or listMode == "history" then   -- persistent: confirm
+        GuildRecruiter_Confirm("Remove |cffffffff"..nm.."|r from the "..(LIST_TITLE[listMode] or listMode).."?",
+          function() RemoveListItem(nm); UpdateList() end)
+      else
+        RemoveListItem(nm); UpdateList()
+      end
+    end)
     row:Hide()
     fr.rows[i] = row
   end
@@ -1020,6 +1113,16 @@ local function BuildListsPanel(parent)
   addEdit:SetScript("OnEnterPressed", function() doAdd(); this:ClearFocus() end)
   addEdit:SetScript("OnEscapePressed", function() this:ClearFocus() end)
 
+  -- send the collected candidate list (paced) through the normal contact pipeline
+  fr.sendBtn = CreateFrame("Button", nil, fr, "UIPanelButtonTemplate")
+  fr.sendBtn:SetPoint("BOTTOMRIGHT", -16, 18); fr.sendBtn:SetWidth(210); fr.sendBtn:SetHeight(22)
+  fr.sendBtn:SetScript("OnClick", function()
+    local cnt = CountTable(GuildRecruiter_Settings.candidates)
+    if cnt == 0 then Print("No collected candidates yet. Turn on Collect (Settings) and scan.") return end
+    GuildRecruiter_Confirm("Send to "..cnt.." collected candidate(s) now? They'll be contacted at your usual paced rate.",
+      function() GuildRecruiter_SendToCandidates() end)
+  end)
+
   listFrame = fr
   return fr
 end
@@ -1040,6 +1143,9 @@ UpdateList = function()
   end
   FauxScrollFrame_Update(listFrame.scroll, n, NUM_ROWS, ROW_HEIGHT)
   listFrame.cycle:SetText("View: "..(LIST_TITLE[listMode] or listMode).."  ("..n..")")
+  local cc = CountTable(GuildRecruiter_Settings.candidates or {})
+  listFrame.sendBtn:SetText("Send to candidates ("..cc..")")
+  if cc > 0 and not running then listFrame.sendBtn:Enable() else listFrame.sendBtn:Disable() end
 end
 
 -- ---------------------------------------------------------------------------
@@ -1051,15 +1157,19 @@ local RefreshConfig, RefreshStats, RefreshABPanel  -- forward decls
 -- level setters used by both the GUI boxes and slash: clamp to 1-60, drop any
 -- fraction, and keep min <= max (raising the other bound if they cross)
 local function SetMinLevel(v)
-  v = clamp(math.floor(tonumber(v) or 1), 1, 60)
+  local raw = tonumber(v)
+  v = clamp(math.floor(raw or 1), 1, 60)
+  if raw and raw ~= v then Print("Min level adjusted to "..v.." (allowed 1-60).") end
   GuildRecruiter_Settings.minLevel = v
-  if GuildRecruiter_Settings.maxLevel < v then GuildRecruiter_Settings.maxLevel = v end
+  if GuildRecruiter_Settings.maxLevel < v then GuildRecruiter_Settings.maxLevel = v; Print("Max raised to "..v.." to keep min <= max.") end
   RecomputeBand(); RefreshConfig()
 end
 local function SetMaxLevel(v)
-  v = clamp(math.floor(tonumber(v) or 60), 1, 60)
+  local raw = tonumber(v)
+  v = clamp(math.floor(raw or 60), 1, 60)
+  if raw and raw ~= v then Print("Max level adjusted to "..v.." (allowed 1-60).") end
   GuildRecruiter_Settings.maxLevel = v
-  if GuildRecruiter_Settings.minLevel > v then GuildRecruiter_Settings.minLevel = v end
+  if GuildRecruiter_Settings.minLevel > v then GuildRecruiter_Settings.minLevel = v; Print("Min lowered to "..v.." to keep min <= max.") end
   RecomputeBand(); RefreshConfig()
 end
 
@@ -1161,6 +1271,7 @@ RefreshConfig = function()
   configFrame.combatCheck:SetChecked(s.skipCombat)
   configFrame.instanceCheck:SetChecked(s.skipInstance)
   configFrame.quietCheck:SetChecked(s.quietWho)
+  configFrame.collectCheck:SetChecked(s.collectOnly)
   configFrame.replyBtn:SetText(REPLY_LABEL[s.replyMode] or s.replyMode)
 
   -- This tab is always variant A (the control) and never locks. We only enable
@@ -1174,7 +1285,15 @@ RefreshConfig = function()
   setBtn(configFrame.replyBtn,  mode == "whisperinvite")
   setBtn(configFrame.whisperBtn, mode == "whisper" or mode == "whisperinvite")
   configFrame.abNote:SetText(GuildRecruiter_ABActive()
-    and "|cff40ff40A/B on: this is variant A (control). Other variants: A/B tab.|r" or "")
+    and "|cff40ff40A/B on -- this is variant A (control)|r" or "")
+  -- tell the user WHY some Invite controls are greyed for the current mode
+  if mode == "invite" then
+    configFrame.modeNote:SetText("Invite-only: sends a guild invite straight away. Reply & Message aren't used.")
+  elseif mode == "whisper" then
+    configFrame.modeNote:SetText("Whisper-only: just messages them. Method & Reply aren't used.")
+  else
+    configFrame.modeNote:SetText("Whisper, then invite when they reply (per the Reply rule).")
+  end
 
   configFrame.updating = false
 end
@@ -1182,6 +1301,10 @@ end
 local function StatusLine()
   if not running then return "Idle." end
   if paused then return "Paused at lvl "..lo.." | queued "..table.getn(contactQueue) end
+  if scanning and GuildRecruiter_Settings.collectOnly then
+    return "collecting lvl "..lo.." | band "..myLo.."-"..myHi.." | found "..stats.collected
+         .." | list "..CountTable(GuildRecruiter_Settings.candidates)
+  end
   local where = scanning and ("scanning lvl "..lo) or "draining"
   return where.." | band "..myLo.."-"..myHi.." | queued "..table.getn(contactQueue)
        .." | sent "..stats.contacted.." | peers "..(CountTable(recruiters))
@@ -1374,18 +1497,26 @@ local function BuildSettingsPanel(parent)
   local fr = CreateFrame("Frame", "GuildRecruiterConfig", parent)
   fr:SetAllPoints(parent)
 
-  -- LEFT column ----------------------------------------------------------
+  -- LEFT column: Speed / Safety / Targets --------------------------------
   Header(fr, "Speed", 18, -44, 250)
   fr.inviteSlider, fr.inviteEdit = MakeSlider(fr, "GuildRecruiterConfigInvite", "Invite/contact delay (s)", INVITE_MIN, INVITE_MAX, -84, ApplyInvite)
   fr.whoSlider,    fr.whoEdit    = MakeSlider(fr, "GuildRecruiterConfigWho",    "/who delay (s)",           WHO_MIN,    WHO_MAX,    -132, ApplyWho)
   fr.jitterCheck   = MakeCheck(fr, "GuildRecruiterConfigJitter", "Random delays (anti-detection)", 20, -162, "jitter")
 
   Header(fr, "Safety", 18, -196, 250)
-  fr.quietCheck    = MakeCheck(fr, "GuildRecruiterConfigQuiet",    "Quiet /who chat",    20, -224, "quietWho")
-  fr.combatCheck   = MakeCheck(fr, "GuildRecruiterConfigCombat",   "Pause in combat",    20, -250, "skipCombat")
-  fr.instanceCheck = MakeCheck(fr, "GuildRecruiterConfigInstance", "Pause in instances", 20, -276, "skipInstance")
+  fr.quietCheck    = MakeCheck(fr, "GuildRecruiterConfigQuiet",    "Quiet /who chat",    20, -222, "quietWho")
+  fr.combatCheck   = MakeCheck(fr, "GuildRecruiterConfigCombat",   "Pause in combat",    20, -246, "skipCombat")
+  fr.instanceCheck = MakeCheck(fr, "GuildRecruiterConfigInstance", "Pause in instances", 20, -270, "skipInstance")
 
-  -- RIGHT column ----------------------------------------------------------
+  Header(fr, "Targets", 18, -304, 250)
+  Label(fr, "Levels", 24, -330)
+  fr.minEdit = MakeNumBox(fr, "GuildRecruiterConfigMin", 150, -326, 34, 2, function(v) SetMinLevel(v) end)
+  Label(fr, "to", 192, -330)
+  fr.maxEdit = MakeNumBox(fr, "GuildRecruiterConfigMax", 214, -326, 34, 2, function(v) SetMaxLevel(v) end)
+  Label(fr, "Session cap (0=off)", 24, -354)
+  fr.capEdit = MakeNumBox(fr, "GuildRecruiterConfigCap", 150, -350, 34, 4, function(v) GuildRecruiter_Settings.sessionCap = clamp(math.floor(v), 0, 9999) end)
+
+  -- RIGHT column: Invites -------------------------------------------------
   Header(fr, "Invites", 292, -44, 250)
   -- three uniform inline dropdown rows: label at 298, dropdown aligned at 352
   Label(fr, "Method:", 298, -82)
@@ -1413,28 +1544,30 @@ local function BuildSettingsPanel(parent)
   fr.whisperBtn:SetText("Edit message...")
   fr.whisperBtn:SetScript("OnClick", function() GuildRecruiter_EditMessage(GuildRecruiter_Settings) end)
   fr.abNote = fr:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
-  fr.abNote:SetPoint("TOPLEFT", 298, -264); fr.abNote:SetWidth(240); fr.abNote:SetJustifyH("LEFT")
+  fr.abNote:SetPoint("TOPLEFT", 298, -266); fr.abNote:SetWidth(240); fr.abNote:SetHeight(14); fr.abNote:SetJustifyH("LEFT")
+  -- explains which Invite controls are greyed and why, for the current Mode
+  fr.modeNote = fr:CreateFontString(nil, "ARTWORK", "GameFontDisableSmall")
+  fr.modeNote:SetPoint("TOPLEFT", 298, -288); fr.modeNote:SetWidth(240); fr.modeNote:SetHeight(40); fr.modeNote:SetJustifyH("LEFT"); fr.modeNote:SetJustifyV("TOP")
 
-  Header(fr, "Targets", 292, -284, 250)
-  Label(fr, "Levels", 298, -314)
-  fr.minEdit = MakeNumBox(fr, "GuildRecruiterConfigMin", 344, -310, 34, 2, function(v) SetMinLevel(v) end)
-  Label(fr, "to", 386, -314)
-  fr.maxEdit = MakeNumBox(fr, "GuildRecruiterConfigMax", 406, -310, 34, 2, function(v) SetMaxLevel(v) end)
-  Label(fr, "Session cap (0=off)", 298, -340)
-  fr.capEdit = MakeNumBox(fr, "GuildRecruiterConfigCap", 430, -336, 34, 4, function(v) GuildRecruiter_Settings.sessionCap = clamp(math.floor(v), 0, 9999) end)
+  fr.collectCheck = MakeCheck(fr, "GuildRecruiterConfigCollect", "Collect only (build a list, don't contact)", 298, -332, "collectOnly")
+  local cnote = fr:CreateFontString(nil, "ARTWORK", "GameFontDisableSmall")
+  cnote:SetPoint("TOPLEFT", 320, -356); cnote:SetWidth(218); cnote:SetJustifyH("LEFT")
+  cnote:SetText("Scanning fills a saved list. Send it from the Lists tab.")
 
   -- RUN (spans full width) ------------------------------------------------
-  Header(fr, "Controls", 18, -370, 524)
+  Header(fr, "Controls", 18, -378, 524)
   fr.status = fr:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
-  fr.status:SetPoint("TOPLEFT", 24, -390); fr.status:SetWidth(512); fr.status:SetJustifyH("LEFT")
+  fr.status:SetPoint("TOPLEFT", 24, -396); fr.status:SetWidth(512); fr.status:SetJustifyH("LEFT")
 
   fr.bar = CreateFrame("StatusBar", nil, fr)
-  fr.bar:SetPoint("TOPLEFT", 24, -408); fr.bar:SetWidth(512); fr.bar:SetHeight(14)
+  fr.bar:SetPoint("TOPLEFT", 24, -414); fr.bar:SetWidth(512); fr.bar:SetHeight(14)
   fr.bar:SetStatusBarTexture("Interface\\TargetingFrame\\UI-StatusBar")
   fr.bar:SetStatusBarColor(0.2, 0.8, 0.3)
   fr.bar:SetMinMaxValues(0, 1); fr.bar:SetValue(0)
   local barbg = fr.bar:CreateTexture(nil, "BACKGROUND")
   barbg:SetAllPoints(fr.bar); barbg:SetTexture(0, 0, 0, 0.4)
+  fr.barText = fr.bar:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+  fr.barText:SetPoint("CENTER", fr.bar, "CENTER", 0, 0)   -- says what the bar means (scan vs drain)
 
   -- start / pause / stop (pause label flips to Resume while paused)
   local startBtn = CreateFrame("Button", nil, fr, "UIPanelButtonTemplate")
@@ -1461,6 +1594,11 @@ local function BuildSettingsPanel(parent)
     if running and scanning and span > 0 then prog = clamp((lo - myLo) / span, 0, 1) end
     if not running then prog = 0 end
     fr.bar:SetValue(prog)
+    -- label the bar so a full bar during the (long) drain phase isn't read as "done"
+    if not running then fr.barText:SetText("")
+    elseif scanning and GuildRecruiter_Settings.collectOnly then fr.barText:SetText("Collecting  "..math.floor(prog * 100 + 0.5).."%  ("..CountTable(GuildRecruiter_Settings.candidates).." on list)")
+    elseif scanning then fr.barText:SetText("Scanning  "..math.floor(prog * 100 + 0.5).."%")
+    else fr.barText:SetText("Sending queued contacts ("..table.getn(contactQueue).." left)") end
   end)
 
   configFrame = fr
@@ -1539,7 +1677,14 @@ local function BuildStatsPanel(parent)
   delB:SetPoint("LEFT", loadB, "RIGHT", 6, 0); delB:SetWidth(80); delB:SetHeight(22); delB:SetText("Delete")
   saveB:SetScript("OnClick", function() if SaveProfile(pedit:GetText()) then RefreshStats() end end)
   loadB:SetScript("OnClick", function() if LoadProfile(pedit:GetText()) then RefreshStats() end end)
-  delB:SetScript("OnClick", function() DeleteProfile(pedit:GetText()); RefreshStats() end)
+  delB:SetScript("OnClick", function()
+    local nm = pedit:GetText()
+    if not nm or nm == "" or not (GuildRecruiter_Settings.profiles and GuildRecruiter_Settings.profiles[nm]) then
+      Print("No saved profile '"..(nm or "").."' to delete."); return
+    end
+    GuildRecruiter_Confirm("Delete profile |cffffffff"..nm.."|r? This can't be undone.",
+      function() DeleteProfile(nm); RefreshStats(); Print("Deleted profile '"..nm.."'.") end)
+  end)
 
   fr.profileText = fr:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
   fr.profileText:SetPoint("TOPLEFT", 18, -114); fr.profileText:SetWidth(524); fr.profileText:SetJustifyH("LEFT")
@@ -1551,9 +1696,12 @@ local function BuildStatsPanel(parent)
   local resetB = CreateFrame("Button", nil, fr, "UIPanelButtonTemplate")
   resetB:SetPoint("BOTTOMRIGHT", -16, 16); resetB:SetWidth(110); resetB:SetHeight(22); resetB:SetText("Reset stats")
   resetB:SetScript("OnClick", function()
-    GuildRecruiter_Settings.tally = { totals = { invited=0, whispered=0, joined=0, declined=0 }, days = {} }
-    GuildRecruiter_Settings.varStats = {}
-    RefreshStats()
+    GuildRecruiter_Confirm("Reset ALL stats? This wipes lifetime tallies and every variant's A/B conversion data. Can't be undone.",
+      function()
+        GuildRecruiter_Settings.tally = { totals = { invited=0, whispered=0, joined=0, declined=0 }, days = {} }
+        GuildRecruiter_Settings.varStats = {}
+        RefreshStats()
+      end)
   end)
 
   fr.tick = 0
@@ -1571,6 +1719,7 @@ end
 RefreshStats = function()
   if not statsFrame then return end
   local t = GuildRecruiter_Settings.tally
+  if not t or not t.totals then return end   -- guard: stats panel can tick before Defaults()
   local tot = t.totals
   local lines = {}
   tinsert(lines, "|cffffd100Lifetime|r")
@@ -1656,10 +1805,12 @@ local function WeightPct(w, total)
   return math.floor(w / total * 100 + 0.5).."%"
 end
 
--- short, truncated preview of a message (blank shows a hint)
-local function MsgPreview(msg, blankHint)
+-- short, truncated preview of a message kept to a single line (blank shows a hint).
+-- maxlen is tuned to the FontString width so it never wraps onto a second line.
+local function MsgPreview(msg, blankHint, maxlen)
+  maxlen = maxlen or 56
   if not msg or msg == "" then return "|cff808080"..(blankHint or "(empty)").."|r" end
-  if string.len(msg) > 86 then msg = string.sub(msg, 1, 84).."..." end
+  if string.len(msg) > maxlen then msg = string.sub(msg, 1, maxlen - 2).."..." end
   return "|cffd0d0d0"..msg.."|r"
 end
 
@@ -1692,7 +1843,7 @@ local function BuildABPanel(parent)
 
   -- control row (variant A = the Settings tab), read-only here except its weight
   local cr = CreateFrame("Frame", nil, fr)
-  cr:SetPoint("TOPLEFT", 16, -116); cr:SetPoint("RIGHT", fr, "RIGHT", -16, 0); cr:SetHeight(44)
+  cr:SetPoint("TOPLEFT", 16, -122); cr:SetPoint("RIGHT", fr, "RIGHT", -16, 0); cr:SetHeight(44)
   cr.nameFS = cr:CreateFontString(nil, "ARTWORK", "GameFontNormal")
   cr.nameFS:SetPoint("TOPLEFT", 2, 0); cr.nameFS:SetText("Variant A  |cff999999(control = Settings)|r")
   cr.convFS = cr:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
@@ -1704,14 +1855,16 @@ local function BuildABPanel(parent)
   cr.wtBtn:SetPoint("TOPLEFT", 14, -22); cr.wtBtn:SetWidth(132); cr.wtBtn:SetHeight(20)
   cr.wtBtn:RegisterForClicks("LeftButtonUp", "RightButtonUp")
   cr.wtBtn:SetScript("OnClick", function() GuildRecruiter_BumpWeight(nil, arg1 == "RightButton" and -1 or 1) end)
+  cr.wtBtn:SetScript("OnEnter", function() GuildRecruiter_WeightTip(this) end)
+  cr.wtBtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
   cr.msgFS = cr:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
-  cr.msgFS:SetPoint("TOPLEFT", 154, -24); cr.msgFS:SetWidth(236); cr.msgFS:SetJustifyH("LEFT")
+  cr.msgFS:SetPoint("TOPLEFT", 154, -24); cr.msgFS:SetWidth(236); cr.msgFS:SetHeight(14); cr.msgFS:SetJustifyH("LEFT")
   fr.ctrl = cr
 
   fr.rows = {}
   for i = 1, MAX_CHAL do
     local row = CreateFrame("Frame", nil, fr)
-    row:SetPoint("TOPLEFT", 16, -168 - (i - 1) * 70); row:SetPoint("RIGHT", fr, "RIGHT", -16, 0); row:SetHeight(62)
+    row:SetPoint("TOPLEFT", 16, -168 - (i - 1) * 72); row:SetPoint("RIGHT", fr, "RIGHT", -16, 0); row:SetHeight(64)
     local nm = row:CreateFontString(nil, "ARTWORK", "GameFontNormal")
     nm:SetPoint("TOPLEFT", 2, 0); row.nameFS = nm
     local cv = row:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
@@ -1732,12 +1885,14 @@ local function BuildABPanel(parent)
     mb:SetScript("OnClick", function() GuildRecruiter_EditMessage(this.variant) end)
     row.msgBtn = mb
     local wb = CreateFrame("Button", nil, row, "UIPanelButtonTemplate")
-    wb:SetPoint("TOPLEFT", 16, -44); wb:SetWidth(132); wb:SetHeight(20)
+    wb:SetPoint("TOPLEFT", 16, -46); wb:SetWidth(132); wb:SetHeight(20)
     wb:RegisterForClicks("LeftButtonUp", "RightButtonUp")
     wb:SetScript("OnClick", function() GuildRecruiter_BumpWeight(this.variant, arg1 == "RightButton" and -1 or 1) end)
+    wb:SetScript("OnEnter", function() GuildRecruiter_WeightTip(this) end)
+    wb:SetScript("OnLeave", function() GameTooltip:Hide() end)
     row.wtBtn = wb
     row.msgFS = row:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
-    row.msgFS:SetPoint("TOPLEFT", 156, -46); row.msgFS:SetWidth(350); row.msgFS:SetJustifyH("LEFT")
+    row.msgFS:SetPoint("TOPLEFT", 156, -48); row.msgFS:SetWidth(350); row.msgFS:SetHeight(14); row.msgFS:SetJustifyH("LEFT")
     row:Hide()
     fr.rows[i] = row
   end
@@ -1751,9 +1906,11 @@ RefreshABPanel = function()
   local s = GuildRecruiter_Settings
   local av = s.abVariants
   local n = table.getn(av)               -- challenger count
-  abFrame.toggle:SetText("A/B: "..(s.abOn and "|cff40ff40Running|r" or "Off"))
+  if not s.abOn then abFrame.toggle:SetText("A/B: Off")
+  elseif n < 1 then abFrame.toggle:SetText("A/B: |cffffcc00On (inactive)|r")   -- on, but no variant to split = no-op
+  else abFrame.toggle:SetText("A/B: |cff40ff40Running|r") end
   if s.abOn and n < 1 then
-    abFrame.hint:SetText("A/B is on but has no other variant yet -- click '+ Add variant' to test one against A (your Settings).")
+    abFrame.hint:SetText("A/B is on but has no other variant yet -- it won't do anything until you click '+ Add variant' to test one against A (your Settings).")
   else
     abFrame.hint:SetText("Each contact is dealt a variant by Weight (left-click +, right-click -). Blank variant fields inherit A. Compare the green conv% -- it's a rate, so weight doesn't skew it.")
   end
@@ -1764,7 +1921,7 @@ RefreshABPanel = function()
   for i = 1, n do totalW = totalW + (av[i].weight or 1) end
 
   abFrame.ctrl.convFS:SetText(ConvBlurb("A"))
-  abFrame.ctrl.msgFS:SetText(MsgPreview(s.whisperMsg, "(no message)"))
+  abFrame.ctrl.msgFS:SetText(MsgPreview(s.whisperMsg, "(no message)", 40))
   abFrame.ctrl.wtBtn:SetText("Weight "..wA.."  ("..WeightPct(wA, totalW)..")")
 
   for i = 1, MAX_CHAL do
@@ -1778,7 +1935,7 @@ RefreshABPanel = function()
       row.replyBtn.variant = v; row.replyBtn:SetText(REPLY_LABEL[v.replyMode or s.replyMode] or "?")
       row.msgBtn.variant = v
       row.wtBtn.variant = v;    row.wtBtn:SetText("Weight "..w.."  ("..WeightPct(w, totalW)..")")
-      row.msgFS:SetText(MsgPreview(v.whisperMsg, "(same message as A)"))
+      row.msgFS:SetText(MsgPreview(v.whisperMsg, "(same message as A)", 56))
       row:Show()
     else
       row:Hide()
@@ -1823,12 +1980,22 @@ local function BuildUI()
   m:SetScript("OnDragStart", function() this:StartMoving() end)
   m:SetScript("OnDragStop", function() this:StopMovingOrSizing() end)
   m:SetScript("OnHide", function() if ddPopup then ddPopup:Hide() end end)  -- no orphan dropdown
+  m:SetScript("OnUpdate", function() GuildRecruiter_HeaderTick(this, arg1) end)  -- run state on every tab
+  tinsert(UISpecialFrames, "GuildRecruiterUI")   -- Escape closes the window (house rule)
   m:Hide()
 
   local title = m:CreateFontString(nil, "ARTWORK", "GameFontNormal")
   title:SetPoint("TOP", 0, -16); title:SetText("Guild Recruiter  v"..VERSION)
   local close = CreateFrame("Button", nil, m, "UIPanelCloseButton")
   close:SetPoint("TOPRIGHT", -6, -6)
+
+  -- header run-state + Stop, visible on every tab during an active run
+  m.runStatus = m:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
+  m.runStatus:SetPoint("TOPLEFT", 16, -16)
+  m.stopBtn = CreateFrame("Button", nil, m, "UIPanelButtonTemplate")
+  m.stopBtn:SetPoint("RIGHT", close, "LEFT", -2, 0); m.stopBtn:SetWidth(70); m.stopBtn:SetHeight(20); m.stopBtn:SetText("Stop")
+  m.stopBtn:SetScript("OnClick", function() GuildRecruiter_StopRun() end)
+  m.stopBtn:Hide()
 
   tabPanels.settings = BuildSettingsPanel(m)
   tabPanels.lists    = BuildListsPanel(m)
@@ -1953,6 +2120,17 @@ SlashCmdList["GUILDRECRUITER"] = function(msg)
   elseif cmd == "pause" then Pause()
   elseif cmd == "resume" then Resume()
   elseif cmd == "status" then Status()
+  elseif cmd == "collect" then
+    if larg == "on" or larg == "off" then GuildRecruiter_Settings.collectOnly = (larg == "on"); RefreshConfig() end
+    Print("Collect-only "..(GuildRecruiter_Settings.collectOnly and "ON -- scans build a list (send with /gr send)" or "off -- scans contact immediately")..".")
+  elseif cmd == "send" then
+    GuildRecruiter_SendToCandidates()
+  elseif cmd == "candidates" then
+    Print("Collected candidates: "..CountTable(GuildRecruiter_Settings.candidates)..".  (Lists tab to view, /gr send to invite, /gr clearlist to empty.)")
+  elseif cmd == "clearlist" then
+    local cnt = CountTable(GuildRecruiter_Settings.candidates)
+    if cnt == 0 then Print("Candidate list is already empty.")
+    else GuildRecruiter_Confirm("Clear the "..cnt.." collected candidate(s)?", function() GuildRecruiter_Settings.candidates = {}; GuildRecruiter_RefreshOpen(); if listFrame then UpdateList() end; Print("Cleared candidate list.") end) end
   elseif cmd == "config" or cmd == "options" or cmd == "gui" then ToggleConfig()
   elseif cmd == "list" or cmd == "lists" then ToggleList()
   elseif cmd == "stats" then GuildRecruiter_ToggleStats()
@@ -2018,7 +2196,12 @@ SlashCmdList["GUILDRECRUITER"] = function(msg)
   elseif cmd == "reset" then
     seen = {}; Print("Cleared this session's scan list (history kept).")
   elseif cmd == "forget" then
-    GuildRecruiter_Settings.history = {}; Print("Cleared persistent invite history.")
+    local cnt = CountTable(GuildRecruiter_Settings.history or {})
+    if cnt == 0 then Print("Invite history is already empty.")
+    else
+      GuildRecruiter_Confirm("Clear invite history of "..cnt.." player(s)? They'll become eligible to contact again.",
+        function() GuildRecruiter_Settings.history = {}; Print("Cleared persistent invite history ("..cnt.." entries).") end)
+    end
   elseif cmd == "hide" then
     GuildRecruiter_Settings.hideWho = not GuildRecruiter_Settings.hideWho
     if running and not paused then
@@ -2082,6 +2265,7 @@ SlashCmdList["GUILDRECRUITER"] = function(msg)
   else
     Print("|cff33ff99GuildRecruiter v"..VERSION.."|r  --  /gr config, /gr list, /gr stats")
     Print("start | stop | pause | resume | status | reset | forget | hide")
+    Print("collect on|off (scan into a list) | send (invite the list) | candidates | clearlist")
     Print("set invite/who/reinvite/cap/min/max/method/mode <v> | msg <text> | class <list|all>")
     Print("profile save/load/delete/list <name> | replymode notno/yesonly/any | ab (open tab) /on/off/clear")
     Print("noword/yesword add/remove/list <phrase>")
