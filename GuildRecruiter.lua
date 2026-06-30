@@ -19,7 +19,7 @@
 
 GuildRecruiter_Settings = GuildRecruiter_Settings or {}
 
-local VERSION    = "3.6.1"
+local VERSION    = "3.7"
 local CAP_HINT   = 49      -- treat a query returning >= this many as truncated
 local START_WIDTH = 10     -- initial level-band width to try
 local WHO_TIMEOUT = 12     -- give up waiting on a reply after this many seconds
@@ -180,7 +180,15 @@ local function Defaults()
   if not s.tally.days   then s.tally.days   = {} end
   if not s.varStats then s.varStats = {} end   -- [profile] = {contacted,joined,declined}
   if s.abOn == nil  then s.abOn = false end     -- simultaneous A/B: deal each contact a variant
-  if not s.abVariants then s.abVariants = {} end -- profiles flagged as A/B variants
+  if not s.abVariants then s.abVariants = {} end -- inline variants {name,mode,whisperMsg,inviteMethod,replyMode}
+  for i = 1, table.getn(s.abVariants) do        -- migrate old flagged-profile-name strings -> tables
+    local v = s.abVariants[i]
+    if type(v) == "string" then
+      local p = s.profiles and s.profiles[v]
+      s.abVariants[i] = { name = v, mode = p and p.mode, whisperMsg = p and p.whisperMsg,
+                          inviteMethod = p and p.inviteMethod, replyMode = p and p.replyMode }
+    end
+  end
   if not s.minimapAngle then s.minimapAngle = 210 end
   -- prune history past the cooldown so the saved table can't grow forever
   if s.reinviteDays > 0 then
@@ -225,8 +233,9 @@ end
 -- exact "yes" missed "sure", "y", "ok", typos, etc., so we invert: any reply
 -- that doesn't contain a negative phrase counts (they bothered to whisper back).
 -- decide whether a whisper reply should trigger an invite, per the reply policy
-local function ShouldInvite(reply, variant)
-  local mode = GuildRecruiter_VariantCfg(variant).replyMode   -- per-variant reply policy
+local function ShouldInvite(reply, vname)
+  local v = GuildRecruiter_VariantByName(vname)               -- the variant that contacted them
+  local mode = (v and v.replyMode) or GuildRecruiter_Settings.replyMode or "notno"
   if mode == "any" then return true end
   local norm = Normalize(reply)
   if mode == "yesonly" then
@@ -404,55 +413,64 @@ function GuildRecruiter_VarBump(profile, field)
   vs[profile][field] = (vs[profile][field] or 0) + 1
 end
 
--- A/B: which variant (profile) handles this contact. When A/B is on with 2+
--- flagged profiles, each contact is randomly dealt one; otherwise the active one.
+-- A/B variants are inline tables {name, mode, whisperMsg, inviteMethod, replyMode}.
+-- PickVariant returns the variant table dealt to this contact (nil = use live).
 function GuildRecruiter_PickVariant()
   local s = GuildRecruiter_Settings
   if s.abOn and s.abVariants and table.getn(s.abVariants) >= 2 then
     return s.abVariants[random(1, table.getn(s.abVariants))]
   end
-  return s.activeProfile
+  return nil
 end
 
--- the per-contact settings of a variant (profile), falling back to live settings
-function GuildRecruiter_VariantCfg(variant)
+-- per-contact settings for a variant table (blank fields fall back to live)
+function GuildRecruiter_CfgOf(v)
   local s = GuildRecruiter_Settings
-  local p = variant and s.profiles and s.profiles[variant]
-  local function pick(k) if p and p[k] ~= nil then return p[k] else return s[k] end end
-  return { mode = pick("mode") or "invite", whisperMsg = pick("whisperMsg"),
-           inviteMethod = pick("inviteMethod"), replyMode = pick("replyMode") or "notno" }
+  if not v then v = s end   -- nil variant -> live settings
+  return {
+    mode         = v.mode         or s.mode or "invite",
+    whisperMsg   = v.whisperMsg   or s.whisperMsg,
+    inviteMethod = v.inviteMethod or s.inviteMethod,
+    replyMode    = v.replyMode    or s.replyMode or "notno",
+  }
 end
 
-local function RecordHandled(name, variant)
+-- find a variant table by name (to credit a reply/join back to it)
+function GuildRecruiter_VariantByName(nm)
+  local av = GuildRecruiter_Settings.abVariants
+  if nm and av then
+    for i = 1, table.getn(av) do if av[i].name == nm then return av[i] end end
+  end
+  return nil
+end
+
+local function RecordHandled(name, vname)
   if not GuildRecruiter_Settings.history then GuildRecruiter_Settings.history = {} end
-  GuildRecruiter_Settings.history[name] = { t = time(), p = variant }
+  GuildRecruiter_Settings.history[name] = { t = time(), p = vname }
   Broadcast("INV "..name)
 end
 
 -- perform the configured contact action for one name (variant chosen per A/B)
 local function Contact(name)
-  local variant = GuildRecruiter_PickVariant()
-  local cfg = GuildRecruiter_VariantCfg(variant)
-  local mode = cfg.mode
-  if mode == "whisper" then
+  local v = GuildRecruiter_PickVariant()                 -- variant table or nil (live)
+  local cfg = GuildRecruiter_CfgOf(v)
+  local vname = (v and v.name) or GuildRecruiter_Settings.activeProfile
+  if cfg.mode == "whisper" then
     SendChatMessage(WhisperBody(name, cfg.whisperMsg), "WHISPER", nil, name)
-    stats.whispered = stats.whispered + 1
-    TallyBump("whispered")
-    RecordHandled(name, variant)
-  elseif mode == "whisperinvite" then
+    stats.whispered = stats.whispered + 1; TallyBump("whispered")
+    RecordHandled(name, vname)
+  elseif cfg.mode == "whisperinvite" then
     SendChatMessage(WhisperBody(name, cfg.whisperMsg), "WHISPER", nil, name)
-    stats.whispered = stats.whispered + 1
-    TallyBump("whispered")
-    whispered[name] = { t = GetTime(), v = variant }
-    RecordHandled(name, variant)
+    stats.whispered = stats.whispered + 1; TallyBump("whispered")
+    whispered[name] = { t = GetTime(), v = vname }
+    RecordHandled(name, vname)
   else
     DoGuildInvite(name, cfg.inviteMethod)
-    stats.invited = stats.invited + 1
-    TallyBump("invited")
-    RecordHandled(name, variant)
+    stats.invited = stats.invited + 1; TallyBump("invited")
+    RecordHandled(name, vname)
   end
   stats.contacted = stats.contacted + 1
-  GuildRecruiter_VarBump(variant, "contacted")
+  GuildRecruiter_VarBump(vname, "contacted")
 end
 
 -- ---------------------------------------------------------------------------
@@ -981,7 +999,7 @@ end
 -- Config GUI
 -- ---------------------------------------------------------------------------
 local configFrame
-local RefreshConfig  -- forward decl
+local RefreshConfig, RefreshStats, RefreshABPanel  -- forward decls
 
 -- level setters used by both the GUI boxes and slash: clamp to 1-60, drop any
 -- fraction, and keep min <= max (raising the other bound if they cross)
@@ -1167,26 +1185,36 @@ local function BuildDDPopup()
     local t = ob:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
     t:SetPoint("LEFT", 4, 0); t:SetPoint("RIGHT", -4, 0); t:SetJustifyH("LEFT"); ob.text = t
     ob:SetScript("OnClick", function()
-      GuildRecruiter_Settings[this.skey] = this.value
-      p:Hide(); RefreshConfig()
+      this.target[this.key] = this.value
+      p:Hide(); GuildRecruiter_RefreshOpen()
     end)
     p.opts[i] = ob
   end
   ddPopup = p
 end
 
-function GuildRecruiter_OpenDD(btn, kind)
+-- refresh whichever panels are open (called after any dropdown pick)
+function GuildRecruiter_RefreshOpen()
+  if RefreshConfig then RefreshConfig() end
+  if RefreshABPanel then RefreshABPanel() end
+  if RefreshStats then RefreshStats() end
+end
+
+-- open the option list for `kind`, writing the picked value into `target`
+-- (defaults to the live settings table; pass a variant table for A/B rows)
+function GuildRecruiter_OpenDD(btn, kind, target)
   if not ddPopup then BuildDDPopup() end
-  if ddPopup:IsShown() and ddPopup.kind == kind then ddPopup:Hide(); return end
+  if ddPopup:IsShown() and ddPopup.kind == kind and ddPopup.target == target then ddPopup:Hide(); return end
+  target = target or GuildRecruiter_Settings
   local def = DD_DEF[kind]
-  local order, label, skey = def[1], def[2], def[3]
-  ddPopup.kind = kind
+  local order, label, key = def[1], def[2], def[3]
+  ddPopup.kind = kind; ddPopup.target = target
   local n = table.getn(order)
   for i = 1, 6 do
     local ob = ddPopup.opts[i]
     if i <= n then
       local k = order[i]
-      ob.value = k; ob.skey = skey; ob.text:SetText(label[k] or k); ob:Show()
+      ob.value = k; ob.target = target; ob.key = key; ob.text:SetText(label[k] or k); ob:Show()
     else
       ob:Hide()
     end
@@ -1342,7 +1370,6 @@ local function Rate(j, d)
   return math.floor(j / t * 100 + 0.5) .. "%"
 end
 
-local RefreshStats  -- forward decl
 
 local function BuildStatsPanel(parent)
   local fr = CreateFrame("Frame", "GuildRecruiterStats", parent)
@@ -1365,30 +1392,12 @@ local function BuildStatsPanel(parent)
   loadB:SetScript("OnClick", function() if LoadProfile(pedit:GetText()) then RefreshStats() end end)
   delB:SetScript("OnClick", function() DeleteProfile(pedit:GetText()); RefreshStats() end)
 
-  -- A/B: toggle simultaneous testing, and flag/unflag the named profile as a variant
-  fr.abToggle = CreateFrame("Button", nil, fr, "UIPanelButtonTemplate")
-  fr.abToggle:SetPoint("TOPLEFT", 18, -110); fr.abToggle:SetWidth(110); fr.abToggle:SetHeight(22)
-  fr.abToggle:SetScript("OnClick", function()
-    GuildRecruiter_Settings.abOn = not GuildRecruiter_Settings.abOn; RefreshStats()
-  end)
-  local abFlag = CreateFrame("Button", nil, fr, "UIPanelButtonTemplate")
-  abFlag:SetPoint("LEFT", fr.abToggle, "RIGHT", 6, 0); abFlag:SetWidth(166); abFlag:SetHeight(22); abFlag:SetText("Flag/unflag for A/B")
-  abFlag:SetScript("OnClick", function()
-    local nm = pedit:GetText()
-    if not nm or nm == "" or not GuildRecruiter_Settings.profiles[nm] then return end
-    local av = GuildRecruiter_Settings.abVariants
-    local found
-    for i = table.getn(av), 1, -1 do if av[i] == nm then tremove(av, i); found = true end end
-    if not found then tinsert(av, nm) end
-    RefreshStats()
-  end)
-
   fr.profileText = fr:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
-  fr.profileText:SetPoint("TOPLEFT", 18, -136); fr.profileText:SetWidth(524); fr.profileText:SetJustifyH("LEFT")
+  fr.profileText:SetPoint("TOPLEFT", 18, -114); fr.profileText:SetWidth(524); fr.profileText:SetJustifyH("LEFT")
 
-  Header(fr, "Statistics", 18, -174, 524)
+  Header(fr, "Statistics", 18, -152, 524)
   fr.text = fr:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
-  fr.text:SetPoint("TOPLEFT", 18, -194); fr.text:SetWidth(524); fr.text:SetJustifyH("LEFT")
+  fr.text:SetPoint("TOPLEFT", 18, -172); fr.text:SetWidth(524); fr.text:SetJustifyH("LEFT")
 
   local resetB = CreateFrame("Button", nil, fr, "UIPanelButtonTemplate")
   resetB:SetPoint("BOTTOMRIGHT", -16, 16); resetB:SetWidth(110); resetB:SetHeight(22); resetB:SetText("Reset stats")
@@ -1467,17 +1476,114 @@ RefreshStats = function()
   table.sort(pnames)
   statsFrame.profileText:SetText("Active profile: |cff33ff99"..(GuildRecruiter_Settings.activeProfile or "(unsaved)")
     .."|r\nSaved: "..(table.getn(pnames) > 0 and table.concat(pnames, ", ") or "(none)"))
-  if statsFrame.abToggle then statsFrame.abToggle:SetText("A/B: "..(GuildRecruiter_Settings.abOn and "ON" or "off")) end
 end
 
 -- ---------------------------------------------------------------------------
--- Main tabbed window (Settings / Lists / Stats) -- one frame, three panels
+-- A/B tab: first-class variants you edit in place
+-- ---------------------------------------------------------------------------
+local abFrame
+local AB_MAX = 4
+
+local function BuildABPanel(parent)
+  local fr = CreateFrame("Frame", "GuildRecruiterAB", parent)
+  fr:SetAllPoints(parent)
+
+  Header(fr, "A/B test", 18, -40, 524)
+  fr.toggle = CreateFrame("Button", nil, fr, "UIPanelButtonTemplate")
+  fr.toggle:SetPoint("TOPLEFT", 18, -62); fr.toggle:SetWidth(150); fr.toggle:SetHeight(22)
+  fr.toggle:SetScript("OnClick", function()
+    GuildRecruiter_Settings.abOn = not GuildRecruiter_Settings.abOn; RefreshABPanel()
+  end)
+  fr.addBtn = CreateFrame("Button", nil, fr, "UIPanelButtonTemplate")
+  fr.addBtn:SetPoint("LEFT", fr.toggle, "RIGHT", 8, 0); fr.addBtn:SetWidth(120); fr.addBtn:SetHeight(22); fr.addBtn:SetText("+ Add variant")
+  fr.addBtn:SetScript("OnClick", function()
+    local av = GuildRecruiter_Settings.abVariants
+    if table.getn(av) >= AB_MAX then return end
+    local s = GuildRecruiter_Settings
+    local used = {}
+    for i = 1, table.getn(av) do used[av[i].name] = true end
+    local letter                                   -- first free letter (so removing A then adding gives A, not a dupe)
+    for i = 1, AB_MAX do local c = string.sub("ABCD", i, i); if not used[c] then letter = c; break end end
+    tinsert(av, { name = letter, mode = s.mode, whisperMsg = s.whisperMsg, inviteMethod = s.inviteMethod, replyMode = s.replyMode })
+    RefreshABPanel()
+  end)
+  fr.hint = fr:CreateFontString(nil, "ARTWORK", "GameFontDisableSmall")
+  fr.hint:SetPoint("TOPLEFT", 18, -90); fr.hint:SetWidth(524); fr.hint:SetJustifyH("LEFT")
+
+  fr.rows = {}
+  for i = 1, AB_MAX do
+    local row = CreateFrame("Frame", nil, fr)
+    row:SetPoint("TOPLEFT", 16, -112 - (i - 1) * 76); row:SetPoint("RIGHT", fr, "RIGHT", -16, 0); row:SetHeight(70)
+    local nm = row:CreateFontString(nil, "ARTWORK", "GameFontNormal")
+    nm:SetPoint("TOPLEFT", 2, 0); row.nameFS = nm
+    local cv = row:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
+    cv:SetPoint("LEFT", nm, "RIGHT", 12, 0); row.convFS = cv
+    local rm = CreateFrame("Button", nil, row, "UIPanelButtonTemplate")
+    rm:SetPoint("TOPRIGHT", 0, 0); rm:SetWidth(72); rm:SetHeight(20); rm:SetText("Remove"); rm.idx = i
+    rm:SetScript("OnClick", function() tremove(GuildRecruiter_Settings.abVariants, this.idx); RefreshABPanel() end)
+    local md = CreateFrame("Button", nil, row, "UIPanelButtonTemplate")
+    md:SetPoint("TOPLEFT", 14, -22); md:SetWidth(172); md:SetHeight(20)
+    md:SetScript("OnClick", function() GuildRecruiter_OpenDD(this, "mode", this.variant) end)
+    row.modeBtn = md
+    local rp = CreateFrame("Button", nil, row, "UIPanelButtonTemplate")
+    rp:SetPoint("LEFT", md, "RIGHT", 8, 0); rp:SetWidth(172); rp:SetHeight(20)
+    rp:SetScript("OnClick", function() GuildRecruiter_OpenDD(this, "reply", this.variant) end)
+    row.replyBtn = rp
+    local msg = CreateFrame("EditBox", "GuildRecruiterABMsg"..i, row, "InputBoxTemplate")
+    msg:SetPoint("TOPLEFT", 16, -46); msg:SetWidth(496); msg:SetHeight(20)
+    msg:SetAutoFocus(false); msg:SetMaxLetters(255)
+    msg:SetScript("OnEnterPressed", function()
+      local txt = this:GetText(); this.variant.whisperMsg = (txt ~= "" and txt) or nil; this:ClearFocus()
+    end)
+    msg:SetScript("OnEscapePressed", function() this:ClearFocus() end)
+    row.msgEdit = msg
+    row:Hide()
+    fr.rows[i] = row
+  end
+
+  abFrame = fr
+  return fr
+end
+
+RefreshABPanel = function()
+  if not abFrame then return end
+  local s = GuildRecruiter_Settings
+  local av = s.abVariants
+  local n = table.getn(av)
+  abFrame.toggle:SetText("A/B: "..(s.abOn and "|cff40ff40Running|r" or "Off"))
+  if s.abOn and n < 2 then
+    abFrame.hint:SetText("A/B needs 2+ variants to split contacts -- add another, or it just uses your live settings.")
+  else
+    abFrame.hint:SetText("Each contact is randomly dealt a variant. Edit a field to make it differ; blank = your live setting. Press Enter in the message box to save it.")
+  end
+  if n >= AB_MAX then abFrame.addBtn:Disable() else abFrame.addBtn:Enable() end
+  for i = 1, AB_MAX do
+    local row = abFrame.rows[i]
+    if i <= n then
+      local v = av[i]
+      local vs = s.varStats and s.varStats[v.name]
+      local c = (vs and vs.contacted) or 0
+      local conv = (c > 0) and (math.floor(((vs.joined or 0) / c) * 100 + 0.5).."%") or "--"
+      row.nameFS:SetText("Variant "..(v.name or "?"))
+      row.convFS:SetText("conv "..conv.."   ("..((vs and vs.joined) or 0).." joined / "..c.." contacted)")
+      row.modeBtn.variant = v;  row.modeBtn:SetText(MODE_LABEL[v.mode or s.mode] or "?")
+      row.replyBtn.variant = v; row.replyBtn:SetText(REPLY_LABEL[v.replyMode or s.replyMode] or "?")
+      row.msgEdit.variant = v;  row.msgEdit:SetText(v.whisperMsg or "")
+      row:Show()
+    else
+      row:Hide()
+    end
+  end
+end
+
+-- ---------------------------------------------------------------------------
+-- Main tabbed window (Settings / Lists / Stats / A/B) -- one frame, four panels
 -- ---------------------------------------------------------------------------
 local UI
 local activeTab = "settings"
 local tabPanels = {}
 local tabButtons = {}
-local TAB_DEFS = { { "settings", "Settings" }, { "lists", "Lists" }, { "stats", "Stats" } }
+local TAB_DEFS = { { "settings", "Settings" }, { "lists", "Lists" }, { "stats", "Stats" }, { "ab", "A/B" } }
 
 local function ShowTab(name)
   activeTab = name
@@ -1488,7 +1594,8 @@ local function ShowTab(name)
   end
   if name == "settings" then RefreshConfig()
   elseif name == "lists" then UpdateList()
-  elseif name == "stats" then RefreshStats() end
+  elseif name == "stats" then RefreshStats()
+  elseif name == "ab" then RefreshABPanel() end
 end
 
 local function BuildUI()
@@ -1516,6 +1623,7 @@ local function BuildUI()
   tabPanels.settings = BuildSettingsPanel(m)
   tabPanels.lists    = BuildListsPanel(m)
   tabPanels.stats    = BuildStatsPanel(m)
+  tabPanels.ab       = BuildABPanel(m)
 
   -- tabs hang just below the frame
   local prev
@@ -1548,6 +1656,7 @@ end
 local function ToggleConfig() OpenTab("settings") end
 local function ToggleList()   OpenTab("lists") end
 function GuildRecruiter_ToggleStats() OpenTab("stats") end
+function GuildRecruiter_ToggleAB() OpenTab("ab") end
 
 -- ---------------------------------------------------------------------------
 -- Minimap button
@@ -1686,31 +1795,14 @@ SlashCmdList["GUILDRECRUITER"] = function(msg)
       Print("Usage: /gr replymode notno|yesonly|any  (current: "..(GuildRecruiter_Settings.replyMode or "notno")..")")
     end
   elseif cmd == "ab" then
-    local _, _, sub, pname = string.find(arg or "", "^(%a+)%s*(.*)$")
-    sub = sub and string.lower(sub) or ""
-    local av = GuildRecruiter_Settings.abVariants
+    local sub = string.lower(larg or "")
     if sub == "on" or sub == "off" then
-      GuildRecruiter_Settings.abOn = (sub == "on"); RefreshStats()
-      Print("Simultaneous A/B "..(GuildRecruiter_Settings.abOn and "ON" or "OFF").."  ("..table.getn(av).." variants).")
-    elseif sub == "add" and pname ~= "" then
-      if not GuildRecruiter_Settings.profiles[pname] then
-        Print("No saved profile '"..pname.."' -- /gr profile save "..pname.." first.")
-      else
-        local found
-        for i = 1, table.getn(av) do if av[i] == pname then found = true end end
-        if not found then tinsert(av, pname) end
-        RefreshStats(); Print("A/B variant added: "..pname.." ("..table.getn(av).." total).")
-      end
-    elseif sub == "remove" and pname ~= "" then
-      for i = table.getn(av), 1, -1 do if av[i] == pname then tremove(av, i) end end
-      RefreshStats(); Print("A/B variant removed: "..pname..".")
+      GuildRecruiter_Settings.abOn = (sub == "on"); GuildRecruiter_RefreshOpen()
+      Print("Simultaneous A/B "..(GuildRecruiter_Settings.abOn and "ON" or "OFF").."  ("..table.getn(GuildRecruiter_Settings.abVariants).." variants).")
     elseif sub == "clear" then
-      GuildRecruiter_Settings.abVariants = {}; RefreshStats(); Print("A/B variants cleared.")
+      GuildRecruiter_Settings.abVariants = {}; GuildRecruiter_RefreshOpen(); Print("A/B variants cleared.")
     else
-      local s = ""
-      for i = 1, table.getn(av) do s = s..av[i]..", " end
-      Print("A/B "..(GuildRecruiter_Settings.abOn and "ON" or "off")..". Variants: "..(s ~= "" and s or "(none)"))
-      Print("Usage: /gr ab on|off | ab add <profile> | ab remove <profile> | ab clear")
+      GuildRecruiter_ToggleAB()   -- open the A/B tab to set variants up
     end
   elseif cmd == "reset" then
     seen = {}; Print("Cleared this session's scan list (history kept).")
@@ -1780,7 +1872,7 @@ SlashCmdList["GUILDRECRUITER"] = function(msg)
     Print("|cff33ff99GuildRecruiter v"..VERSION.."|r  --  /gr config, /gr list, /gr stats")
     Print("start | stop | pause | resume | status | reset | forget | hide")
     Print("set invite/who/reinvite/cap/min/max/method/mode <v> | msg <text> | class <list|all>")
-    Print("profile save/load/delete/list <name> | replymode notno/yesonly/any | ab on/off/add/remove/clear")
+    Print("profile save/load/delete/list <name> | replymode notno/yesonly/any | ab (open tab) /on/off/clear")
     Print("noword/yesword add/remove/list <phrase>")
     Print("black add/remove/list <name> | jitter/sync/combat/instance/quiet [on|off]")
   end
