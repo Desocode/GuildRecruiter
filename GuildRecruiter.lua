@@ -19,7 +19,7 @@
 
 GuildRecruiter_Settings = GuildRecruiter_Settings or {}
 
-local VERSION    = "3.3.4"
+local VERSION    = "3.5"
 local CAP_HINT   = 49      -- treat a query returning >= this many as truncated
 local START_WIDTH = 10     -- initial level-band width to try
 local WHO_TIMEOUT = 12     -- give up waiting on a reply after this many seconds
@@ -179,6 +179,8 @@ local function Defaults()
   if not s.tally.totals then s.tally.totals = { invited=0, whispered=0, joined=0, declined=0 } end
   if not s.tally.days   then s.tally.days   = {} end
   if not s.varStats then s.varStats = {} end   -- [profile] = {contacted,joined,declined}
+  if s.abOn == nil  then s.abOn = false end     -- simultaneous A/B: deal each contact a variant
+  if not s.abVariants then s.abVariants = {} end -- profiles flagged as A/B variants
   if not s.minimapAngle then s.minimapAngle = 210 end
   -- prune history past the cooldown so the saved table can't grow forever
   if s.reinviteDays > 0 then
@@ -223,8 +225,8 @@ end
 -- exact "yes" missed "sure", "y", "ok", typos, etc., so we invert: any reply
 -- that doesn't contain a negative phrase counts (they bothered to whisper back).
 -- decide whether a whisper reply should trigger an invite, per the reply policy
-local function ShouldInvite(reply)
-  local mode = GuildRecruiter_Settings.replyMode or "notno"
+local function ShouldInvite(reply, variant)
+  local mode = GuildRecruiter_VariantCfg(variant).replyMode   -- per-variant reply policy
   if mode == "any" then return true end
   local norm = Normalize(reply)
   if mode == "yesonly" then
@@ -368,8 +370,8 @@ end
 
 -- GuildInviteByName is Turtle's canonical name-taking invite; auto prefers it
 -- because bare GuildInvite() invites your TARGET on some cores.
-local function DoGuildInvite(name)
-  local m = GuildRecruiter_Settings.inviteMethod or "auto"
+local function DoGuildInvite(name, method)
+  local m = method or GuildRecruiter_Settings.inviteMethod or "auto"
   if m == "byname" and type(GuildInviteByName) == "function" then
     GuildInviteByName(name)
   elseif m == "invite" and type(GuildInvite) == "function" then
@@ -385,8 +387,8 @@ local function DoGuildInvite(name)
   end
 end
 
-local function WhisperBody(name)
-  local msg = GuildRecruiter_Settings.whisperMsg or ""
+local function WhisperBody(name, msg)
+  msg = msg or GuildRecruiter_Settings.whisperMsg or ""
   local gname = GetGuildInfo("player") or "our guild"
   msg = string.gsub(msg, "%%p", name)
   msg = string.gsub(msg, "%%g", gname)
@@ -402,34 +404,55 @@ function GuildRecruiter_VarBump(profile, field)
   vs[profile][field] = (vs[profile][field] or 0) + 1
 end
 
-local function RecordHandled(name)
+-- A/B: which variant (profile) handles this contact. When A/B is on with 2+
+-- flagged profiles, each contact is randomly dealt one; otherwise the active one.
+function GuildRecruiter_PickVariant()
+  local s = GuildRecruiter_Settings
+  if s.abOn and s.abVariants and table.getn(s.abVariants) >= 2 then
+    return s.abVariants[random(1, table.getn(s.abVariants))]
+  end
+  return s.activeProfile
+end
+
+-- the per-contact settings of a variant (profile), falling back to live settings
+function GuildRecruiter_VariantCfg(variant)
+  local s = GuildRecruiter_Settings
+  local p = variant and s.profiles and s.profiles[variant]
+  local function pick(k) if p and p[k] ~= nil then return p[k] else return s[k] end end
+  return { mode = pick("mode") or "invite", whisperMsg = pick("whisperMsg"),
+           inviteMethod = pick("inviteMethod"), replyMode = pick("replyMode") or "notno" }
+end
+
+local function RecordHandled(name, variant)
   if not GuildRecruiter_Settings.history then GuildRecruiter_Settings.history = {} end
-  GuildRecruiter_Settings.history[name] = { t = time(), p = GuildRecruiter_Settings.activeProfile }
+  GuildRecruiter_Settings.history[name] = { t = time(), p = variant }
   Broadcast("INV "..name)
 end
 
--- perform the configured contact action for one name
+-- perform the configured contact action for one name (variant chosen per A/B)
 local function Contact(name)
-  local mode = GuildRecruiter_Settings.mode or "invite"
+  local variant = GuildRecruiter_PickVariant()
+  local cfg = GuildRecruiter_VariantCfg(variant)
+  local mode = cfg.mode
   if mode == "whisper" then
-    SendChatMessage(WhisperBody(name), "WHISPER", nil, name)
+    SendChatMessage(WhisperBody(name, cfg.whisperMsg), "WHISPER", nil, name)
     stats.whispered = stats.whispered + 1
     TallyBump("whispered")
-    RecordHandled(name)
+    RecordHandled(name, variant)
   elseif mode == "whisperinvite" then
-    SendChatMessage(WhisperBody(name), "WHISPER", nil, name)
+    SendChatMessage(WhisperBody(name, cfg.whisperMsg), "WHISPER", nil, name)
     stats.whispered = stats.whispered + 1
     TallyBump("whispered")
-    whispered[name] = GetTime()
-    RecordHandled(name)
+    whispered[name] = { t = GetTime(), v = variant }
+    RecordHandled(name, variant)
   else
-    DoGuildInvite(name)
+    DoGuildInvite(name, cfg.inviteMethod)
     stats.invited = stats.invited + 1
     TallyBump("invited")
-    RecordHandled(name)
+    RecordHandled(name, variant)
   end
   stats.contacted = stats.contacted + 1
-  GuildRecruiter_VarBump(GuildRecruiter_Settings.activeProfile, "contacted")
+  GuildRecruiter_VarBump(variant, "contacted")
 end
 
 -- ---------------------------------------------------------------------------
@@ -621,8 +644,9 @@ local function GR_OnEvent()
     end
   elseif event == "CHAT_MSG_WHISPER" then
     local sender = arg2
-    if sender and whispered[sender] then
-      if ShouldInvite(arg1) then
+    local w = sender and whispered[sender]
+    if w then
+      if ShouldInvite(arg1, w.v) then   -- judge with the variant that whispered them
         whispered[sender] = nil
         tinsert(replyQueue, sender)   -- reply passes the policy: invite (paced)
       end
@@ -651,8 +675,8 @@ end)
 -- Main loop
 -- ---------------------------------------------------------------------------
 local function HasOutstandingWhispers()
-  for _, t in whispered do
-    if GetTime() - t < WHISPER_WAIT then return true end
+  for _, w in whispered do
+    if GetTime() - (w.t or 0) < WHISPER_WAIT then return true end
   end
   return false
 end
@@ -681,8 +705,8 @@ local function GR_OnUpdate()
   if pruned then RecomputeBand() end
 
   -- forget whisper targets who never replied
-  for n, t in whispered do
-    if GetTime() - t > WHISPER_WAIT then whispered[n] = nil end
+  for n, w in whispered do
+    if GetTime() - (w.t or 0) > WHISPER_WAIT then whispered[n] = nil end
   end
 
   -- scanning
@@ -1110,22 +1134,23 @@ local function BuildSettingsPanel(parent)
 
   -- RIGHT column ----------------------------------------------------------
   Header(fr, "Invites", 292, -44, 250)
-  Label(fr, "Invite method:", 298, -78)
+  -- three uniform inline rows: label at 298, button aligned at 352, same width
+  Label(fr, "Method:", 298, -82)
   fr.methodBtn = CreateFrame("Button", "GuildRecruiterConfigMethodBtn", fr, "UIPanelButtonTemplate")
-  fr.methodBtn:SetPoint("TOPLEFT", 298, -94); fr.methodBtn:SetWidth(222); fr.methodBtn:SetHeight(22)
+  fr.methodBtn:SetPoint("TOPLEFT", 352, -78); fr.methodBtn:SetWidth(186); fr.methodBtn:SetHeight(22)
   fr.methodBtn:SetScript("OnClick", function() CycleMethod() end)
-  Label(fr, "Mode:", 298, -124)
+  Label(fr, "Mode:", 298, -108)
   fr.modeBtn = CreateFrame("Button", "GuildRecruiterConfigModeBtn", fr, "UIPanelButtonTemplate")
-  fr.modeBtn:SetPoint("TOPLEFT", 298, -140); fr.modeBtn:SetWidth(222); fr.modeBtn:SetHeight(22)
+  fr.modeBtn:SetPoint("TOPLEFT", 352, -104); fr.modeBtn:SetWidth(186); fr.modeBtn:SetHeight(22)
   fr.modeBtn:SetScript("OnClick", function() CycleMode() end)
-  Label(fr, "On reply:", 298, -166)
+  Label(fr, "Reply:", 298, -134)
   fr.replyBtn = CreateFrame("Button", "GuildRecruiterConfigReplyBtn", fr, "UIPanelButtonTemplate")
-  fr.replyBtn:SetPoint("TOPLEFT", 360, -162); fr.replyBtn:SetWidth(160); fr.replyBtn:SetHeight(22)
+  fr.replyBtn:SetPoint("TOPLEFT", 352, -130); fr.replyBtn:SetWidth(186); fr.replyBtn:SetHeight(22)
   fr.replyBtn:SetScript("OnClick", function() GuildRecruiter_CycleReplyMode() end)
-  fr.syncCheck   = MakeCheck(fr, "GuildRecruiterConfigSync",   "Guild sync (dedup + split)",   294, -190, "guildSync")
-  Label(fr, "Whisper (%p name, %g guild):", 298, -216)
+  fr.syncCheck   = MakeCheck(fr, "GuildRecruiterConfigSync",   "Guild sync (dedup + split)",   294, -160, "guildSync")
+  Label(fr, "Whisper (%p name, %g guild):", 298, -188)
   fr.whisperEdit = CreateFrame("EditBox", "GuildRecruiterConfigWhisper", fr, "InputBoxTemplate")
-  fr.whisperEdit:SetPoint("TOPLEFT", 298, -232); fr.whisperEdit:SetWidth(240); fr.whisperEdit:SetHeight(20)
+  fr.whisperEdit:SetPoint("TOPLEFT", 298, -204); fr.whisperEdit:SetWidth(240); fr.whisperEdit:SetHeight(20)
   fr.whisperEdit:SetAutoFocus(false); fr.whisperEdit:SetMaxLetters(255)
   fr.whisperEdit:SetScript("OnEnterPressed", function() GuildRecruiter_Settings.whisperMsg = this:GetText(); this:ClearFocus() end)
   fr.whisperEdit:SetScript("OnEscapePressed", function() this:ClearFocus() end)
@@ -1310,21 +1335,25 @@ RefreshStats = function()
   end
 
   -- per-profile conversion comparison (for A/B): conv = joined / contacted
+  local s = GuildRecruiter_Settings
   tinsert(lines, " ")
-  tinsert(lines, "|cffffd100By profile (A/B)|r")
-  local vs = GuildRecruiter_Settings.varStats or {}
+  tinsert(lines, "|cffffd100By profile|r   A/B test: "..(s.abOn and "|cff40ff40ON|r" or "off")
+               .."  ("..table.getn(s.abVariants or {}).." variants, * below)")
+  local vs = s.varStats or {}
   local vnames = {}
   for v in vs do tinsert(vnames, v) end
   table.sort(vnames)
   if table.getn(vnames) == 0 then
-    tinsert(lines, "no per-profile data yet -- load a profile, then recruit")
+    tinsert(lines, "no per-profile data yet -- load a profile (or /gr ab add), then recruit")
   else
     for i = 1, table.getn(vnames) do
       if i > 6 then tinsert(lines, "(+"..(table.getn(vnames) - 6).." more)"); break end
       local v = vnames[i]; local r = vs[v]
       local c = r.contacted or 0
       local conv = (c > 0) and (math.floor((r.joined or 0) / c * 100 + 0.5).."%") or "--"
-      tinsert(lines, v..":  contacted "..c..", joined "..(r.joined or 0)
+      local flag = ""
+      for j = 1, table.getn(s.abVariants or {}) do if s.abVariants[j] == v then flag = " |cff40ff40*|r" end end
+      tinsert(lines, v..flag..":  contacted "..c..", joined "..(r.joined or 0)
                    ..", declined "..(r.declined or 0).."  (conv "..conv..")")
     end
   end
@@ -1552,6 +1581,33 @@ SlashCmdList["GUILDRECRUITER"] = function(msg)
     else
       Print("Usage: /gr replymode notno|yesonly|any  (current: "..(GuildRecruiter_Settings.replyMode or "notno")..")")
     end
+  elseif cmd == "ab" then
+    local _, _, sub, pname = string.find(arg or "", "^(%a+)%s*(.*)$")
+    sub = sub and string.lower(sub) or ""
+    local av = GuildRecruiter_Settings.abVariants
+    if sub == "on" or sub == "off" then
+      GuildRecruiter_Settings.abOn = (sub == "on"); RefreshStats()
+      Print("Simultaneous A/B "..(GuildRecruiter_Settings.abOn and "ON" or "OFF").."  ("..table.getn(av).." variants).")
+    elseif sub == "add" and pname ~= "" then
+      if not GuildRecruiter_Settings.profiles[pname] then
+        Print("No saved profile '"..pname.."' -- /gr profile save "..pname.." first.")
+      else
+        local found
+        for i = 1, table.getn(av) do if av[i] == pname then found = true end end
+        if not found then tinsert(av, pname) end
+        RefreshStats(); Print("A/B variant added: "..pname.." ("..table.getn(av).." total).")
+      end
+    elseif sub == "remove" and pname ~= "" then
+      for i = table.getn(av), 1, -1 do if av[i] == pname then tremove(av, i) end end
+      RefreshStats(); Print("A/B variant removed: "..pname..".")
+    elseif sub == "clear" then
+      GuildRecruiter_Settings.abVariants = {}; RefreshStats(); Print("A/B variants cleared.")
+    else
+      local s = ""
+      for i = 1, table.getn(av) do s = s..av[i]..", " end
+      Print("A/B "..(GuildRecruiter_Settings.abOn and "ON" or "off")..". Variants: "..(s ~= "" and s or "(none)"))
+      Print("Usage: /gr ab on|off | ab add <profile> | ab remove <profile> | ab clear")
+    end
   elseif cmd == "reset" then
     seen = {}; Print("Cleared this session's scan list (history kept).")
   elseif cmd == "forget" then
@@ -1620,7 +1676,7 @@ SlashCmdList["GUILDRECRUITER"] = function(msg)
     Print("|cff33ff99GuildRecruiter v"..VERSION.."|r  --  /gr config, /gr list, /gr stats")
     Print("start | stop | pause | resume | status | reset | forget | hide")
     Print("set invite/who/reinvite/cap/min/max/method/mode <v> | msg <text> | class <list|all>")
-    Print("profile save/load/delete/list <name> | replymode notno/yesonly/any")
+    Print("profile save/load/delete/list <name> | replymode notno/yesonly/any | ab on/off/add/remove/clear")
     Print("noword/yesword add/remove/list <phrase>")
     Print("black add/remove/list <name> | jitter/sync/combat/instance/quiet [on|off]")
   end
