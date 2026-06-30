@@ -19,7 +19,7 @@
 
 GuildRecruiter_Settings = GuildRecruiter_Settings or {}
 
-local VERSION    = "3.3.1"
+local VERSION    = "3.3.2"
 local CAP_HINT   = 49      -- treat a query returning >= this many as truncated
 local START_WIDTH = 10     -- initial level-band width to try
 local WHO_TIMEOUT = 12     -- give up waiting on a reply after this many seconds
@@ -54,24 +54,16 @@ local MODE_SHORT   = { invite = "Invite only", whisper = "Whisper only", whisper
 local OLD_WHISPER = "Hi %p! We're recruiting for %g -- whisper me back if you're interested and I'll send an invite. :)"
 local NEW_WHISPER = "Hi %p! :) I'm recruiting for <%g>, a friendly and active guild that loves grouping up for quests, dungeons and raids. If you're after a guild, just whisper me back and I'll send an invite -- no pressure either way!"
 
--- default affirmative library (whisperinvite mode invites when a reply matches
--- one of these as a whole word/phrase). Saved to SavedVariables and editable.
-local AFFIRM_DEFAULTS = {
-  "yes", "yeah", "yep", "yup", "ya", "yea", "yess", "yas", "yes please", "yes pls",
-  "sure", "ok", "okay", "kk", "alright", "aight", "of course", "ofc",
-  "definitely", "absolutely", "sounds good", "sounds great", "why not",
-  "go ahead", "go for it", "please", "pls", "plz", "im in", "count me in",
-  "sign me up", "lets go", "do it", "send it", "send invite", "invite me",
-  "inv me", "add me", "invite", "inv", "for sure", "heck yes", "hell yes",
-  "id love to", "love to", "happy to", "lets do it",
-}
--- negatives veto an affirmative match (so "ok no thanks" is NOT treated as yes)
+-- a reply matching any of these is treated as a refusal (no invite). Everything
+-- else -- "sure", "y", "ok", "yea", typos, even a question -- counts as interest.
 local NEGATIVES = {
-  "no", "nope", "nah", "not interested", "no thanks", "no thank you",
-  "leave me", "stop", "go away", "not now", "maybe later", "busy",
-  "fuck off", "piss off", "reported", "report",
+  "no", "nope", "nah", "naw", "no thanks", "no thank you", "no thx", "nty",
+  "not interested", "not now", "maybe later", "pass", "im good", "no im good",
+  "leave me alone", "leave me", "stop", "go away", "not looking",
+  "already in", "already in a guild", "have a guild", "got a guild",
+  "busy", "fuck off", "piss off", "reported", "report",
 }
--- which settings a profile snapshots (history/blacklist/stats/affirmatives stay global)
+-- which settings a profile snapshots (history/blacklist/stats/negatives stay global)
 local PROFILE_KEYS = {
   "inviteDelay", "whoDelay", "reinviteDays", "mode", "whisperMsg", "minLevel",
   "maxLevel", "sessionCap", "jitter", "skipCombat", "skipInstance", "guildSync",
@@ -156,9 +148,9 @@ local function Defaults()
   if s.guildSync == nil    then s.guildSync    = true end
   if s.quietWho == nil     then s.quietWho     = true end  -- hide /who chat spam during a run
   if s.affirmOnly == nil   then s.affirmOnly   = true end  -- only auto-invite on an affirmative reply
-  if not s.affirmatives then
-    s.affirmatives = {}
-    for i = 1, table.getn(AFFIRM_DEFAULTS) do s.affirmatives[AFFIRM_DEFAULTS[i]] = true end
+  if not s.negatives then   -- editable "refusal" word list (whisper replies to skip)
+    s.negatives = {}
+    for i = 1, table.getn(NEGATIVES) do s.negatives[NEGATIVES[i]] = true end
   end
   if not s.profiles then s.profiles = {} end
   if not s.tally then s.tally = {} end
@@ -203,17 +195,15 @@ local function Normalize(s)
   return s
 end
 
--- true if the reply clearly says yes (and isn't vetoed by a negative)
+-- Treat a whisper reply as interest UNLESS it's a clear refusal. Requiring an
+-- exact "yes" missed "sure", "y", "ok", typos, etc., so we invert: any reply
+-- that doesn't contain a negative phrase counts (they bothered to whisper back).
 local function IsAffirmative(reply)
   local norm = Normalize(reply)
-  for i = 1, table.getn(NEGATIVES) do
-    if string.find(norm, " " .. NEGATIVES[i] .. " ", 1, true) then return false end
+  for phrase in (GuildRecruiter_Settings.negatives or {}) do
+    if string.find(norm, " " .. phrase .. " ", 1, true) then return false end
   end
-  local set = GuildRecruiter_Settings.affirmatives or {}
-  for phrase in set do
-    if string.find(norm, " " .. phrase .. " ", 1, true) then return true end
-  end
-  return false
+  return true
 end
 
 -- ---------------------------------------------------------------------------
@@ -786,8 +776,8 @@ end
 local listFrame, listMode = nil, "queue"
 local listData = {}
 local NUM_ROWS, ROW_HEIGHT = 13, 18
-local LIST_ORDER = { "queue", "blacklist", "history", "affirmatives" }
-local LIST_TITLE = { queue = "Queue (this run)", blacklist = "Blacklist", history = "Invite history", affirmatives = "Affirmative replies" }
+local LIST_ORDER = { "queue", "blacklist", "history", "negatives" }
+local LIST_TITLE = { queue = "Queue (this run)", blacklist = "Blacklist", history = "Invite history", negatives = "Refusal words (replies to skip)" }
 
 local function BuildListData()
   listData = {}
@@ -796,8 +786,8 @@ local function BuildListData()
   elseif listMode == "blacklist" then
     for n in GuildRecruiter_Settings.blacklist do tinsert(listData, n) end
     table.sort(listData)
-  elseif listMode == "affirmatives" then
-    for n in GuildRecruiter_Settings.affirmatives do tinsert(listData, n) end
+  elseif listMode == "negatives" then
+    for n in GuildRecruiter_Settings.negatives do tinsert(listData, n) end
     table.sort(listData)
   else
     for n in GuildRecruiter_Settings.history do tinsert(listData, n) end
@@ -812,8 +802,8 @@ local function RemoveListItem(name)
     end
   elseif listMode == "blacklist" then
     GuildRecruiter_Settings.blacklist[name] = nil
-  elseif listMode == "affirmatives" then
-    GuildRecruiter_Settings.affirmatives[name] = nil
+  elseif listMode == "negatives" then
+    GuildRecruiter_Settings.negatives[name] = nil
   else
     GuildRecruiter_Settings.history[name] = nil
   end
@@ -866,8 +856,8 @@ local function BuildListsPanel(parent)
   local function doAdd()
     local n = addEdit:GetText()
     if n and n ~= "" then
-      if listMode == "affirmatives" then
-        GuildRecruiter_Settings.affirmatives[string.lower(n)] = true
+      if listMode == "negatives" then
+        GuildRecruiter_Settings.negatives[string.lower(n)] = true
       else
         GuildRecruiter_Settings.blacklist[string.lower(n)] = true
         listMode = "blacklist"
@@ -1057,7 +1047,7 @@ local function BuildSettingsPanel(parent)
   fr.modeBtn = CreateFrame("Button", "GuildRecruiterConfigModeBtn", fr, "UIPanelButtonTemplate")
   fr.modeBtn:SetPoint("TOPLEFT", 298, -140); fr.modeBtn:SetWidth(222); fr.modeBtn:SetHeight(22)
   fr.modeBtn:SetScript("OnClick", function() CycleMode() end)
-  fr.affirmCheck = MakeCheck(fr, "GuildRecruiterConfigAffirm", "Invite only on a 'yes' reply", 294, -166, "affirmOnly")
+  fr.affirmCheck = MakeCheck(fr, "GuildRecruiterConfigAffirm", "Invite on reply unless they say no", 294, -166, "affirmOnly")
   fr.syncCheck   = MakeCheck(fr, "GuildRecruiterConfigSync",   "Guild sync (dedup + split)",   294, -190, "guildSync")
   Label(fr, "Whisper (%p name, %g guild):", 298, -216)
   fr.whisperEdit = CreateFrame("EditBox", "GuildRecruiterConfigWhisper", fr, "InputBoxTemplate")
@@ -1434,18 +1424,18 @@ SlashCmdList["GUILDRECRUITER"] = function(msg)
     else
       Print("Usage: /gr profile save|load|delete <name> | profile list")
     end
-  elseif cmd == "affirm" then
+  elseif cmd == "noword" then
     local _, _, sub, phrase = string.find(larg, "^(%a+)%s*(.*)$")
     if sub == "add" and phrase ~= "" then
-      GuildRecruiter_Settings.affirmatives[phrase] = true; Print("Added affirmative '"..phrase.."'.")
+      GuildRecruiter_Settings.negatives[phrase] = true; Print("Added refusal word '"..phrase.."' (replies with it are skipped).")
     elseif sub == "remove" and phrase ~= "" then
-      GuildRecruiter_Settings.affirmatives[phrase] = nil; Print("Removed affirmative '"..phrase.."'.")
+      GuildRecruiter_Settings.negatives[phrase] = nil; Print("Removed refusal word '"..phrase.."'.")
     elseif sub == "list" then
       local a = ""
-      for p in GuildRecruiter_Settings.affirmatives do a = a..p..", " end
-      Print("Affirmatives: "..a)
+      for p in GuildRecruiter_Settings.negatives do a = a..p..", " end
+      Print("Refusal words: "..a)
     else
-      Print("Usage: /gr affirm add|remove <phrase> | affirm list")
+      Print("Usage: /gr noword add|remove <phrase> | noword list")
     end
   elseif cmd == "reset" then
     seen = {}; Print("Cleared this session's scan list (history kept).")
@@ -1515,7 +1505,7 @@ SlashCmdList["GUILDRECRUITER"] = function(msg)
     Print("|cff33ff99GuildRecruiter v"..VERSION.."|r  --  /gr config, /gr list, /gr stats")
     Print("start | stop | pause | resume | status | reset | forget | hide")
     Print("set invite/who/reinvite/cap/min/max/method/mode <v> | msg <text> | class <list|all>")
-    Print("profile save/load/delete/list <name> | affirm add/remove/list <phrase>")
+    Print("profile save/load/delete/list <name> | noword add/remove/list <phrase>")
     Print("black add/remove/list <name> | jitter/sync/combat/instance/quiet/affirmonly [on|off]")
   end
 end
