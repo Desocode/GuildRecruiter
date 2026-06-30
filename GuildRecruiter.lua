@@ -19,7 +19,7 @@
 
 GuildRecruiter_Settings = GuildRecruiter_Settings or {}
 
-local VERSION    = "3.5"
+local VERSION    = "3.6"
 local CAP_HINT   = 49      -- treat a query returning >= this many as truncated
 local START_WIDTH = 10     -- initial level-band width to try
 local WHO_TIMEOUT = 12     -- give up waiting on a reply after this many seconds
@@ -1083,8 +1083,8 @@ RefreshConfig = function()
   configFrame.whoSlider:SetValue(clamp(s.whoDelay, WHO_MIN, WHO_MAX))
   configFrame.inviteEdit:SetText(tostring(s.inviteDelay))
   configFrame.whoEdit:SetText(tostring(s.whoDelay))
-  configFrame.methodBtn:SetText(METHOD_SHORT[s.inviteMethod] or s.inviteMethod)
-  configFrame.modeBtn:SetText(MODE_SHORT[s.mode] or s.mode)
+  configFrame.methodBtn:SetText(METHOD_LABEL[s.inviteMethod] or s.inviteMethod)
+  configFrame.modeBtn:SetText(MODE_LABEL[s.mode] or s.mode)
   configFrame.whisperEdit:SetText(s.whisperMsg or "")
   configFrame.minEdit:SetText(tostring(s.minLevel))
   configFrame.maxEdit:SetText(tostring(s.maxLevel))
@@ -1095,6 +1095,23 @@ RefreshConfig = function()
   configFrame.instanceCheck:SetChecked(s.skipInstance)
   configFrame.quietCheck:SetChecked(s.quietWho)
   configFrame.replyBtn:SetText(REPLY_LABEL[s.replyMode] or s.replyMode)
+
+  -- enable controls only where they make sense in the current combination:
+  --   A/B on  -> per-contact settings come from the variant profiles, so the
+  --              live mode/method/reply/whisper are overridden (greyed out)
+  --   method  -> only matters when we actually invite (not whisper-only mode)
+  --   reply   -> only matters in whisper-then-invite mode
+  --   whisper -> only matters when a whisper is sent (whisper or whisperinvite)
+  local ab, mode = s.abOn, s.mode
+  local function setBtn(b, on) if on then b:Enable() else b:Disable() end end
+  setBtn(configFrame.modeBtn,   not ab)
+  setBtn(configFrame.methodBtn, not ab and mode ~= "whisper")
+  setBtn(configFrame.replyBtn,  not ab and mode == "whisperinvite")
+  local wOn = not ab and (mode == "whisper" or mode == "whisperinvite")
+  if wOn then configFrame.whisperEdit:EnableMouse(true); configFrame.whisperEdit:SetTextColor(1, 1, 1)
+  else configFrame.whisperEdit:EnableMouse(false); configFrame.whisperEdit:SetTextColor(0.5, 0.5, 0.5) end
+  configFrame.abNote:SetText(ab and "|cff40ff40A/B on -- mode/method/reply/message come from the variant profiles|r" or "")
+
   configFrame.updating = false
 end
 
@@ -1117,6 +1134,70 @@ function GuildRecruiter_CycleReplyMode()
   RefreshConfig()
 end
 
+-- ---------------------------------------------------------------------------
+-- Custom dropdowns (plain frames -- avoids UIDropDownMenu's finicky 1.12 API).
+-- The open handler is GLOBAL so the settings dropdown buttons add no upvalue.
+-- ---------------------------------------------------------------------------
+local DD_DEF = {
+  method = { METHOD_ORDER, METHOD_LABEL, "inviteMethod" },
+  mode   = { MODE_ORDER,   MODE_LABEL,   "mode" },
+  reply  = { REPLY_ORDER,  REPLY_LABEL,  "replyMode" },
+}
+local ddPopup   -- shared option list, built lazily
+
+local function BuildDDPopup()
+  local p = CreateFrame("Frame", "GuildRecruiterDDPopup", UIParent)
+  p:SetFrameStrata("FULLSCREEN_DIALOG")
+  p:SetBackdrop({
+    bgFile = "Interface\\DialogFrame\\UI-DialogBox-Background",
+    edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
+    tile = true, tileSize = 16, edgeSize = 14,
+    insets = { left = 4, right = 4, top = 4, bottom = 4 },
+  })
+  p:EnableMouse(true); p:Hide()
+  p.opts = {}
+  for i = 1, 6 do
+    local ob = CreateFrame("Button", nil, p)
+    ob:SetHeight(16)
+    ob:SetPoint("TOPLEFT", 6, -4 - (i - 1) * 16)
+    ob:SetPoint("RIGHT", p, "RIGHT", -6, 0)
+    local ht = ob:CreateTexture(nil, "HIGHLIGHT")
+    ht:SetAllPoints(ob); ht:SetTexture("Interface\\QuestFrame\\UI-QuestTitleHighlight")
+    ht:SetBlendMode("ADD"); ht:SetAlpha(0.5)
+    local t = ob:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
+    t:SetPoint("LEFT", 4, 0); t:SetPoint("RIGHT", -4, 0); t:SetJustifyH("LEFT"); ob.text = t
+    ob:SetScript("OnClick", function()
+      GuildRecruiter_Settings[this.skey] = this.value
+      p:Hide(); RefreshConfig()
+    end)
+    p.opts[i] = ob
+  end
+  ddPopup = p
+end
+
+function GuildRecruiter_OpenDD(btn, kind)
+  if not ddPopup then BuildDDPopup() end
+  if ddPopup:IsShown() and ddPopup.kind == kind then ddPopup:Hide(); return end
+  local def = DD_DEF[kind]
+  local order, label, skey = def[1], def[2], def[3]
+  ddPopup.kind = kind
+  local n = table.getn(order)
+  for i = 1, 6 do
+    local ob = ddPopup.opts[i]
+    if i <= n then
+      local k = order[i]
+      ob.value = k; ob.skey = skey; ob.text:SetText(label[k] or k); ob:Show()
+    else
+      ob:Hide()
+    end
+  end
+  ddPopup:SetWidth(btn:GetWidth())
+  ddPopup:SetHeight(n * 16 + 8)
+  ddPopup:ClearAllPoints()
+  ddPopup:SetPoint("TOPLEFT", btn, "BOTTOMLEFT", 0, -2)
+  ddPopup:Show()
+end
+
 local function BuildSettingsPanel(parent)
   local fr = CreateFrame("Frame", "GuildRecruiterConfig", parent)
   fr:SetAllPoints(parent)
@@ -1134,19 +1215,19 @@ local function BuildSettingsPanel(parent)
 
   -- RIGHT column ----------------------------------------------------------
   Header(fr, "Invites", 292, -44, 250)
-  -- three uniform inline rows: label at 298, button aligned at 352, same width
+  -- three uniform inline dropdown rows: label at 298, dropdown aligned at 352
   Label(fr, "Method:", 298, -82)
   fr.methodBtn = CreateFrame("Button", "GuildRecruiterConfigMethodBtn", fr, "UIPanelButtonTemplate")
   fr.methodBtn:SetPoint("TOPLEFT", 352, -78); fr.methodBtn:SetWidth(186); fr.methodBtn:SetHeight(22)
-  fr.methodBtn:SetScript("OnClick", function() CycleMethod() end)
+  fr.methodBtn:SetScript("OnClick", function() GuildRecruiter_OpenDD(this, "method") end)
   Label(fr, "Mode:", 298, -108)
   fr.modeBtn = CreateFrame("Button", "GuildRecruiterConfigModeBtn", fr, "UIPanelButtonTemplate")
   fr.modeBtn:SetPoint("TOPLEFT", 352, -104); fr.modeBtn:SetWidth(186); fr.modeBtn:SetHeight(22)
-  fr.modeBtn:SetScript("OnClick", function() CycleMode() end)
+  fr.modeBtn:SetScript("OnClick", function() GuildRecruiter_OpenDD(this, "mode") end)
   Label(fr, "Reply:", 298, -134)
   fr.replyBtn = CreateFrame("Button", "GuildRecruiterConfigReplyBtn", fr, "UIPanelButtonTemplate")
   fr.replyBtn:SetPoint("TOPLEFT", 352, -130); fr.replyBtn:SetWidth(186); fr.replyBtn:SetHeight(22)
-  fr.replyBtn:SetScript("OnClick", function() GuildRecruiter_CycleReplyMode() end)
+  fr.replyBtn:SetScript("OnClick", function() GuildRecruiter_OpenDD(this, "reply") end)
   fr.syncCheck   = MakeCheck(fr, "GuildRecruiterConfigSync",   "Guild sync (dedup + split)",   294, -160, "guildSync")
   Label(fr, "Whisper (%p name, %g guild):", 298, -188)
   fr.whisperEdit = CreateFrame("EditBox", "GuildRecruiterConfigWhisper", fr, "InputBoxTemplate")
@@ -1154,6 +1235,8 @@ local function BuildSettingsPanel(parent)
   fr.whisperEdit:SetAutoFocus(false); fr.whisperEdit:SetMaxLetters(255)
   fr.whisperEdit:SetScript("OnEnterPressed", function() GuildRecruiter_Settings.whisperMsg = this:GetText(); this:ClearFocus() end)
   fr.whisperEdit:SetScript("OnEscapePressed", function() this:ClearFocus() end)
+  fr.abNote = fr:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
+  fr.abNote:SetPoint("TOPLEFT", 298, -226); fr.abNote:SetWidth(240); fr.abNote:SetJustifyH("LEFT")
 
   Header(fr, "Targets", 292, -284, 250)
   Label(fr, "Levels", 298, -314)
@@ -1282,12 +1365,30 @@ local function BuildStatsPanel(parent)
   loadB:SetScript("OnClick", function() if LoadProfile(pedit:GetText()) then RefreshStats() end end)
   delB:SetScript("OnClick", function() DeleteProfile(pedit:GetText()); RefreshStats() end)
 
-  fr.profileText = fr:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
-  fr.profileText:SetPoint("TOPLEFT", 18, -116); fr.profileText:SetWidth(524); fr.profileText:SetJustifyH("LEFT")
+  -- A/B: toggle simultaneous testing, and flag/unflag the named profile as a variant
+  fr.abToggle = CreateFrame("Button", nil, fr, "UIPanelButtonTemplate")
+  fr.abToggle:SetPoint("TOPLEFT", 18, -110); fr.abToggle:SetWidth(110); fr.abToggle:SetHeight(22)
+  fr.abToggle:SetScript("OnClick", function()
+    GuildRecruiter_Settings.abOn = not GuildRecruiter_Settings.abOn; RefreshStats()
+  end)
+  local abFlag = CreateFrame("Button", nil, fr, "UIPanelButtonTemplate")
+  abFlag:SetPoint("LEFT", fr.abToggle, "RIGHT", 6, 0); abFlag:SetWidth(166); abFlag:SetHeight(22); abFlag:SetText("Flag/unflag for A/B")
+  abFlag:SetScript("OnClick", function()
+    local nm = pedit:GetText()
+    if not nm or nm == "" or not GuildRecruiter_Settings.profiles[nm] then return end
+    local av = GuildRecruiter_Settings.abVariants
+    local found
+    for i = table.getn(av), 1, -1 do if av[i] == nm then tremove(av, i); found = true end end
+    if not found then tinsert(av, nm) end
+    RefreshStats()
+  end)
 
-  Header(fr, "Statistics", 18, -160, 524)
+  fr.profileText = fr:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
+  fr.profileText:SetPoint("TOPLEFT", 18, -138); fr.profileText:SetWidth(524); fr.profileText:SetJustifyH("LEFT")
+
+  Header(fr, "Statistics", 18, -184, 524)
   fr.text = fr:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
-  fr.text:SetPoint("TOPLEFT", 18, -182); fr.text:SetWidth(524); fr.text:SetJustifyH("LEFT")
+  fr.text:SetPoint("TOPLEFT", 18, -206); fr.text:SetWidth(524); fr.text:SetJustifyH("LEFT")
 
   local resetB = CreateFrame("Button", nil, fr, "UIPanelButtonTemplate")
   resetB:SetPoint("BOTTOMRIGHT", -16, 16); resetB:SetWidth(110); resetB:SetHeight(22); resetB:SetText("Reset stats")
@@ -1366,6 +1467,7 @@ RefreshStats = function()
   table.sort(pnames)
   statsFrame.profileText:SetText("Active profile: |cff33ff99"..(GuildRecruiter_Settings.activeProfile or "(unsaved)")
     .."|r\nSaved: "..(table.getn(pnames) > 0 and table.concat(pnames, ", ") or "(none)"))
+  if statsFrame.abToggle then statsFrame.abToggle:SetText("A/B: "..(GuildRecruiter_Settings.abOn and "ON" or "off")) end
 end
 
 -- ---------------------------------------------------------------------------
