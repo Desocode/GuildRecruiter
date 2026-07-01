@@ -19,10 +19,11 @@
 
 GuildRecruiter_Settings = GuildRecruiter_Settings or {}
 
-local VERSION    = "3.19"
+local VERSION    = "3.20"
 local CAP_HINT   = 49      -- treat a query returning >= this many as truncated
 local START_WIDTH = 10     -- initial level-band width to try
-local WHO_TIMEOUT = 12     -- give up waiting on a reply after this many seconds
+local WHO_TIMEOUT = 15     -- give up waiting on a /who reply after this many seconds (then retry)
+local WHO_RETRIES = 3      -- re-send a band this many times on timeout before skipping past it
 local SYNC_PREFIX = "GuildRec"
 local PRESENCE_INTERVAL = 20  -- re-announce "I'm recruiting" this often (s)
 local PRESENCE_TTL      = 60  -- forget a recruiter not heard from in this long
@@ -126,6 +127,7 @@ local backoffUntil = 0
 local presenceTimer = 0
 
 local whoTimer, inviteTimer, whoTimeout = 0, 0, 0
+local whoRetries = 0       -- consecutive timeouts on the current band before we give up on it
 local stats = { contacted=0, invited=0, whispered=0, guilded=0, scanned=0, queries=0, dropped=0, cooldown=0, collected=0 }
 
 local function Print(msg)
@@ -657,21 +659,40 @@ local function ProcessWho()
   if num > observedCap then observedCap = num end
   local ceiling = (observedCap < CAP_HINT) and observedCap or CAP_HINT
   local capped = (num >= ceiling and num >= 5)
-  if GuildRecruiter_Settings.debug then
-    Print("who "..(current and (current.lo..(current.hi and current.hi~=current.lo and ("-"..current.hi) or "") ) or "?")
-      .."  results="..num.." cap~="..ceiling.." capped="..(capped and "Y" or "n"))
-  end
   local c = current
+  local band = c and (c.lo..(c.hi and c.hi ~= c.lo and ("-"..c.hi) or "")..(c.class and (" c-"..c.class) or "")) or "?"
+
+  -- CRITICAL: only the reply we're actively awaiting may move the sweep cursor.
+  -- A reply that lands after we already timed out (or any stray WHO_LIST_UPDATE)
+  -- still harvests players above -- that's safe, seen[] dedups -- but must NOT
+  -- touch lo/width. Otherwise a late "1-10 capped" reply rewrites the cursor
+  -- after the timeout already advanced it, and the sweep jumps forward in coarse
+  -- bands (1-10 -> 11-15 -> ...) instead of subdividing, so anyone past the /who
+  -- cap in a dense low-level band is never found.
+  if not awaiting then
+    if GuildRecruiter_Settings.debug then Print("who "..band.." results="..num.." (late/stray reply -- harvested only, cursor unchanged)") end
+    return
+  end
+
+  if GuildRecruiter_Settings.debug then
+    Print("who "..band.."  results="..num.." cap~="..ceiling.." capped="..(capped and "Y" or "n"))
+  end
+
   if c and c.sweep then
     if capped then
       if c.lo < c.hi then
+        -- re-scan THIS band from its start at half width. Absolute positioning:
+        -- we do NOT trust `lo`, which the timeout path may have advanced.
+        lo = c.lo
         width = math.floor((c.hi - c.lo + 1) / 2)
         if width < 1 then width = 1 end
+        if GuildRecruiter_Settings.debug then Print("  -> capped: subdividing to "..lo.."-"..(lo + width - 1)) end
       else
         for i = 1, table.getn(classes) do
           tinsert(pending, { lo = c.lo, hi = c.lo, class = classes[i] })
         end
         lo = c.lo + 1; width = 1
+        if GuildRecruiter_Settings.debug then Print("  -> lvl "..c.lo.." capped: splitting by class ("..table.getn(classes).." queries)") end
       end
     else
       lo = c.hi + 1
@@ -683,9 +704,11 @@ local function ProcessWho()
   elseif c and capped then
     -- a single class at a single level is still capped -- take what we got
     stats.dropped = stats.dropped + 1
+    if GuildRecruiter_Settings.debug then Print("  -> lvl "..c.lo.." c-"..(c.class or "?").." still capped; some dropped") end
   end
 
   awaiting = false
+  whoRetries = 0
   whoTimer = GuildRecruiter_Settings.whoDelay
 end
 
@@ -700,7 +723,7 @@ function GuildRecruiter_RestartScanCycle()
   current = nil
   pending = {}
   RecomputeBand()
-  lo, width = myLo, START_WIDTH
+  lo, width, whoRetries = myLo, START_WIDTH, 0
   whoTimer = 0
   stats.cycles = (stats.cycles or 0) + 1
   if GuildRecruiter_Settings.debug then Print("Auto-rescan: starting cycle "..stats.cycles.." on levels "..myLo.."-"..myHi..".") end
@@ -930,7 +953,17 @@ local function GR_OnUpdate()
       whoTimeout = whoTimeout - e
       if whoTimeout <= 0 then
         awaiting = false
-        if current and current.sweep then lo = current.hi + 1 end
+        if current and current.sweep and whoRetries < WHO_RETRIES then
+          -- slow / no reply: retry the SAME band. lo/width are left untouched so
+          -- NextQuery rebuilds and re-sends it -- important on throttled servers
+          -- where a dense band's reply can lag past the timeout.
+          whoRetries = whoRetries + 1
+          if GuildRecruiter_Settings.debug then Print("who "..current.lo..(current.hi ~= current.lo and ("-"..current.hi) or "").." no reply in "..WHO_TIMEOUT.."s -- retry "..whoRetries.."/"..WHO_RETRIES) end
+        else
+          whoRetries = 0
+          if current and current.sweep then lo = current.hi + 1 end   -- give up; skip past it
+          if GuildRecruiter_Settings.debug then Print("who timed out -- skipping ahead") end
+        end
         whoTimer = GuildRecruiter_Settings.whoDelay
       end
     elseif GetTime() >= backoffUntil then
@@ -1003,7 +1036,7 @@ local function Start()
   whoTimer, inviteTimer, whoTimeout, presenceTimer = 0, 0, 0, 0
   stats = { contacted=0, invited=0, whispered=0, guilded=0, scanned=0, queries=0, dropped=0, cooldown=0, collected=0 }
   RecomputeBand()
-  lo, width, observedCap = myLo, START_WIDTH, 0
+  lo, width, observedCap, whoRetries = myLo, START_WIDTH, 0, 0
   if GuildRecruiter_Settings.guildSync and IsInGuild() then Broadcast("HI") end
   Print("Started ("..(MODE_LABEL[GuildRecruiter_Settings.mode] or "?")..") on levels "..myLo.."-"..myHi..". /gr stop to cancel.")
 end
@@ -1494,20 +1527,39 @@ function GuildRecruiter_SetAutoScanDelay(v)
   if configFrame then RefreshConfig() end
 end
 
+-- One-line description of the /who query in flight + how far through the sweep
+-- we are, e.g. "7-10 c-Warrior  (query 12, +3 queued)". GLOBAL so both the
+-- status line and the progress bar can show it without adding upvalues to the
+-- near-limit BuildSettingsPanel.
+function GuildRecruiter_ScanNow()
+  if not current then return "(preparing)" end
+  local b = current.lo..(current.hi and current.hi ~= current.lo and ("-"..current.hi) or "")
+  if current.class then b = b.." c-"..current.class end
+  local pend = table.getn(pending)
+  return b.."  (query "..stats.queries..(pend > 0 and (", +"..pend.." queued") or "")..")"
+end
+
 local function StatusLine()
   if not running then return "Idle." end
-  if paused then return "Paused at lvl "..lo.." | queued "..table.getn(contactQueue) end
+  -- sweep position: where the band cursor sits (@lvl) and the current band width
+  local pos = "band "..myLo.."-"..myHi.." @"..lo.." w"..width
+  if paused then return "Paused -- /who "..GuildRecruiter_ScanNow().." | "..pos.." | queued "..table.getn(contactQueue) end
   if (GuildRecruiter_rescanWait or 0) > 0 then
-    return "rescanning in "..math.ceil(GuildRecruiter_rescanWait).."s | band "..myLo.."-"..myHi
+    return "rescanning in "..math.ceil(GuildRecruiter_rescanWait).."s | "..pos
          .." | queued "..table.getn(contactQueue).." | sent "..stats.contacted
   end
   if scanning and GuildRecruiter_Settings.collectOnly then
-    return "collecting lvl "..lo.." | band "..myLo.."-"..myHi.." | found "..stats.collected
-         .." | list "..CountTable(GuildRecruiter_Settings.candidates)
+    return "collecting  /who "..GuildRecruiter_ScanNow().."  "..pos
+         .."  collected "..stats.collected.." (list "..CountTable(GuildRecruiter_Settings.candidates)..")"
   end
-  local where = scanning and ("scanning lvl "..lo) or "draining"
-  return where.." | band "..myLo.."-"..myHi.." | queued "..table.getn(contactQueue)
-       .." | sent "..stats.contacted.." | peers "..(CountTable(recruiters))
+  if scanning then
+    return "scan  /who "..GuildRecruiter_ScanNow().."  "..pos
+         .."  queued "..table.getn(contactQueue).." sent "..stats.contacted
+         ..(stats.dropped > 0 and (" drop "..stats.dropped) or "")
+         ..(CountTable(recruiters) > 0 and (" peers "..CountTable(recruiters)) or "")
+  end
+  return "draining  queued "..table.getn(contactQueue).." | sent "..stats.contacted
+       .." ("..stats.invited.." inv, "..stats.whispered.." wh) | peers "..CountTable(recruiters)
 end
 
 -- GLOBAL on purpose: the settings-tab reply-mode button calls this, so its
@@ -1818,8 +1870,8 @@ local function BuildSettingsPanel(parent)
     -- label the bar so a full bar during the (long) drain phase isn't read as "done"
     if not running then fr.barText:SetText("")
     elseif (GuildRecruiter_rescanWait or 0) > 0 then fr.barText:SetText("Rescanning in "..math.ceil(GuildRecruiter_rescanWait).."s")
-    elseif scanning and GuildRecruiter_Settings.collectOnly then fr.barText:SetText("Collecting  "..math.floor(prog * 100 + 0.5).."%  ("..CountTable(GuildRecruiter_Settings.candidates).." on list)")
-    elseif scanning then fr.barText:SetText("Scanning  "..math.floor(prog * 100 + 0.5).."%")
+    elseif scanning and GuildRecruiter_Settings.collectOnly then fr.barText:SetText("Collecting "..math.floor(prog * 100 + 0.5).."%   /who "..GuildRecruiter_ScanNow())
+    elseif scanning then fr.barText:SetText("Scanning "..math.floor(prog * 100 + 0.5).."%   /who "..GuildRecruiter_ScanNow())
     else fr.barText:SetText("Sending queued contacts ("..table.getn(contactQueue).." left)") end
   end)
 
