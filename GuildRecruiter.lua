@@ -19,7 +19,7 @@
 
 GuildRecruiter_Settings = GuildRecruiter_Settings or {}
 
-local VERSION    = "3.16"
+local VERSION    = "3.19"
 local CAP_HINT   = 49      -- treat a query returning >= this many as truncated
 local START_WIDTH = 10     -- initial level-band width to try
 local WHO_TIMEOUT = 12     -- give up waiting on a reply after this many seconds
@@ -32,6 +32,7 @@ local BACKOFF_SECS      = 12  -- pause sends this long when the server throttles
 -- config-GUI slider ranges and option tables
 local INVITE_MIN, INVITE_MAX = 1, 10
 local WHO_MIN,    WHO_MAX    = 1, 15
+local AUTO_MIN,   AUTO_MAX   = 5, 900   -- seconds to rest between auto-rescan cycles
 local METHOD_ORDER = { "auto", "byname", "invite", "chat" }
 local METHOD_LABEL = {
   auto   = "Auto (recommended)",
@@ -108,6 +109,8 @@ local f = CreateFrame("Frame", "GuildRecruiterFrame")
 local running, scanning, awaiting, paused = false, false, false, false
 local lo        = 1        -- next uncovered level in the sweep
 local width     = START_WIDTH
+local observedCap = 0      -- largest /who result count seen this run; the server's
+                           -- real cap is learned, not assumed (see ProcessWho)
 local myLo, myHi = 1, 60   -- my assigned slice of the level range (after split)
 local pending   = {}       -- targeted class sub-queries for dense levels
 local current   = nil      -- slice currently being queried
@@ -198,6 +201,9 @@ local function Defaults()
   if s.abOn == nil  then s.abOn = false end     -- simultaneous A/B: deal each contact a variant
   if not s.abWeightA then s.abWeightA = 1 end   -- frequency weight of the control (variant A)
   if s.collectOnly == nil then s.collectOnly = false end  -- scan into a list instead of contacting
+  if s.autoScan == nil then s.autoScan = false end         -- loop: after a scan sweep finishes, rest then sweep again
+  if not s.autoScanDelay then s.autoScanDelay = 60 end     -- seconds to rest between auto-rescan cycles
+  if s.debug == nil then s.debug = false end               -- print per-/who diagnostics during a scan
   if not s.candidates then s.candidates = {} end          -- [name] = {t, level, class}; persists across logout
   -- abVariants are the CHALLENGERS only (B/C/D). Variant A is always the live
   -- Settings tab (the control), so it is never stored here.
@@ -578,6 +584,19 @@ end
 
 local function SendNextWho()
   if not NextQuery() then
+    -- Sweep of my level band is done. If auto-rescan is on (and this is a scan
+    -- run, not a send/blast), rest for autoScanDelay and then sweep again instead
+    -- of ending -- catches players who log in later. `seen` is kept across cycles
+    -- so a repeat sweep only acts on newly-appeared guildless players, and the
+    -- persistent re-invite cooldown still guards against re-contacting. We keep
+    -- scanning=true through the rest so the run stays alive (the drain-complete
+    -- branch won't fire) and contacts keep draining in parallel.
+    if GuildRecruiter_runKind == "scan" and GuildRecruiter_Settings.autoScan then
+      local gap = GuildRecruiter_Settings.autoScanDelay or 60
+      GuildRecruiter_rescanWait = gap
+      Print("Scan cycle done ("..stats.queries.." queries). Rescanning in "..math.floor(gap).."s. /gr stop to end.")
+      return
+    end
     scanning = false
     if GuildRecruiter_Settings.collectOnly then
       Print("Scan complete: "..stats.queries.." queries, collected "..stats.collected.." (list now "..CountTable(GuildRecruiter_Settings.candidates).."). Send from the Lists tab.")
@@ -630,7 +649,18 @@ local function ProcessWho()
     end
   end
 
-  local capped = (num >= CAP_HINT)
+  -- Learn the server's real /who cap instead of assuming 49. The most rows the
+  -- server has ever handed us is at-or-below its true cap, so a query that hits
+  -- that ceiling is presumed truncated and gets subdivided. CAP_HINT is only an
+  -- upper bound for the first few queries. This is coverage-safe: it can only
+  -- over-subdivide (slower but complete), never miss people on a low-cap server.
+  if num > observedCap then observedCap = num end
+  local ceiling = (observedCap < CAP_HINT) and observedCap or CAP_HINT
+  local capped = (num >= ceiling and num >= 5)
+  if GuildRecruiter_Settings.debug then
+    Print("who "..(current and (current.lo..(current.hi and current.hi~=current.lo and ("-"..current.hi) or "") ) or "?")
+      .."  results="..num.." cap~="..ceiling.." capped="..(capped and "Y" or "n"))
+  end
   local c = current
   if c and c.sweep then
     if capped then
@@ -645,7 +675,7 @@ local function ProcessWho()
       end
     else
       lo = c.hi + 1
-      if num < CAP_HINT * 0.6 then width = math.floor(width * 1.7) + 1 end
+      if num < ceiling * 0.6 then width = math.floor(width * 1.7) + 1 end
       local remain = myHi - lo + 1
       if width > remain then width = remain end
       if width < 1 then width = 1 end
@@ -657,6 +687,23 @@ local function ProcessWho()
 
   awaiting = false
   whoTimer = GuildRecruiter_Settings.whoDelay
+end
+
+-- Re-arm the level-band sweep for another auto-rescan cycle. GLOBAL so it costs
+-- GR_OnUpdate zero upvalues (Lua 5.0 caps them at 32/function). We reset the
+-- sweep position but deliberately KEEP `seen` (and the learned observedCap and
+-- cumulative stats) so a repeat cycle only picks up newly-arrived guildless
+-- players rather than re-processing everyone.
+function GuildRecruiter_RestartScanCycle()
+  GuildRecruiter_rescanWait = 0
+  scanning, awaiting = true, false
+  current = nil
+  pending = {}
+  RecomputeBand()
+  lo, width = myLo, START_WIDTH
+  whoTimer = 0
+  stats.cycles = (stats.cycles or 0) + 1
+  if GuildRecruiter_Settings.debug then Print("Auto-rescan: starting cycle "..stats.cycles.." on levels "..myLo.."-"..myHi..".") end
 end
 
 -- ---------------------------------------------------------------------------
@@ -697,6 +744,7 @@ end
 -- ---------------------------------------------------------------------------
 local function Abort(reason)
   running, scanning, awaiting, paused = false, false, false, false
+  GuildRecruiter_rescanWait = 0
   SuppressWho(false)
   Print("|cffff4040Stopped on error:|r "..tostring(reason))
 end
@@ -873,7 +921,12 @@ local function GR_OnUpdate()
 
   -- scanning
   if scanning then
-    if awaiting then
+    if (GuildRecruiter_rescanWait or 0) > 0 then
+      -- auto-rescan rest between cycles; when it elapses, re-arm the sweep.
+      -- (globals => no upvalue cost to GR_OnUpdate.)
+      GuildRecruiter_rescanWait = GuildRecruiter_rescanWait - e
+      if GuildRecruiter_rescanWait <= 0 then GuildRecruiter_RestartScanCycle() end
+    elseif awaiting then
       whoTimeout = whoTimeout - e
       if whoTimeout <= 0 then
         awaiting = false
@@ -943,13 +996,14 @@ local function Start()
   SuppressWho(true)
   FactionLists()
   running, scanning, awaiting, paused = true, true, false, false
+  GuildRecruiter_rescanWait = 0
   GuildRecruiter_runKind = "scan"; GuildRecruiter_runTotal = 0
   current = nil
   pending, contactQueue, replyQueue, seen, whispered = {}, {}, {}, {}, {}
   whoTimer, inviteTimer, whoTimeout, presenceTimer = 0, 0, 0, 0
   stats = { contacted=0, invited=0, whispered=0, guilded=0, scanned=0, queries=0, dropped=0, cooldown=0, collected=0 }
   RecomputeBand()
-  lo, width = myLo, START_WIDTH
+  lo, width, observedCap = myLo, START_WIDTH, 0
   if GuildRecruiter_Settings.guildSync and IsInGuild() then Broadcast("HI") end
   Print("Started ("..(MODE_LABEL[GuildRecruiter_Settings.mode] or "?")..") on levels "..myLo.."-"..myHi..". /gr stop to cancel.")
 end
@@ -958,6 +1012,7 @@ local function Stop()
   if not running then Print("Not running.") return end
   local wasSend = (GuildRecruiter_runKind ~= "scan")
   running, scanning, awaiting, paused = false, false, false, false
+  GuildRecruiter_rescanWait = 0
   GuildRecruiter_runKind = nil
   SuppressWho(false)
   Broadcast("BYE")
@@ -981,6 +1036,7 @@ function GuildRecruiter_SendToCandidates(blast)
   for n in s.candidates do tinsert(names, n) end
   if table.getn(names) == 0 then Print("No collected candidates. Turn on Collect (Settings) and scan first.") return end
   running, scanning, awaiting, paused = true, false, false, false
+  GuildRecruiter_rescanWait = 0                          -- auto-rescan is scan-runs-only
   GuildRecruiter_runKind = blast and "blast" or "send"   -- fast invite-all vs paced send
   GuildRecruiter_runTotal = table.getn(names)            -- for N-of-M progress
   current = nil
@@ -1399,6 +1455,8 @@ RefreshConfig = function()
   configFrame.instanceCheck:SetChecked(s.skipInstance)
   configFrame.quietCheck:SetChecked(s.quietWho)
   configFrame.collectCheck:SetChecked(s.collectOnly)
+  configFrame.autoScanCheck:SetChecked(s.autoScan)
+  configFrame.autoScanEdit:SetText(tostring(s.autoScanDelay))
   configFrame.replyBtn:SetText(REPLY_LABEL[s.replyMode] or s.replyMode)
 
   -- This tab is always variant A (the control) and never locks. We only enable
@@ -1425,9 +1483,24 @@ RefreshConfig = function()
   configFrame.updating = false
 end
 
+-- Clamp + store the auto-rescan gap. GLOBAL so the config box's applyFn adds no
+-- upvalue to BuildSettingsPanel (which sits near the 32-upvalue limit). Defined
+-- here (after RefreshConfig) so it captures configFrame/RefreshConfig as upvalues.
+function GuildRecruiter_SetAutoScanDelay(v)
+  local raw = tonumber(v)
+  v = clamp(math.floor(raw or AUTO_MIN), AUTO_MIN, AUTO_MAX)
+  if raw and raw ~= v then Print("Rescan gap adjusted to "..v.."s (allowed "..AUTO_MIN.."-"..AUTO_MAX..").") end
+  GuildRecruiter_Settings.autoScanDelay = v
+  if configFrame then RefreshConfig() end
+end
+
 local function StatusLine()
   if not running then return "Idle." end
   if paused then return "Paused at lvl "..lo.." | queued "..table.getn(contactQueue) end
+  if (GuildRecruiter_rescanWait or 0) > 0 then
+    return "rescanning in "..math.ceil(GuildRecruiter_rescanWait).."s | band "..myLo.."-"..myHi
+         .." | queued "..table.getn(contactQueue).." | sent "..stats.contacted
+  end
   if scanning and GuildRecruiter_Settings.collectOnly then
     return "collecting lvl "..lo.." | band "..myLo.."-"..myHi.." | found "..stats.collected
          .." | list "..CountTable(GuildRecruiter_Settings.candidates)
@@ -1708,6 +1781,27 @@ local function BuildSettingsPanel(parent)
   stopBtn:SetText("Stop"); stopBtn:SetScript("OnClick", function() Stop() end)
   fr.pauseBtn = pauseBtn
 
+  -- Auto-rescan (loop) toggle + rest interval, sharing the run-button baseline so
+  -- it reads as a run modifier and disturbs no other layout. SetAutoScanDelay is a
+  -- global => the box's applyFn adds no upvalue to this near-limit function.
+  fr.autoScanCheck = MakeCheck(fr, "GuildRecruiterConfigAutoScan", "Auto-rescan", 0, 0, "autoScan")
+  fr.autoScanCheck:ClearAllPoints()
+  fr.autoScanCheck:SetPoint("BOTTOMLEFT", fr, "BOTTOMLEFT", 344, 15)
+  fr.autoScanCheck:SetScript("OnEnter", function()
+    GameTooltip:SetOwner(this, "ANCHOR_TOPLEFT")
+    GameTooltip:AddLine("Auto-rescan")
+    GameTooltip:AddLine("Keep scanning: after a full /who sweep finishes, rest for the gap and sweep again, catching players who log in later. Runs until you press Stop.", 1, 1, 1, 1)
+    GameTooltip:AddLine("Gap: "..(GuildRecruiter_Settings.autoScanDelay or 60).."s  (edit the box, or /gr autoscan <seconds>)", 0.6, 0.8, 1, 1)
+    GameTooltip:Show()
+  end)
+  fr.autoScanCheck:SetScript("OnLeave", function() GameTooltip:Hide() end)
+  fr.autoScanEdit = MakeNumBox(fr, "GuildRecruiterConfigAutoDelay", 0, 0, 34, 3, GuildRecruiter_SetAutoScanDelay)
+  fr.autoScanEdit:ClearAllPoints()
+  fr.autoScanEdit:SetPoint("LEFT", fr.autoScanCheck, "RIGHT", 100, 1)
+  local asLbl = Label(fr, "s gap", 0, 0)
+  asLbl:ClearAllPoints()
+  asLbl:SetPoint("LEFT", fr.autoScanEdit, "RIGHT", 4, 0)
+
   -- throttled live refresh of the status line + bar
   fr.tick = 0
   fr:SetScript("OnUpdate", function()
@@ -1719,10 +1813,11 @@ local function BuildSettingsPanel(parent)
     local span = myHi - myLo + 1
     local prog = 1
     if running and scanning and span > 0 then prog = clamp((lo - myLo) / span, 0, 1) end
-    if not running then prog = 0 end
+    if not running or (GuildRecruiter_rescanWait or 0) > 0 then prog = 0 end
     fr.bar:SetValue(prog)
     -- label the bar so a full bar during the (long) drain phase isn't read as "done"
     if not running then fr.barText:SetText("")
+    elseif (GuildRecruiter_rescanWait or 0) > 0 then fr.barText:SetText("Rescanning in "..math.ceil(GuildRecruiter_rescanWait).."s")
     elseif scanning and GuildRecruiter_Settings.collectOnly then fr.barText:SetText("Collecting  "..math.floor(prog * 100 + 0.5).."%  ("..CountTable(GuildRecruiter_Settings.candidates).." on list)")
     elseif scanning then fr.barText:SetText("Scanning  "..math.floor(prog * 100 + 0.5).."%")
     else fr.barText:SetText("Sending queued contacts ("..table.getn(contactQueue).." left)") end
@@ -2170,6 +2265,29 @@ function GuildRecruiter_GotoSettings() OpenTab("settings") end  -- A/B control r
 -- ---------------------------------------------------------------------------
 -- Minimap button
 -- ---------------------------------------------------------------------------
+-- Build the minimap tooltip. GLOBAL so both OnEnter and the live-refresh OnUpdate
+-- can call it, and so it adds no upvalue to InitMinimap. Reads module state
+-- directly, so it's accurate whether or not the config window is open.
+function GuildRecruiter_MinimapTip(btn)
+  local s = GuildRecruiter_Settings
+  GameTooltip:SetOwner(btn, "ANCHOR_LEFT")
+  GameTooltip:AddLine("Guild Rawcruiter")
+  if not running then
+    GameTooltip:AddLine("Idle", 0.7, 0.7, 0.7)
+  elseif paused then
+    GameTooltip:AddLine("Paused", 1, 0.6, 0.2)
+    GameTooltip:AddLine(StatusLine(), 1, 1, 1)
+  else
+    GameTooltip:AddLine("Running", 0.3, 1, 0.3)
+    GameTooltip:AddLine(StatusLine(), 1, 1, 1)
+  end
+  GameTooltip:AddLine("Auto-rescan: "..(s.autoScan and ("on -- every "..(s.autoScanDelay or 60).."s") or "off"), 0.6, 0.8, 1)
+  GameTooltip:AddLine(" ")
+  GameTooltip:AddLine("Left-click: settings", 1, 1, 1)
+  GameTooltip:AddLine("Right-click: "..(running and "stop" or "start"), 1, 1, 1)
+  GameTooltip:Show()
+end
+
 local minimapBtn
 local function MinimapUpdatePos()
   if not minimapBtn then return end
@@ -2212,13 +2330,20 @@ InitMinimap = function()
   end)
   mb:SetScript("OnDragStop", function() this:SetScript("OnUpdate", nil) end)
   mb:SetScript("OnEnter", function()
-    GameTooltip:SetOwner(this, "ANCHOR_LEFT")
-    GameTooltip:AddLine("Guild Rawcruiter")
-    GameTooltip:AddLine("Left-click: settings", 1, 1, 1)
-    GameTooltip:AddLine("Right-click: start / stop", 1, 1, 1)
-    GameTooltip:Show()
+    GuildRecruiter_MinimapTip(this)
+    -- keep the tooltip live while hovering, so status updates in real time
+    this.tipTick = 0
+    this:SetScript("OnUpdate", function()
+      this.tipTick = (this.tipTick or 0) + (arg1 or 0)
+      if this.tipTick < 0.3 then return end
+      this.tipTick = 0
+      GuildRecruiter_MinimapTip(this)   -- OnLeave clears this OnUpdate, so it only runs while hovered
+    end)
   end)
-  mb:SetScript("OnLeave", function() GameTooltip:Hide() end)
+  mb:SetScript("OnLeave", function()
+    this:SetScript("OnUpdate", nil)
+    GameTooltip:Hide()
+  end)
 
   minimapBtn = mb
   MinimapUpdatePos()
@@ -2330,6 +2455,9 @@ SlashCmdList["GUILDRECRUITER"] = function(msg)
     end
   elseif cmd == "reset" then
     seen = {}; Print("Cleared this session's scan list (history kept).")
+  elseif cmd == "debug" then
+    GuildRecruiter_Settings.debug = (larg == "on") or (larg ~= "off" and not GuildRecruiter_Settings.debug)
+    Print("Scan debug: "..(GuildRecruiter_Settings.debug and "ON (prints each /who's result count + learned cap)" or "OFF"))
   elseif cmd == "forget" then
     local cnt = CountTable(GuildRecruiter_Settings.history or {})
     if cnt == 0 then Print("Invite history is already empty.")
@@ -2390,6 +2518,18 @@ SlashCmdList["GUILDRECRUITER"] = function(msg)
     else
       Print("set invite|who|reinvite|cap|min|max <n> | set method auto|byname|invite|chat | set mode invite|whisper|whisperinvite")
     end
+  elseif cmd == "autoscan" then
+    local n = tonumber(larg)
+    if n then
+      GuildRecruiter_SetAutoScanDelay(n)
+      Print("Auto-rescan gap "..GuildRecruiter_Settings.autoScanDelay.."s"..(GuildRecruiter_Settings.autoScan and " (auto-rescan is ON)." or " (auto-rescan is off -- /gr autoscan on)."))
+    else
+      if larg == "on" then GuildRecruiter_Settings.autoScan = true
+      elseif larg == "off" then GuildRecruiter_Settings.autoScan = false
+      else GuildRecruiter_Settings.autoScan = not GuildRecruiter_Settings.autoScan end
+      RefreshConfig()
+      Print("Auto-rescan "..(GuildRecruiter_Settings.autoScan and ("ON -- loops scans every "..GuildRecruiter_Settings.autoScanDelay.."s until /gr stop") or "off")..".")
+    end
   elseif cmd == "jitter" or cmd == "sync" or cmd == "combat" or cmd == "instance" or cmd == "quiet" then
     local keymap = { jitter="jitter", sync="guildSync", combat="skipCombat", instance="skipInstance", quiet="quietWho" }
     local key = keymap[cmd]
@@ -2400,6 +2540,7 @@ SlashCmdList["GUILDRECRUITER"] = function(msg)
   else
     Print("|cff33ff99Guild Rawcruiter v"..VERSION.."|r  --  /gr config, /gr list, /gr stats")
     Print("start | stop | pause | resume | status | reset | forget | hide")
+    Print("autoscan on|off (loop scanning) | autoscan <seconds> (rest between cycles)")
     Print("collect on|off (scan into a list) | inviteall (fast) | send (paced) | invite <name> | candidates | clearlist")
     Print("set invite/who/reinvite/cap/min/max/method/mode <v> | msg <text> | class <list|all>")
     Print("profile save/load/delete/list <name> | replymode notno/yesonly/any | ab (open tab) /on/off/clear")
