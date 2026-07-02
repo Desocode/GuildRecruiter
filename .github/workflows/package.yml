@@ -5,10 +5,18 @@ name: Package Addon
 # of GitHub's auto-generated "GuildRecruiter-main/". WoW requires the folder name
 # to match the .toc, so tell users to download this attached asset — NOT the
 # "Source code (zip)" link, which GitHub always suffixes with the branch/tag.
+#
+# Runs automatically on a published release, and can also be run manually
+# (Actions tab -> Package Addon -> Run workflow) to backfill an existing release.
 
 on:
   release:
     types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing release tag to (re)package, e.g. v1.1"
+        required: true
 
 permissions:
   contents: write   # needed to upload the asset onto the release
@@ -16,23 +24,32 @@ permissions:
 jobs:
   package:
     runs-on: ubuntu-latest
+    env:
+      TAG: ${{ github.event.release.tag_name || github.event.inputs.tag }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name || github.event.inputs.tag }}
 
       - name: Stage into a correctly-named folder
         run: |
           ADDON="${{ github.event.repository.name }}"
           mkdir -p "staging/$ADDON"
-          # Copy the whole repo into staging/<AddonName>/, minus VCS/CI cruft.
-          # Add more --exclude lines here to trim docs/screenshots from the download.
+          # Copy the repo into staging/<AddonName>/, minus VCS/CI and docs.
+          # WoW only ever loads .lua/.xml and .tga/.blp, so dropping .md/README/
+          # .gitignore is always safe; add more --exclude lines to trim further.
           rsync -a \
             --exclude='.git' \
             --exclude='.github' \
             --exclude='staging' \
+            --exclude='.gitignore' \
+            --exclude='*.md' \
+            --exclude='README*' \
             ./ "staging/$ADDON/"
           (cd staging && zip -r "../$ADDON.zip" "$ADDON")
 
       - name: Attach the zip to the release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ env.TAG }}
           files: ${{ github.event.repository.name }}.zip
