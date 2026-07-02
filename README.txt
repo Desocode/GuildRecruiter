@@ -8,11 +8,16 @@ clients and Turtle WoW.
 
 INSTALL
 -------
-1. The "GuildRecruiter" folder goes in:
+1. On the Releases page:
+      https://github.com/Desocode/GuildRecruiter/releases/latest
+   download the "GuildRecruiter.zip" asset (under "Assets").
+   DO NOT use the green "Code -> Download ZIP" button or the "Source code (zip)"
+   link -- those unzip to a mis-named "GuildRecruiter-main" folder WoW won't load.
+2. Extract it so the "GuildRecruiter" folder lands in:
       <WoW>\Interface\AddOns\GuildRecruiter\GuildRecruiter.toc
-2. FULLY RESTART the game the first time (a /reload won't register a new addon,
+3. FULLY RESTART the game the first time (a /reload won't register a new addon,
    and the .toc version bump needs a restart too).
-3. Enable "Guild Rawcruiter" in the AddOns list at character select.
+4. Enable "Guild Rawcruiter" in the AddOns list at character select.
    (The install folder stays named "GuildRecruiter" -- that's intentional, so
     your saved settings carry over.)
 
