@@ -1,0 +1,38 @@
+name: Package Addon
+
+# Builds a clean, correctly-named zip when you publish a GitHub Release, so the
+# folder users extract is exactly the addon name (e.g. "GuildRecruiter/") instead
+# of GitHub's auto-generated "GuildRecruiter-main/". WoW requires the folder name
+# to match the .toc, so tell users to download this attached asset — NOT the
+# "Source code (zip)" link, which GitHub always suffixes with the branch/tag.
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write   # needed to upload the asset onto the release
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Stage into a correctly-named folder
+        run: |
+          ADDON="${{ github.event.repository.name }}"
+          mkdir -p "staging/$ADDON"
+          # Copy the whole repo into staging/<AddonName>/, minus VCS/CI cruft.
+          # Add more --exclude lines here to trim docs/screenshots from the download.
+          rsync -a \
+            --exclude='.git' \
+            --exclude='.github' \
+            --exclude='staging' \
+            ./ "staging/$ADDON/"
+          (cd staging && zip -r "../$ADDON.zip" "$ADDON")
+
+      - name: Attach the zip to the release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ github.event.repository.name }}.zip
