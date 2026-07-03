@@ -52,16 +52,16 @@ CONTACT MODES  (/gr set mode ...)
   whisperinvite   Whisper first; then auto-invite (~1s later) ONLY if they reply
                   with something affirmative ("yes", "sure", "invite me", ...).
 
-AFFIRMATIVE REPLIES (whisperinvite mode)
-----------------------------------------
-With "affirm only" on (default), a whisper reply only triggers an invite if it
-matches the affirmative library -- a big editable list of yes-phrases. A reply
-containing a negative ("no thanks") never triggers an invite, and a vague reply
-("what guild?") keeps the person on hold so a later "ok" still works.
-  /gr affirmonly on|off     Require an affirmative (off = invite on ANY reply).
-  /gr affirm add <phrase>   Add a yes-phrase (also editable in the list window).
-  /gr affirm remove <phrase>
-  /gr affirm list
+REPLY POLICY (whisperinvite mode)
+---------------------------------
+/gr replymode chooses when a whisper reply triggers the invite:
+  notno    (default) invite unless the reply contains a refusal word ("no thanks")
+  yesonly  invite only when the reply matches a yes-word ("yes", "invite me", ...)
+  any      invite on any reply at all
+Both word lists are editable in the Lists tab or via slash:
+  /gr noword add|remove|list <phrase>    Refusal words (block the invite).
+  /gr yesword add|remove|list <phrase>   Yes words (required in yesonly mode).
+A vague reply ("what guild?") keeps the person on hold so a later "ok" still works.
 
 PROFILES (swappable setting presets, saved across logout)
 ---------------------------------------------------------
@@ -80,15 +80,15 @@ wording differs and counts look off, tell me the exact text.)
 
 A/B TESTING (compare configs simultaneously)
 ---------------------------------------------
-Find out which approach actually converts better. Flag 2+ saved profiles as
-variants, turn A/B on, and every player you contact is randomly dealt one
-variant -- so both run in the same hour over the same /who population (a fair
-test). Only the per-contact settings differ between variants (whisper message,
-mode, invite method, affirm-only); run-level settings (delays, levels, pacing)
+Find out which approach actually converts better. Your live Settings are variant
+A (the control); add challenger variants B/C/D on the A/B tab (each with its own
+message / mode / method / reply policy), turn A/B on, and every player you
+contact is randomly dealt one variant -- so all run in the same hour over the
+same /who population (a fair test). Run-level settings (delays, levels, pacing)
 are shared. Each variant's contacted / joined / declined and conversion % show
 in the Stats tab.
-  /gr ab add <profile>   (do this for 2+ profiles)
-  /gr ab on              (then recruit normally)
+  /gr ab            open the A/B tab (add/edit variants there)
+  /gr ab on         (then recruit normally)
   /gr ab off | clear
 Even with A/B off, stats are tagged by the active profile, so you can also just
 run profile A for a while, switch to B, and compare. A/B stats are per-account

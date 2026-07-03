@@ -1,4 +1,4 @@
---[[ Guild Rawcruiter -- vanilla 1.12 / Turtle WoW   (v2.0)
+--[[ Guild Rawcruiter -- vanilla 1.12 / Turtle WoW   (version: see .toc / VERSION below)
 
   Scans online players with /who and sends paced guild contacts (invite and/or
   whisper) to players who are NOT already in a guild.
@@ -19,7 +19,7 @@
 
 GuildRecruiter_Settings = GuildRecruiter_Settings or {}
 
-local VERSION    = "3.20"
+local VERSION    = "3.21"
 local CAP_HINT   = 49      -- treat a query returning >= this many as truncated
 local START_WIDTH = 10     -- initial level-band width to try
 local WHO_TIMEOUT = 15     -- give up waiting on a /who reply after this many seconds (then retry)
@@ -240,6 +240,14 @@ local function Defaults()
       local et = (type(e) == "table") and e.t or e   -- entries are {t,p} now; tolerate old numbers
       if (et or 0) < cutoff then s.history[n] = nil end
     end
+  else
+    -- reinviteDays == 0 ("never re-invite") skips time-pruning, so history grows
+    -- forever. Cap the SavedVariables at ~1 year of entries to bound memory.
+    local cutoff = time() - 365 * 86400
+    for n, e in s.history do
+      local et = (type(e) == "table") and e.t or e
+      if (et or 0) < cutoff then s.history[n] = nil end
+    end
   end
 end
 
@@ -447,6 +455,9 @@ local function WhisperBody(name, msg)
   local gname = GetGuildInfo("player") or "our guild"
   msg = string.gsub(msg, "%%p", name)
   msg = string.gsub(msg, "%%g", gname)
+  -- hard cap: a chat message over 255 chars DISCONNECTS the client. Token expansion
+  -- (%p/%g) can push an at-the-limit template over, so clamp after expansion.
+  if string.len(msg) > 255 then msg = string.sub(msg, 1, 255) end
   return msg
 end
 
@@ -622,11 +633,14 @@ end
 local function ProcessWho()
   local me = UnitName("player")
   local num = GetNumWhoResults()
+  local inBand = 0
   for i = 1, num do
     -- 1.12: name, guild, level, race, class, zone
     local name, guild, level, _, class = GetWhoInfo(i)
     if name then
       stats.scanned = stats.scanned + 1
+      if current and level and level >= current.lo and level <= (current.hi or current.lo)
+         and (not current.class or class == current.class) then inBand = inBand + 1 end
       if name == me or seen[name] then
         -- skip
       elseif guild and guild ~= "" then
@@ -671,6 +685,15 @@ local function ProcessWho()
   -- cap in a dense low-level band is never found.
   if not awaiting then
     if GuildRecruiter_Settings.debug then Print("who "..band.." results="..num.." (late/stray reply -- harvested only, cursor unchanged)") end
+    return
+  end
+
+  -- band sanity: the player's own manual /who can land while we're awaiting and be
+  -- mistaken for our reply (1.12 gives no query id). Our query filters server-side by
+  -- band, so OUR reply's results all fit the band; if NONE do, it's foreign -- harvest
+  -- only and keep awaiting our real reply (or let the timeout retry).
+  if num > 0 and c and inBand == 0 then
+    if GuildRecruiter_Settings.debug then Print("who "..band.." results="..num.." (none in band -- foreign /who? cursor unchanged)") end
     return
   end
 
@@ -769,6 +792,7 @@ local function Abort(reason)
   running, scanning, awaiting, paused = false, false, false, false
   GuildRecruiter_rescanWait = 0
   SuppressWho(false)
+  if type(SetWhoToUI) == "function" then pcall(SetWhoToUI, 0) end   -- RestoreWho (defined later; inline to avoid a forward ref)
   Print("|cffff4040Stopped on error:|r "..tostring(reason))
 end
 
@@ -882,6 +906,7 @@ function GuildRecruiter_Drain(e)
           DoGuildInvite(name)
           if not GuildRecruiter_Settings.history then GuildRecruiter_Settings.history = {} end
           GuildRecruiter_Settings.history[name] = { t = time(), p = GuildRecruiter_Settings.activeProfile }
+          Broadcast("INV "..name)                    -- share with peers (guild-wide dedup), like RecordHandled
           stats.invited = stats.invited + 1; stats.contacted = stats.contacted + 1
           TallyBump("invited")
           Print("Invited "..name.." ("..stats.invited..")")
@@ -891,17 +916,27 @@ function GuildRecruiter_Drain(e)
         end
         if GuildRecruiter_Settings.candidates then GuildRecruiter_Settings.candidates[name] = nil end  -- collected -> contacted
         inviteTimer = (GuildRecruiter_runKind == "blast") and INVITE_MIN or Pace(GuildRecruiter_Settings.inviteDelay)
+      else
+        -- session cap hit with names still queued: end the run instead of hanging
+        -- "Running" forever (the queue kept this branch alive but nothing drained)
+        Print("Session cap ("..GuildRecruiter_Settings.sessionCap..") reached -- dropping "..table.getn(contactQueue).." queued name(s).")
+        contactQueue = {}
+        scanning = false
+        GuildRecruiter_rescanWait = 0
       end
     end
   elseif not scanning then
-    -- whisper-on-reply mode keeps running a while to catch late replies
-    if GuildRecruiter_Settings.mode == "whisperinvite" and HasOutstandingWhispers() then
+    -- ANY outstanding whisper (incl. an A/B variant's whisperinvite when the global
+    -- mode differs) keeps the run alive to catch late replies -- else those replies
+    -- would arrive with running=false and the invites would be dropped
+    if HasOutstandingWhispers() then
       -- keep waiting
     else
       running = false
       local kind = GuildRecruiter_runKind
       GuildRecruiter_runKind = nil
       SuppressWho(false)
+      if type(SetWhoToUI) == "function" then pcall(SetWhoToUI, 0) end   -- restore manual /who to chat (RestoreWho is defined later in the file)
       Broadcast("BYE")
       if kind == "blast" or kind == "send" then
         Print("Done. "..(kind == "blast" and "Invited " or "Contacted ")..stats.contacted.." of "..(GuildRecruiter_runTotal or stats.contacted)..". "..CountTable(GuildRecruiter_Settings.candidates).." candidate(s) remain.")
@@ -1012,6 +1047,21 @@ end
 local function ForceWhoToEvent()
   if type(SetWhoToUI) == "function" then pcall(SetWhoToUI, 1) end
 end
+-- undo ForceWhoToEvent when a run ends -- otherwise the player's own /who stays
+-- routed to the UI (results stop printing to chat) until a /reload
+local function RestoreWho()
+  if type(SetWhoToUI) == "function" then pcall(SetWhoToUI, 0) end
+end
+-- an invite sent without permission fails SILENTLY while we still record + broadcast
+-- the contact, poisoning the guild-wide re-invite cooldown -- so block invite runs early
+local function CheckInvitePerms(mode)
+  if mode == "whisper" then return true end          -- whisper-only runs send no invites
+  if type(CanGuildInvite) == "function" and not CanGuildInvite() then
+    Print("|cffff4040You don't have guild-invite permission|r -- invites would fail silently. Ask an officer, or use whisper mode.")
+    return false
+  end
+  return true
+end
 
 local function FactionLists()
   classes = {}
@@ -1025,6 +1075,7 @@ end
 local function Start()
   if not IsInGuild() then Print("You're not in a guild.") return end
   if running then Print("Already running. /gr stop to cancel"..(paused and ", /gr resume to continue." or ", /gr pause to pause.")) return end
+  if not CheckInvitePerms(GuildRecruiter_Settings.mode) then return end
   ForceWhoToEvent()
   SuppressWho(true)
   FactionLists()
@@ -1048,6 +1099,7 @@ local function Stop()
   GuildRecruiter_rescanWait = 0
   GuildRecruiter_runKind = nil
   SuppressWho(false)
+  RestoreWho()
   Broadcast("BYE")
   if wasSend then
     Print("Stopped. Invited "..stats.contacted.." this run; "..CountTable(GuildRecruiter_Settings.candidates).." candidate(s) remain on the list.")
@@ -1063,6 +1115,7 @@ end
 function GuildRecruiter_SendToCandidates(blast)
   if not IsInGuild() then Print("You're not in a guild.") return end
   if running then Print("Already running -- /gr stop first"..(paused and " (or resume)." or ".")) return end
+  if not CheckInvitePerms(blast and "invite" or GuildRecruiter_Settings.mode) then return end
   Defaults()
   local s = GuildRecruiter_Settings
   local names = {}
@@ -2506,7 +2559,8 @@ SlashCmdList["GUILDRECRUITER"] = function(msg)
       GuildRecruiter_ToggleAB()   -- open the A/B tab to set variants up
     end
   elseif cmd == "reset" then
-    seen = {}; Print("Cleared this session's scan list (history kept).")
+    seen = {}; contactQueue = {}; replyQueue = {}   -- clear queues too, or a mid-run reset re-queues re-found players
+    Print("Cleared this session's scan list and queues (history kept).")
   elseif cmd == "debug" then
     GuildRecruiter_Settings.debug = (larg == "on") or (larg ~= "off" and not GuildRecruiter_Settings.debug)
     Print("Scan debug: "..(GuildRecruiter_Settings.debug and "ON (prints each /who's result count + learned cap)" or "OFF"))
