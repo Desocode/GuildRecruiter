@@ -30,9 +30,9 @@ QUICK START
 Everything lives in ONE window with three tabs along the bottom -- Settings,
 Lists, and Stats. Open it on any tab:
   /gr config     Open on the Settings tab (sliders, mode, filters, run buttons).
-  /gr list       Open on the Lists tab: view/edit the contact queue, blacklist,
-                 invite history, and affirmative library (click a row to remove;
-                 add via the box at the bottom).
+  /gr list       Open on the Lists tab: view/edit the candidates, contact queue,
+                 blacklist, invite history, and yes/refusal word lists (click a
+                 row to remove; add via the box at the bottom).
   /gr stats      Open on the Stats tab: profiles + join/decline analytics.
   /gr start      Begin scanning + contacting (or click the minimap button).
   /gr stop       Halt. /gr pause + /gr resume keep your place.
@@ -154,6 +154,13 @@ ALL COMMANDS  (slash:  /gr)
   set min <lvl> / set max <lvl>   Level range to sweep.
   set method auto|byname|invite|chat   Which guild-invite function to use.
   set mode invite|whisper|whisperinvite
+  replymode notno|yesonly|any    When a whisper reply triggers the invite.
+  noword / yesword add|remove|list <phrase>   Edit the reply word lists.
+  collect [on|off] | send | inviteall | invite <name> | candidates | clearlist
+  profile save|load|delete|list <name>
+  ab [on|off|clear]     A/B testing (bare /gr ab opens the tab).
+  autoscan [on|off|<seconds>]   Loop the scan with a rest between sweeps.
+  stats | debug [on|off]
   jitter|sync|combat|instance [on|off]
 
 
