@@ -19,7 +19,7 @@
 
 GuildRecruiter_Settings = GuildRecruiter_Settings or {}
 
-local VERSION    = "3.21"
+local VERSION    = "3.22"
 local CAP_HINT   = 49      -- treat a query returning >= this many as truncated
 local START_WIDTH = 10     -- initial level-band width to try
 local WHO_TIMEOUT = 15     -- give up waiting on a /who reply after this many seconds (then retry)
@@ -207,6 +207,7 @@ local function Defaults()
   if not s.autoScanDelay then s.autoScanDelay = 60 end     -- seconds to rest between auto-rescan cycles
   if s.debug == nil then s.debug = false end               -- print per-/who diagnostics during a scan
   if not s.candidates then s.candidates = {} end          -- [name] = {t, level, class}; persists across logout
+  if not s.dataset then s.dataset = {} end                -- [name] = {race, class, level, t}; every player seen in /who, for name-corpus building (persists across logout)
   -- abVariants are the CHALLENGERS only (B/C/D). Variant A is always the live
   -- Settings tab (the control), so it is never stored here.
   if not s.abVariants then s.abVariants = {} end
@@ -636,9 +637,21 @@ local function ProcessWho()
   local inBand = 0
   for i = 1, num do
     -- 1.12: name, guild, level, race, class, zone
-    local name, guild, level, _, class = GetWhoInfo(i)
+    local name, guild, level, race, class = GetWhoInfo(i)
     if name then
       stats.scanned = stats.scanned + 1
+      -- Name-corpus collector: record EVERY player seen in /who (guilded or not),
+      -- keyed by name -> race/class/level/last-seen. Independent of the contact
+      -- pipeline so it builds a full race+class-tagged dataset. All global-keyed,
+      -- so it adds no upvalues to ProcessWho. (Gender is not available from /who.)
+      if name ~= me and GuildRecruiter_Settings.dataset then
+        local rec = GuildRecruiter_Settings.dataset[name] or {}
+        rec.race  = race  or rec.race
+        rec.class = class or rec.class
+        rec.level = level or rec.level
+        rec.t = time()
+        GuildRecruiter_Settings.dataset[name] = rec
+      end
       if current and level and level >= current.lo and level <= (current.hi or current.lo)
          and (not current.class or class == current.class) then inBand = inBand + 1 end
       if name == me or seen[name] then
@@ -2564,6 +2577,27 @@ SlashCmdList["GUILDRECRUITER"] = function(msg)
   elseif cmd == "debug" then
     GuildRecruiter_Settings.debug = (larg == "on") or (larg ~= "off" and not GuildRecruiter_Settings.debug)
     Print("Scan debug: "..(GuildRecruiter_Settings.debug and "ON (prints each /who's result count + learned cap)" or "OFF"))
+  elseif cmd == "dataset" then
+    local d = GuildRecruiter_Settings.dataset or {}
+    local total = CountTable(d)
+    if larg == "clear" then
+      GuildRecruiter_Confirm("Clear the name dataset of "..total.." player(s)?",
+        function() GuildRecruiter_Settings.dataset = {}; Print("Cleared name dataset ("..total.." entries).") end)
+    else
+      local byRace, byClass = {}, {}
+      for _, rec in pairs(d) do
+        local r = rec.race or "?"
+        local c = rec.class or "?"
+        byRace[r]  = (byRace[r]  or 0) + 1
+        byClass[c] = (byClass[c] or 0) + 1
+      end
+      Print("Name dataset: "..total.." unique player(s) captured from /who (name/race/class/level).")
+      local rl = ""; for r, n in pairs(byRace)  do rl = rl..r.."="..n.."  " end
+      local cl = ""; for c, n in pairs(byClass) do cl = cl..c.."="..n.."  " end
+      if rl ~= "" then Print("  by race:  "..rl) end
+      if cl ~= "" then Print("  by class: "..cl) end
+      Print("  Grows during scans; saved on logout/reload. '/gr dataset clear' to reset.")
+    end
   elseif cmd == "forget" then
     local cnt = CountTable(GuildRecruiter_Settings.history or {})
     if cnt == 0 then Print("Invite history is already empty.")
