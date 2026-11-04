@@ -8,7 +8,9 @@ This is a BETA port to the WoW: Forever client (## Interface: 16001, modified
 Lua 5.1, Mainline-style API). It has NOT been tested in game -- it was ported
 and checked offline only. The 1.12 / Turtle build stays on the "main" branch;
 the text below this section describes that build's features, which the port
-keeps unchanged (same settings, defaults, slash commands and pacing).
+keeps (same settings, defaults, slash commands and pacing values), except that
+each /who and each invite now waits for a key press -- see "ONE KEY PRESS PER
+/WHO OR INVITE" below.
 
 What changed: the Lua 5.0 code was converted to Lua 5.1 (no table.getn,
 string.gfind, getglobal, `this` or arg1 globals), and every client call whose
@@ -26,12 +28,45 @@ check) and uses the modern one when present, else the old 1.12 global:
 Values the client marks secret (issecretvalue) are skipped, never compared.
 On load the addon prints which invite, /who and whisper calls it picked.
 
-KNOWN RISK: the warcraft.wiki.gg pages for C_FriendList.SendWho and
-C_GuildInfo.Invite say both need a hardware event (a key or mouse press). If
-Forever enforces that, the automatic /who sweep and the automatic invites,
-which run on a timer, will be blocked ("Interface action failed because of an
-AddOn"). Sending a whisper is not restricted, but whisper mode still needs the
-/who sweep to find people. Details are in PORT_NOTES.md.
+ONE KEY PRESS PER /WHO OR INVITE (key-press mode)
+The warcraft.wiki.gg pages for C_FriendList.SendWho and C_GuildInfo.Invite say
+both need a hardware event (a key press or mouse click), and the other Forever
+recruiters all work one /who or one invite per press. So on a client that has
+C_FriendList.SendWho, the addon never sends a /who or an invite from its timer.
+It waits for you to press "Next":
+  /gr start       ARMS the run (or right-click the minimap button). Nothing is
+                  sent yet; chat tells you how to press Next.
+  Next            Each press sends ONE thing, in this order:
+                    1. an invite to someone who replied yes (whisper-then-invite)
+                    2. the next queued contact: an invite, or the first whisper
+                       of whisper-then-invite mode
+                    3. otherwise the next /who of the sweep
+                  Three ways to press it:
+                    - a key: Key Bindings > Guild Rawcruiter >
+                      "Next: send one /who or one invite" (binding name
+                      GUILDRECRUITER_NEXT, from Bindings.xml). No default key.
+                    - the "Next" button that appears under the minimap button
+                      while a run is armed (and on the Lists tab during
+                      Invite all / Send)
+                    - typing /gr next (a macro with /gr next works too)
+The button shows what the next press will do and when it is allowed, e.g.
+"Next: send /who", "/who ready in 2s", "Invite Bob", "Waiting for /who".
+A number in [brackets] is how many replies are ready to invite.
+Your delay settings (invite delay, /who delay, random delays) still apply, as
+the shortest gap between presses: press too early and chat says "wait Ns".
+The timer still does the waiting: /who timeouts and retries, reading the
+results, judging whisper replies, auto-backoff, the rest between auto-rescan
+sweeps (each new sweep waits for a press), and ending the run.
+Whisper-only contacts are not restricted, so in "whisper" mode the whispers
+still go out by themselves at the invite delay; you only press for the /who.
+Lists tab "Invite all" / "Send": confirm once to arm, then each click on Next
+sends one invite and chat says "N left, click again".
+If the client still blocks a call (ADDON_ACTION_BLOCKED / FORBIDDEN naming
+this addon), the run pauses and one chat line names the blocked call.
+On a client without C_FriendList.SendWho the old automatic timer loop runs
+unchanged and Next is not needed.
+NONE OF THIS HAS BEEN TESTED IN GAME. Details and open questions are in
+PORT_NOTES.md.
 
 Before trusting it, run this in game and send the output along with any error:
   /dump select(4, GetBuildInfo())
@@ -181,6 +216,8 @@ ANTI-PATTERN / SAFETY OPTIONS
 ALL COMMANDS  (slash:  /gr)
 ---------------------------
   start | stop | pause | resume | status | config
+  next                  (Forever build) Send the next /who or invite -- one
+                        per press. Bind a key: Key Bindings > Guild Rawcruiter.
   reset                 Clear THIS session's scan list (keeps history).
   forget                Wipe the persistent invite history.
   hide                  Toggle auto-hiding the Who window during scans.

@@ -43,6 +43,71 @@ local issecret    = issecretvalue  or function() return false end
 local issecrettab = issecrettable  or function() return false end
 GR_Compat.IsSecret = issecret
 
+-- Hardware-event mode (blockers 1 + 2). The wiki marks C_FriendList.SendWho and
+-- C_GuildInfo.Invite #hwevent: they work only inside a handler the client runs
+-- for a key press or mouse click, never from OnUpdate, C_Timer or an event.
+-- ONE switch, set by feature detection at load: a client with
+-- C_FriendList.SendWho is treated as needing a press for every /who and every
+-- invite (the run waits for the Next key / button); a client with only the old
+-- globals keeps the automatic timer loop.
+GR_Compat.RequiresHardwareEvent = (C_FriendList and C_FriendList.SendWho) and true or false
+
+-- contact modes the run timer may still send by itself in hardware-event mode:
+-- a WHISPER is not hardware-restricted (wiki), so whisper-only contacts keep
+-- going out on the invite delay. Everything else waits for a press.
+GR_Compat.TimerContactModes = { whisper = true }
+
+-- GR_Compat.Press(fn, ...) runs fn for a key press or click, in the SAME call
+-- stack (pcall is synchronous: no timer, no OnUpdate hop, no coroutine), and
+-- returns pcall's ok, err. The restricted wrappers below (SendWho, GuildInvite)
+-- call CheckPress first: in hardware-event mode, reaching them outside a Press
+-- is a bug, and it stops the run with a named error instead of tripping the
+-- client's "action blocked" counter.
+GR_Compat.inPress = false
+function GR_Compat.Press(fn, ...)
+  local outer = GR_Compat.inPress
+  GR_Compat.inPress = true
+  local ok, err = pcall(fn, ...)
+  GR_Compat.inPress = outer
+  return ok, err
+end
+
+function GR_Compat.CheckPress(label)
+  if GR_Compat.RequiresHardwareEvent and not GR_Compat.inPress then
+    error(label.." needs a key press or click on this client, but was reached from a timer or event", 0)
+  end
+  GR_Compat.lastCall, GR_Compat.lastCallAt = label, GetTime()   -- named if the client blocks it
+end
+
+-- the key bound to a Bindings.xml action, or nil
+function GR_Compat.BindingKey(action)
+  if type(GetBindingKey) == "function" then
+    local k = GetBindingKey(action)
+    if type(k) == "string" and k ~= "" then return k end
+  end
+  return nil
+end
+
+-- the client reports a blocked call with ADDON_ACTION_BLOCKED (protected call
+-- from tainted code) or ADDON_ACTION_FORBIDDEN, payload (addonName, function);
+-- both are synchronous events (wiki). Registered under pcall, so a client
+-- without them just never fires them.
+function GR_Compat.WatchBlocked(frame)
+  pcall(frame.RegisterEvent, frame, "ADDON_ACTION_BLOCKED")
+  pcall(frame.RegisterEvent, frame, "ADDON_ACTION_FORBIDDEN")
+end
+
+-- one chat line for a block report that names this addon, else nil
+function GR_Compat.BlockedLine(event, addon, fn)
+  if issecret(addon) or issecret(fn) or addon ~= ADDON_NAME then return nil end
+  local line = "|cffff4040The client blocked "..tostring(fn or "an action").."|r ("..tostring(event)..")"
+  if GR_Compat.lastCall then
+    line = line.."; our last restricted call was "..GR_Compat.lastCall
+         ..string.format(" %.1fs ago", GetTime() - (GR_Compat.lastCallAt or 0))
+  end
+  return line
+end
+
 -- Mainline chat/addon events name players "Name-Realm"; 1.12 used a bare "Name".
 -- Strip our own realm (Ambiguate "none") so history/seen/whisper keys match the
 -- /who and guild-message names. Other realms keep their suffix.
@@ -54,12 +119,14 @@ end
 
 -- /who query (blocker 1). Mainline: C_FriendList.SendWho(filter, origin); the
 -- origin argument arrived in 10.2.0, and the wiki marks the call #hwevent
--- (needs a key/mouse press) since 8.2.5.
+-- (needs a key/mouse press) since 8.2.5. RESTRICTED: CheckPress first.
 function GR_Compat.SendWho(filter)
   if C_FriendList and C_FriendList.SendWho then
+    GR_Compat.CheckPress("C_FriendList.SendWho")
     local origin = Enum and Enum.SocialWhoOrigin and Enum.SocialWhoOrigin.Social
     C_FriendList.SendWho(filter, origin)
   elseif type(SendWho) == "function" then
+    GR_Compat.CheckPress("SendWho")
     SendWho(filter)
   else
     error("no /who API on this client (C_FriendList.SendWho / SendWho)")
@@ -125,30 +192,31 @@ end
 -- guild invite (blocker 2). method = the saved setting auto|byname|invite|chat.
 -- Mainline: C_GuildInfo.Invite(name), marked #hwevent on the wiki. "auto" tries
 -- it first, then the 1.12 order (GuildInviteByName, GuildInvite, /ginvite).
+-- A chosen method whose function is missing falls back to the "auto" order.
+-- Returns the call's name and the function that sends it.
+function GR_Compat.ResolveInvite(method)
+  if method == "byname" and type(GuildInviteByName) == "function" then return "GuildInviteByName", GuildInviteByName end
+  if method == "invite" and type(GuildInvite) == "function" then return "GuildInvite", GuildInvite end
+  if method == "chat" then return "/ginvite", GR_Compat.InviteByChat end
+  if C_GuildInfo and C_GuildInfo.Invite then return "C_GuildInfo.Invite", C_GuildInfo.Invite end
+  if type(GuildInviteByName) == "function" then return "GuildInviteByName", GuildInviteByName end
+  if type(GuildInvite) == "function" then return "GuildInvite", GuildInvite end
+  return "/ginvite (chat fallback)", GR_Compat.InviteByChat
+end
+function GR_Compat.InviteByChat(name) GR_Compat.RunSlash("/ginvite "..name) end
+
+-- RESTRICTED: every invite method (including /ginvite typed from code) needs
+-- the press on a hardware-event client, so CheckPress guards all of them.
 function GR_Compat.GuildInvite(name, method)
-  if method == "byname" and type(GuildInviteByName) == "function" then
-    GuildInviteByName(name)
-  elseif method == "invite" and type(GuildInvite) == "function" then
-    GuildInvite(name)
-  elseif method == "chat" then
-    GR_Compat.RunSlash("/ginvite "..name)
-  elseif C_GuildInfo and C_GuildInfo.Invite then
-    C_GuildInfo.Invite(name)
-  elseif type(GuildInviteByName) == "function" then
-    GuildInviteByName(name)
-  elseif type(GuildInvite) == "function" then
-    GuildInvite(name)
-  else
-    GR_Compat.RunSlash("/ginvite "..name)
-  end
+  local label, send = GR_Compat.ResolveInvite(method)
+  GR_Compat.CheckPress(label)
+  send(name)
 end
 
 -- which call "auto" invites with, for the load message
 function GR_Compat.InviteApiName()
-  if C_GuildInfo and C_GuildInfo.Invite then return "C_GuildInfo.Invite" end
-  if type(GuildInviteByName) == "function" then return "GuildInviteByName" end
-  if type(GuildInvite) == "function" then return "GuildInvite" end
-  return "/ginvite (chat fallback)"
+  local label = GR_Compat.ResolveInvite("auto")
+  return label
 end
 
 -- invite permission (blocker 2). No API at all = unknown = allowed, as in 1.12.
@@ -194,6 +262,7 @@ function GR_Compat.ApiSummary()
   local wsp = (C_ChatInfo and C_ChatInfo.SendChatMessage and "C_ChatInfo.SendChatMessage")
            or (type(SendChatMessage) == "function" and "SendChatMessage") or "none"
   return "Invite API: "..GR_Compat.InviteApiName().." (who: "..who..", whisper: "..wsp..")"
+      ..(GR_Compat.RequiresHardwareEvent and ". Key-press mode: each /who and invite waits for /gr next or the Next key" or "")
 end
 
 -- guild sync. Mainline moved both calls to C_ChatInfo (8.0.1) and delivers
@@ -320,6 +389,11 @@ function GR_Compat.SetChildText(frame, suffix, text)
 end
 
 local VERSION    = "4.0.0-forever.1"
+
+-- Key Bindings entry (Bindings.xml in this folder, loaded by the client; it
+-- calls GuildRecruiter_Next). FrameXML reads these two globals for the labels.
+BINDING_HEADER_GUILDRECRUITER    = "Guild Rawcruiter"
+BINDING_NAME_GUILDRECRUITER_NEXT = "Next: send one /who or one invite"
 local CAP_HINT   = 49      -- treat a query returning >= this many as truncated
 local START_WIDTH = 10     -- initial level-band width to try
 local WHO_TIMEOUT = 15     -- give up waiting on a /who reply after this many seconds (then retry)
@@ -819,9 +893,9 @@ local function RecordHandled(name, vname)
   Broadcast("INV "..name)
 end
 
--- perform the configured contact action for one name (variant chosen per A/B)
-local function Contact(name)
-  local v = GuildRecruiter_PickVariant()                 -- challenger table, or nil = control A
+-- perform the configured contact action for one name. v = the A/B variant dealt
+-- to it (challenger table, or nil = control A); see GuildRecruiter_DealHead.
+local function Contact(name, v)
   local cfg = GuildRecruiter_CfgOf(v)
   -- during an A/B test a nil pick is the control, credited as "A"; otherwise
   -- (A/B off) it's just the active profile, for sequential profile comparison.
@@ -855,12 +929,16 @@ local function BuildFilter(s)
   return table.concat(parts, " ")
 end
 
-local function NextQuery()
+-- pick the next slice into `current`. peek = only say whether one is left
+-- (no state change), for the key-press mode's timer and Next button.
+local function NextQuery(peek)
   if #pending > 0 then
-    current = tremove(pending, 1)
+    if not peek then current = tremove(pending, 1) end
     return true
   end
-  if lo < myLo then lo = myLo end
+  local start = (lo < myLo) and myLo or lo
+  if peek then return start <= myHi and start <= 60 end
+  lo = start
   if lo <= myHi and lo <= 60 then
     local hi = lo + width - 1
     if hi > myHi then hi = myHi end
@@ -871,29 +949,32 @@ local function NextQuery()
   return false
 end
 
-local function SendNextWho()
-  if not NextQuery() then
-    -- Sweep of my level band is done. If auto-rescan is on (and this is a scan
-    -- run, not a send/blast), rest for autoScanDelay and then sweep again instead
-    -- of ending -- catches players who log in later. `seen` is kept across cycles
-    -- so a repeat sweep only acts on newly-appeared guildless players, and the
-    -- persistent re-invite cooldown still guards against re-contacting. We keep
-    -- scanning=true through the rest so the run stays alive (the drain-complete
-    -- branch won't fire) and contacts keep draining in parallel.
-    if GuildRecruiter_runKind == "scan" and GuildRecruiter_Settings.autoScan then
-      local gap = GuildRecruiter_Settings.autoScanDelay or 60
-      GuildRecruiter_rescanWait = gap
-      Print("Scan cycle done ("..stats.queries.." queries). Rescanning in "..math.floor(gap).."s. /gr stop to end.")
-      return
-    end
-    scanning = false
-    if GuildRecruiter_Settings.collectOnly then
-      Print("Scan complete: "..stats.queries.." queries, collected "..stats.collected.." (list now "..CountTable(GuildRecruiter_Settings.candidates).."). Send from the Lists tab.")
-    else
-      Print("Scan complete: "..stats.queries.." queries, "..#contactQueue.." left to contact.")
-    end
+-- Sweep of my level band is done. Sends no /who. If auto-rescan is on (and this
+-- is a scan run, not a send/blast), rest for autoScanDelay and then sweep again
+-- instead of ending -- catches players who log in later. `seen` is kept across
+-- cycles so a repeat sweep only acts on newly-appeared guildless players, and the
+-- persistent re-invite cooldown still guards against re-contacting. We keep
+-- scanning=true through the rest so the run stays alive (the drain-complete
+-- branch won't fire) and contacts keep draining in parallel.
+local function FinishSweep()
+  if GuildRecruiter_runKind == "scan" and GuildRecruiter_Settings.autoScan then
+    local gap = GuildRecruiter_Settings.autoScanDelay or 60
+    GuildRecruiter_rescanWait = gap
+    Print("Scan cycle done ("..stats.queries.." queries). Rescanning in "..math.floor(gap).."s. /gr stop to end.")
     return
   end
+  scanning = false
+  if GuildRecruiter_Settings.collectOnly then
+    Print("Scan complete: "..stats.queries.." queries, collected "..stats.collected.." (list now "..CountTable(GuildRecruiter_Settings.candidates).."). Send from the Lists tab.")
+  else
+    Print("Scan complete: "..stats.queries.." queries, "..#contactQueue.." left to contact.")
+  end
+end
+
+-- RESTRICTED (sends a /who). Callers: the 1.12 timer branch of GR_OnUpdate
+-- (only when not GR_Compat.RequiresHardwareEvent) and GuildRecruiter_NextPress.
+local function SendNextWho()
+  if not NextQuery() then FinishSweep(); return end
   awaiting = true
   whoTimeout = WHO_TIMEOUT
   stats.queries = stats.queries + 1
@@ -1039,6 +1120,8 @@ function GuildRecruiter_RestartScanCycle()
   whoTimer = 0
   stats.cycles = (stats.cycles or 0) + 1
   if GuildRecruiter_Settings.debug then Print("Auto-rescan: starting cycle "..stats.cycles.." on levels "..myLo.."-"..myHi..".") end
+  -- key-press mode: the new sweep's first /who (like every /who) waits for Next
+  if GR_Compat.RequiresHardwareEvent then Print("Auto-rescan: sweep "..stats.cycles.." of levels "..myLo.."-"..myHi.." is ready -- press Next to start it.") end
 end
 
 -- ---------------------------------------------------------------------------
@@ -1061,11 +1144,12 @@ local function InstanceBlocked()
   return false
 end
 
--- can we send a contact/invite right now?
+-- can we send a contact/invite right now? false, or the reason (a string, so
+-- it still reads as true) -- the Next button shows it
 local function SendsBlocked()
-  if GetTime() < backoffUntil then return true end
-  if GuildRecruiter_Settings.skipCombat and inCombat then return true end
-  if InstanceBlocked() then return true end
+  if GetTime() < backoffUntil then return "server throttle" end
+  if GuildRecruiter_Settings.skipCombat and inCombat then return "in combat" end
+  if InstanceBlocked() then return "in an instance" end
   return false
 end
 
@@ -1147,9 +1231,17 @@ local function GR_OnEvent(event, ...)
       if ShouldInvite(a1, w.v) then   -- judge with the variant that whispered them
         whispered[sender] = nil
         tinsert(replyQueue, sender)   -- reply passes the policy: invite (paced)
+        -- key-press mode: never invite from this handler; the ready-to-invite
+        -- list waits for the next Next press (its count shows on the button)
+        if GR_Compat.RequiresHardwareEvent then
+          Print(sender.." replied -- ready to invite ("..#replyQueue.." waiting). Press Next.")
+        end
       end
       -- otherwise keep waiting -- a later, clearer "yes" still triggers it
     end
+  elseif event == "ADDON_ACTION_BLOCKED" or event == "ADDON_ACTION_FORBIDDEN" then
+    local line = GR_Compat.BlockedLine(event, a1, a2)   -- nil unless it names this addon
+    if line then GuildRecruiter_PauseBlocked(line) end
   elseif event == "PLAYER_REGEN_DISABLED" then
     inCombat = true
   elseif event == "PLAYER_REGEN_ENABLED" then
@@ -1165,6 +1257,7 @@ f:RegisterEvent("CHAT_MSG_SYSTEM")
 f:RegisterEvent("CHAT_MSG_WHISPER")
 f:RegisterEvent("PLAYER_REGEN_DISABLED")
 f:RegisterEvent("PLAYER_REGEN_ENABLED")
+GR_Compat.WatchBlocked(f)                    -- ADDON_ACTION_BLOCKED / _FORBIDDEN: pause + say which call
 GR_Compat.RegisterAddonPrefix(SYNC_PREFIX)   -- Mainline delivers CHAT_MSG_ADDON only for registered prefixes
 f:SetScript("OnEvent", function(self, event, ...)
   local ok, err = pcall(GR_OnEvent, event, ...)
@@ -1181,46 +1274,106 @@ local function HasOutstandingWhispers()
   return false
 end
 
+-- Deal the A/B variant for the head of the contact queue ONCE and remember it,
+-- so the Next button can show what the next press will do (invite or whisper)
+-- and the press then sends exactly that. Returns name, variant (nil = control
+-- A). Invite-all ("blast") ignores the variants, so it deals nothing. On the
+-- 1.12 timer path this runs at contact time, as Contact's PickVariant did.
+function GuildRecruiter_DealHead()
+  local name = contactQueue[1]
+  if not name or GuildRecruiter_runKind == "blast" then return name, nil end
+  local d = GuildRecruiter_dealt
+  if not d or d.name ~= name then
+    d = { name = name, v = GuildRecruiter_PickVariant() }
+    GuildRecruiter_dealt = d
+  end
+  return name, d.v
+end
+
+-- key-press mode: may the run timer contact this one by itself? Only a plain
+-- whisper (GR_Compat.TimerContactModes); invites wait for a press.
+function GuildRecruiter_TimerMay(v)
+  if GuildRecruiter_runKind == "blast" then return false end
+  return GR_Compat.TimerContactModes[GuildRecruiter_CfgOf(v).mode] and true or false
+end
+
+-- " -- N left, click again" after a contact made by a press, else ""
+function GuildRecruiter_LeftNote()
+  if not GR_Compat.inPress then return "" end
+  local left = #contactQueue + #replyQueue
+  if GuildRecruiter_runKind == "blast" or GuildRecruiter_runKind == "send" then
+    return (left > 0) and (" -- "..left.." left, click again") or " -- that was the last one"
+  end
+  if #replyQueue > 0 then return " -- "..#replyQueue.." more ready to invite" end
+  return (left > 0) and (" -- "..left.." queued") or ""
+end
+
+-- RESTRICTED (guild invite): the first player on the ready-to-invite list
+-- (replied yes to a whisperinvite whisper). Callers: GuildRecruiter_Drain (1.12
+-- timer only) and GuildRecruiter_NextPress.
+function GuildRecruiter_InviteReply()
+  local name = tremove(replyQueue, 1)
+  DoGuildInvite(name)
+  if not GuildRecruiter_Settings.history then GuildRecruiter_Settings.history = {} end
+  local pe = GuildRecruiter_Settings.history[name]   -- keep the profile that contacted them
+  GuildRecruiter_Settings.history[name] = { t = time(), p = (type(pe) == "table") and pe.p or GuildRecruiter_Settings.activeProfile }
+  stats.invited = stats.invited + 1
+  TallyBump("invited")
+  Print("Invited (replied) "..name.." ("..stats.invited..")"..GuildRecruiter_LeftNote())
+  inviteTimer = Pace(GuildRecruiter_Settings.inviteDelay)
+end
+
+-- RESTRICTED when the head's contact is an invite: contact the head of the
+-- queue with the variant DealHead dealt it. Callers: GuildRecruiter_Drain (1.12
+-- timer; key-press mode only for TimerMay whispers) and GuildRecruiter_NextPress.
+function GuildRecruiter_ContactHead()
+  local name, v = GuildRecruiter_DealHead()
+  tremove(contactQueue, 1)
+  GuildRecruiter_dealt = nil
+  if GuildRecruiter_runKind == "blast" then    -- invite-all: straight guild invite, fast
+    DoGuildInvite(name)
+    if not GuildRecruiter_Settings.history then GuildRecruiter_Settings.history = {} end
+    GuildRecruiter_Settings.history[name] = { t = time(), p = GuildRecruiter_Settings.activeProfile }
+    Broadcast("INV "..name)                    -- share with peers (guild-wide dedup), like RecordHandled
+    stats.invited = stats.invited + 1; stats.contacted = stats.contacted + 1
+    TallyBump("invited")
+    Print("Invited "..name.." ("..stats.invited..")"..GuildRecruiter_LeftNote())
+  else
+    Contact(name, v)
+    Print("Contacted "..name.." ("..stats.contacted..")"..GuildRecruiter_LeftNote())
+  end
+  if GuildRecruiter_Settings.candidates then GuildRecruiter_Settings.candidates[name] = nil end  -- collected -> contacted
+  inviteTimer = (GuildRecruiter_runKind == "blast") and INVITE_MIN or Pace(GuildRecruiter_Settings.inviteDelay)
+end
+
 -- GLOBAL on purpose: extracting the contacting/draining block here keeps
--- GR_OnUpdate's upvalue count safely under the Lua 5.0 limit of 32.
+-- GR_OnUpdate's upvalue count low.
+-- Key-press mode (GR_Compat.RequiresHardwareEvent): this timer NEVER invites.
+-- It only paces, sends TimerMay whispers, applies the session cap and ends the
+-- run; reply invites and invite contacts wait for GuildRecruiter_NextPress.
 function GuildRecruiter_Drain(e)
   -- contacting / inviting (paced; replies take priority)
   if #replyQueue > 0 or #contactQueue > 0 then
     inviteTimer = inviteTimer - e
     if inviteTimer <= 0 and not SendsBlocked() then
-      if #replyQueue > 0 then
-        local name = tremove(replyQueue, 1)
-        DoGuildInvite(name)
-        if not GuildRecruiter_Settings.history then GuildRecruiter_Settings.history = {} end
-        local pe = GuildRecruiter_Settings.history[name]   -- keep the profile that contacted them
-        GuildRecruiter_Settings.history[name] = { t = time(), p = (type(pe) == "table") and pe.p or GuildRecruiter_Settings.activeProfile }
-        stats.invited = stats.invited + 1
-        TallyBump("invited")
-        Print("Invited (replied) "..name.." ("..stats.invited..")")
-        inviteTimer = Pace(GuildRecruiter_Settings.inviteDelay)
-      elseif not CapReached() then
-        local name = tremove(contactQueue, 1)
-        if GuildRecruiter_runKind == "blast" then    -- invite-all: straight guild invite, fast
-          DoGuildInvite(name)
-          if not GuildRecruiter_Settings.history then GuildRecruiter_Settings.history = {} end
-          GuildRecruiter_Settings.history[name] = { t = time(), p = GuildRecruiter_Settings.activeProfile }
-          Broadcast("INV "..name)                    -- share with peers (guild-wide dedup), like RecordHandled
-          stats.invited = stats.invited + 1; stats.contacted = stats.contacted + 1
-          TallyBump("invited")
-          Print("Invited "..name.." ("..stats.invited..")")
-        else
-          Contact(name)
-          Print("Contacted "..name.." ("..stats.contacted..")")
-        end
-        if GuildRecruiter_Settings.candidates then GuildRecruiter_Settings.candidates[name] = nil end  -- collected -> contacted
-        inviteTimer = (GuildRecruiter_runKind == "blast") and INVITE_MIN or Pace(GuildRecruiter_Settings.inviteDelay)
-      else
+      local hw = GR_Compat.RequiresHardwareEvent
+      if #replyQueue > 0 and not hw then
+        GuildRecruiter_InviteReply()
+      elseif #contactQueue == 0 then
+        -- key-press mode: only ready-to-invite replies left; they wait for Next
+      elseif CapReached() then
         -- session cap hit with names still queued: end the run instead of hanging
         -- "Running" forever (the queue kept this branch alive but nothing drained)
         Print("Session cap ("..GuildRecruiter_Settings.sessionCap..") reached -- dropping "..#contactQueue.." queued name(s).")
         contactQueue = {}
         scanning = false
         GuildRecruiter_rescanWait = 0
+      elseif not hw then
+        GuildRecruiter_ContactHead()
+      else
+        local _, v = GuildRecruiter_DealHead()
+        if GuildRecruiter_TimerMay(v) then GuildRecruiter_ContactHead() end   -- a plain whisper
+        -- else: an invite (or whisper-then-invite) contact; it waits for Next
       end
     end
   elseif not scanning then
@@ -1303,8 +1456,16 @@ local function GR_OnUpdate(e)
     elseif GetTime() >= backoffUntil then
       whoTimer = whoTimer - e
       if whoTimer <= 0 then
-        SendNextWho()
-        whoTimer = Pace(GuildRecruiter_Settings.whoDelay)
+        if not GR_Compat.RequiresHardwareEvent then
+          SendNextWho()                           -- 1.12: the timer sends the /who
+          whoTimer = Pace(GuildRecruiter_Settings.whoDelay)
+        elseif not NextQuery(true) then
+          -- key-press mode, band fully swept: no /who is needed, so end the
+          -- sweep (or start the auto-rescan rest) without waiting for a press
+          FinishSweep()
+          whoTimer = Pace(GuildRecruiter_Settings.whoDelay)
+        end
+        -- key-press mode: otherwise the /who is due and waits for Next
       end
     end
   end
@@ -1376,7 +1537,11 @@ local function Start()
   RecomputeBand()
   lo, width, observedCap, whoRetries = myLo, START_WIDTH, 0, 0
   if GuildRecruiter_Settings.guildSync and IsInGuild() then Broadcast("HI") end
-  Print("Started ("..(MODE_LABEL[GuildRecruiter_Settings.mode] or "?")..") on levels "..myLo.."-"..myHi..". /gr stop to cancel.")
+  GuildRecruiter_dealt = nil
+  -- key-press mode: Start only ARMS the run; each /who and invite waits for Next
+  if not GuildRecruiter_Arm("Armed ("..(MODE_LABEL[GuildRecruiter_Settings.mode] or "?")..") on levels "..myLo.."-"..myHi..".") then
+    Print("Started ("..(MODE_LABEL[GuildRecruiter_Settings.mode] or "?")..") on levels "..myLo.."-"..myHi..". /gr stop to cancel.")
+  end
 end
 
 local function Stop()
@@ -1418,10 +1583,16 @@ function GuildRecruiter_SendToCandidates(blast)
   stats = { contacted=0, invited=0, whispered=0, guilded=0, scanned=0, queries=0, dropped=0, cooldown=0, collected=0 }
   for i = 1, #names do tinsert(contactQueue, names[i]) end
   if s.guildSync and IsInGuild() then Broadcast("HI") end
+  GuildRecruiter_dealt = nil
+  -- key-press mode: arm only; every click on Next sends ONE invite
   if blast then
-    Print("Inviting all "..#names.." candidate(s) as fast as the server allows (auto-backs-off if throttled). /gr stop to cancel.")
+    if not GuildRecruiter_Arm("Armed invite-all for "..#names.." candidate(s): one invite per click.") then
+      Print("Inviting all "..#names.." candidate(s) as fast as the server allows (auto-backs-off if throttled). /gr stop to cancel.")
+    end
   else
-    Print("Sending to "..#names.." collected candidate(s) ("..(MODE_LABEL[s.mode] or "?").."). /gr stop to cancel.")
+    if not GuildRecruiter_Arm("Armed send to "..#names.." collected candidate(s) ("..(MODE_LABEL[s.mode] or "?").."); invites go one per click.") then
+      Print("Sending to "..#names.." collected candidate(s) ("..(MODE_LABEL[s.mode] or "?").."). /gr stop to cancel.")
+    end
   end
 end
 
@@ -1444,15 +1615,16 @@ function GuildRecruiter_HeaderTick(m, elapsed)
   end
 end
 
-local function Pause()
-  if not running then Print("Not running.") return end
-  if paused then Print("Already paused. /gr resume to continue.") return end
+-- quiet = pause without the chat lines (the block report prints its own line)
+local function Pause(quiet)
+  if not running then if not quiet then Print("Not running.") end return end
+  if paused then if not quiet then Print("Already paused. /gr resume to continue.") end return end
   paused = true
   if GuildRecruiter_runKind == "scan" then
     SuppressWho(false)  -- let manual /who work normally while paused
     Broadcast("BYE")    -- yield my band to others while paused
   end
-  Print("Paused. "..#contactQueue.." left. /gr resume to continue.")
+  if not quiet then Print("Paused. "..#contactQueue.." left. /gr resume to continue.") end
 end
 
 local function Resume()
@@ -1470,6 +1642,169 @@ end
 
 -- GLOBAL so header / Lists play-pause buttons add no upvalues to their builders
 function GuildRecruiter_TogglePause() if paused then Resume() else Pause() end end
+
+-- ---------------------------------------------------------------------------
+-- Key-press mode (GR_Compat.RequiresHardwareEvent): the Next action
+-- ---------------------------------------------------------------------------
+-- The client marks C_FriendList.SendWho and C_GuildInfo.Invite #hwevent, so
+-- every /who and every invite must start from a key press or click. One press
+-- makes at most ONE restricted call, chosen in this order:
+--   1. the ready-to-invite list (whisper replies that passed the reply rule)
+--   2. the head of the contact queue, unless its contact is a plain whisper
+--      (those still go out on the timer: GuildRecruiter_TimerMay)
+--   3. the next /who of the sweep
+-- The pacing settings are minimum gaps: a press that comes too early only says
+-- how long to wait. Entry point GuildRecruiter_Next(): Bindings.xml, the Next
+-- buttons and /gr next, all key/click handlers; the restricted call runs in
+-- the same call stack (GR_Compat.Press -> pcall, which is synchronous).
+
+-- the client reported a blocked call naming this addon (GR_Compat.BlockedLine)
+function GuildRecruiter_PauseBlocked(line)
+  if running and not paused then
+    Pause(true)
+    line = line.." -- run paused (/gr resume to try again, /gr stop to end)."
+  end
+  Print(line)
+end
+
+-- What the next press would do, without doing it (the press, the buttons and
+-- /gr status all ask this, so they always agree):
+--   action  "reply" | "contact" | "who", or nil when a press can do nothing now
+--   wait    seconds until that press may fire (0 = now)
+--   info    what it would do / why not, for chat
+--   short   the same for the button
+function GuildRecruiter_NextStep()
+  if not running then return nil, 0, "not armed -- /gr start first", "Not armed" end
+  if paused then return nil, 0, "paused -- /gr resume first", "Paused" end
+  -- contacts held (combat / instance / throttle) don't stop the /who: as in
+  -- 1.12, only the server-throttle backoff holds the sweep
+  local blocked = SendsBlocked()
+  local held = nil
+  local cwait = (inviteTimer > 0) and inviteTimer or 0
+  if #replyQueue > 0 then
+    if not blocked then return "reply", cwait, "invite "..replyQueue[1].." (replied)", "Invite "..replyQueue[1] end
+    held = "invites held: "..blocked
+  elseif #contactQueue > 0 then
+    if CapReached() then return nil, 0, "session cap reached", "Cap reached" end
+    local name, v = GuildRecruiter_DealHead()
+    if not GuildRecruiter_TimerMay(v) then
+      if not blocked then
+        local verb = (GuildRecruiter_runKind ~= "blast" and GuildRecruiter_CfgOf(v).mode ~= "invite") and "Whisper" or "Invite"
+        return "contact", cwait, string.lower(verb).." "..name, verb.." "..name
+      end
+      held = "contacts held: "..blocked
+    end
+  end
+  if held and not scanning then return nil, 0, held, "Held: "..blocked end
+  if scanning then
+    local rest = GuildRecruiter_rescanWait or 0
+    if rest > 0 then return "who", rest, "auto-rescan rest", "Rescan" end
+    if awaiting then return "who", (whoTimeout > 0) and whoTimeout or 0, "waiting for the /who reply", "Waiting for /who" end
+    if not NextQuery(true) then return nil, 0, held or "sweep finished", held and ("Held: "..blocked) or "Sweep done" end
+    local wait = backoffUntil - GetTime()
+    if wait < 0 then wait = 0 end
+    if whoTimer > 0 then wait = wait + whoTimer end
+    return "who", wait, "next /who", "/who"
+  end
+  if #contactQueue > 0 then return nil, 0, #contactQueue.." whisper(s) going out by themselves", "Whispering" end
+  return nil, 0, "waiting for whisper replies", "Waiting"
+end
+
+-- the Next button's text, e.g. "/who ready in 2s [3]" ([n] = ready to invite)
+function GuildRecruiter_NextLabel()
+  local act, wait, _, short = GuildRecruiter_NextStep()
+  local secs = math.ceil(wait or 0)
+  local text = short
+  if act == "who" then
+    if awaiting then text = "Waiting for /who"
+    elseif (GuildRecruiter_rescanWait or 0) > 0 then text = "Rescan in "..secs.."s"
+    elseif secs > 0 then text = "/who ready in "..secs.."s"
+    else text = "Next: send /who" end
+  elseif act and secs > 0 then
+    text = (string.match(short, "^%S+") or "Next").." ready in "..secs.."s"
+  end
+  if #replyQueue > 0 then text = text.." ["..#replyQueue.."]" end
+  return text
+end
+
+-- runs INSIDE the hardware event (via GR_Compat.Press): at most one restricted call
+function GuildRecruiter_NextPress()
+  local act, wait, info = GuildRecruiter_NextStep()
+  if not act then Print("Next: "..info..".") return end
+  if wait > 0 then Print("Next: wait "..math.ceil(wait).."s ("..info..").") return end
+  if act == "reply" then
+    GuildRecruiter_InviteReply()            -- C_GuildInfo.Invite
+  elseif act == "contact" then
+    GuildRecruiter_ContactHead()            -- C_GuildInfo.Invite, or the whisperinvite whisper
+  else
+    SendNextWho()                           -- C_FriendList.SendWho
+    whoTimer = Pace(GuildRecruiter_Settings.whoDelay)
+  end
+end
+
+-- THE entry point for a key press or click (Bindings.xml, Next buttons, /gr next)
+function GuildRecruiter_Next()
+  if not GR_Compat.RequiresHardwareEvent then
+    Print("Next isn't needed on this client: the run sends /who and invites by itself (/gr start).")
+    return
+  end
+  local ok, err = GR_Compat.Press(GuildRecruiter_NextPress)
+  if not ok then Abort(err) end
+end
+
+-- how to press Next, for chat
+function GuildRecruiter_PressHint()
+  local k = GR_Compat.BindingKey("GUILDRECRUITER_NEXT")
+  if k then return "press "..k..", click Next (under the minimap button) or type /gr next" end
+  return "click Next (under the minimap button) or type /gr next; bind a key under Key Bindings > Guild Rawcruiter"
+end
+
+-- key-press mode: announce the armed run and show the Next button. Returns
+-- false on a timer-loop client, so the caller prints its 1.12 line instead.
+function GuildRecruiter_Arm(text)
+  if not GR_Compat.RequiresHardwareEvent then return false end
+  Print(text.." Each /who and invite waits for you: "..GuildRecruiter_PressHint()..". /gr stop to cancel.")
+  GuildRecruiter_ShowNext()
+  return true
+end
+
+function GuildRecruiter_NextTip(btn)
+  local _, _, info = GuildRecruiter_NextStep()
+  GameTooltip:SetOwner(btn, "ANCHOR_BOTTOMLEFT")
+  GameTooltip:AddLine("Guild Rawcruiter: Next")
+  GameTooltip:AddLine("Next: "..info, 1, 1, 1, 1)
+  if #replyQueue > 0 then GameTooltip:AddLine(#replyQueue.." replied -- ready to invite", 0.3, 1, 0.3) end
+  GameTooltip:AddLine("One /who or one invite per press: this client needs a key press or click for each.", 0.7, 0.7, 0.7, 1)
+  local k = GR_Compat.BindingKey("GUILDRECRUITER_NEXT")
+  GameTooltip:AddLine(k and ("Key: "..k.."  (or /gr next)") or "No key bound: Key Bindings > Guild Rawcruiter (or /gr next)", 0.6, 0.8, 1, 1)
+  GameTooltip:Show()
+end
+
+-- the floating Next button under the minimap button; hides itself when the run ends
+function GuildRecruiter_ShowNext()
+  if not GR_Compat.RequiresHardwareEvent then return end
+  local b = GuildRecruiterNextButton
+  if not b then
+    b = CreateFrame("Button", "GuildRecruiterNextButton", UIParent, "UIPanelButtonTemplate")
+    b:SetWidth(170); b:SetHeight(22); b:SetFrameStrata("MEDIUM")
+    if GuildRecruiterMinimapButton then b:SetPoint("TOP", GuildRecruiterMinimapButton, "BOTTOM", 0, -2)
+    else b:SetPoint("TOP", UIParent, "TOP", 0, -120) end
+    b:SetScript("OnClick", function() GuildRecruiter_Next() end)   -- the click IS the hardware event
+    b:SetScript("OnEnter", function(self) GuildRecruiter_NextTip(self) end)
+    b:SetScript("OnLeave", function() GameTooltip:Hide() end)
+    b.tick = 0
+    b:SetScript("OnUpdate", function(self, elapsed)
+      self.tick = self.tick - (elapsed or 0)
+      if self.tick > 0 then return end
+      self.tick = 0.2
+      if not running then self:Hide(); return end
+      local ok, text = pcall(GuildRecruiter_NextLabel)   -- label only; never sends anything
+      self:SetText(ok and text or "Next")
+    end)
+  end
+  b:SetText(GuildRecruiter_NextLabel())
+  b:Show()
+end
 
 -- ---------------------------------------------------------------------------
 -- List window: view/edit the contact queue, blacklist, and invite history
@@ -1532,7 +1867,10 @@ function GuildRecruiter_InviteOne(name)
   if not name then return end
   if not IsInGuild() then Print("You're not in a guild.") return end
   if running then Print("A run is active -- stop it first to invite individually.") return end
-  DoGuildInvite(name)
+  -- RESTRICTED: reached only from a list-row click or a typed /gr invite, both
+  -- hardware events; GR_Compat.Press marks it so the invite gate lets it through
+  local ok, err = GR_Compat.Press(DoGuildInvite, name)
+  if not ok then error(err, 0) end
   if not GuildRecruiter_Settings.history then GuildRecruiter_Settings.history = {} end
   GuildRecruiter_Settings.history[name] = { t = time(), p = GuildRecruiter_Settings.activeProfile }
   if GuildRecruiter_Settings.candidates then GuildRecruiter_Settings.candidates[name] = nil end
@@ -1541,7 +1879,7 @@ function GuildRecruiter_InviteOne(name)
 end
 
 function GuildRecruiter_ListControls(fr)
-  if not fr or not fr.inviteBtn then return end
+  if not fr or not fr.inviteBtn or not fr.lnextBtn then return end
   if running then
     fr.inviteBtn:Hide(); fr.sendBtn:Hide()
     fr.lpauseBtn:Show(); fr.lstopBtn:Show()
@@ -1549,9 +1887,17 @@ function GuildRecruiter_ListControls(fr)
     local total = GuildRecruiter_runTotal or 0
     local verb = (GuildRecruiter_runKind == "blast" or GuildRecruiter_runKind == "send") and "Inviting" or "Working"
     local prog = (total > 0) and (stats.contacted.." of "..total) or (stats.contacted.." sent")
+    -- key-press mode: one invite per click on this strip's Next button
+    local left = #contactQueue + #replyQueue
+    if GR_Compat.RequiresHardwareEvent then
+      fr.lnextBtn:SetText("Next ("..left..")"); fr.lnextBtn:Show()
+      if not paused and left > 0 then prog = prog.." -- "..left.." left, click Next" end
+    else
+      fr.lnextBtn:Hide()
+    end
     fr.hint:SetText((paused and "|cffffcc00Paused|r -- " or ("|cff40ff40"..verb.."|r  "))..prog)
   else
-    fr.lpauseBtn:Hide(); fr.lstopBtn:Hide()
+    fr.lpauseBtn:Hide(); fr.lstopBtn:Hide(); fr.lnextBtn:Hide()
     fr.inviteBtn:Show(); fr.sendBtn:Show()
     local cc = CountTable(GuildRecruiter_Settings.candidates or {})
     fr.inviteBtn:SetText("Invite all ("..cc..")")
@@ -1642,7 +1988,9 @@ local function BuildListsPanel(parent)
   fr.inviteBtn:SetScript("OnClick", function()
     local cnt = CountTable(GuildRecruiter_Settings.candidates)
     if cnt == 0 then Print("No collected candidates yet. Turn on Collect (Settings) and scan.") return end
-    GuildRecruiter_Confirm("Invite all "..cnt.." collected candidate(s) now? Guild invites go out as fast as the server allows.",
+    GuildRecruiter_Confirm(GR_Compat.RequiresHardwareEvent
+      and ("Invite all "..cnt.." collected candidate(s)? This client needs a click per invite: each click on Next sends one.")
+      or ("Invite all "..cnt.." collected candidate(s) now? Guild invites go out as fast as the server allows."),
       function() GuildRecruiter_SendToCandidates(true) end)
   end)
   fr.sendBtn = CreateFrame("Button", nil, fr, "UIPanelButtonTemplate")
@@ -1662,6 +2010,13 @@ local function BuildListsPanel(parent)
   fr.lstopBtn:SetPoint("RIGHT", fr.lpauseBtn, "LEFT", -8, 0); fr.lstopBtn:SetWidth(70); fr.lstopBtn:SetHeight(22); fr.lstopBtn:SetText("|cffff6060Stop|r")
   fr.lstopBtn:SetScript("OnClick", function() GuildRecruiter_StopRun() end)
   fr.lstopBtn:Hide()
+  -- key-press mode: Next (one /who or invite per click), left of Stop
+  fr.lnextBtn = CreateFrame("Button", nil, fr, "UIPanelButtonTemplate")
+  fr.lnextBtn:SetPoint("RIGHT", fr.lstopBtn, "LEFT", -8, 0); fr.lnextBtn:SetWidth(80); fr.lnextBtn:SetHeight(22); fr.lnextBtn:SetText("Next")
+  fr.lnextBtn:SetScript("OnClick", function() GuildRecruiter_Next() end)   -- the click IS the hardware event
+  fr.lnextBtn:SetScript("OnEnter", function(self) GuildRecruiter_NextTip(self) end)
+  fr.lnextBtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
+  fr.lnextBtn:Hide()
   -- keep the run strip / launch buttons live while this tab is shown
   fr.ltick = 0
   fr:SetScript("OnUpdate", function(self, elapsed)
@@ -2674,9 +3029,11 @@ function GuildRecruiter_MinimapTip(btn)
     GameTooltip:AddLine(StatusLine(), 1, 1, 1)
   end
   GameTooltip:AddLine("Auto-rescan: "..(s.autoScan and ("on -- every "..(s.autoScanDelay or 60).."s") or "off"), 0.6, 0.8, 1)
+  local hw = GR_Compat.RequiresHardwareEvent
+  if hw and running then GameTooltip:AddLine("Next: "..GuildRecruiter_NextLabel(), 1, 0.82, 0) end
   GameTooltip:AddLine(" ")
   GameTooltip:AddLine("Left-click: settings", 1, 1, 1)
-  GameTooltip:AddLine("Right-click: "..(running and "stop" or "start"), 1, 1, 1)
+  GameTooltip:AddLine("Right-click: "..(running and "stop" or (hw and "arm (then press Next per /who or invite)" or "start")), 1, 1, 1)
   GameTooltip:Show()
 end
 
@@ -2749,6 +3106,7 @@ local function HistoryCount() return CountTable(GuildRecruiter_Settings.history)
 local function Status()
   if running then
     Print((paused and "Paused" or "Running").." -- "..StatusLine())
+    if GR_Compat.RequiresHardwareEvent then Print("Next: "..GuildRecruiter_NextLabel().."  ("..GuildRecruiter_PressHint()..")") end
   else
     Print("Idle. Last run: contacted "..stats.contacted.." ("..stats.invited.." inv, "..stats.whispered.." wsp), guilded-skipped "..stats.guilded..".")
   end
@@ -2767,6 +3125,7 @@ SlashCmdList["GUILDRECRUITER"] = function(msg)
   elseif cmd == "stop" then Stop()
   elseif cmd == "pause" then Pause()
   elseif cmd == "resume" then Resume()
+  elseif cmd == "next" then GuildRecruiter_Next()   -- typed: the Enter key press is the hardware event
   elseif cmd == "status" then Status()
   elseif cmd == "collect" then
     if larg == "on" or larg == "off" then GuildRecruiter_Settings.collectOnly = (larg == "on"); RefreshConfig() end
@@ -2954,6 +3313,7 @@ SlashCmdList["GUILDRECRUITER"] = function(msg)
   else
     Print("|cff33ff99Guild Rawcruiter v"..VERSION.."|r  --  /gr config, /gr list, /gr stats")
     Print("start | stop | pause | resume | status | reset | forget | hide")
+    if GR_Compat.RequiresHardwareEvent then Print("next -- send the next /who or invite (this client needs one key press each; bind a key under Key Bindings > Guild Rawcruiter)") end
     Print("autoscan on|off (loop scanning) | autoscan <seconds> (rest between cycles)")
     Print("collect on|off (scan into a list) | inviteall (fast) | send (paced) | invite <name> | candidates | clearlist")
     Print("set invite/who/reinvite/cap/min/max/method/mode <v> | msg <text> | class <list|all>")

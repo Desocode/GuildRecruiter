@@ -2,10 +2,15 @@
 
 Version `4.0.0-forever.1`, branch `forever`, based on `1023a66` (the v3.22 source
 plus REQUIREMENTS.md). Status: **ported and checked offline only. Not run on a
-Forever client.** Nothing has been committed.
+Forever client.** The port is committed locally as `e824243`. The key-press
+mode (§1.9) sits on top of it and is **not committed**.
 
-`git diff --numstat`: GuildRecruiter.lua +526 / -252, GuildRecruiter.toc +3 / -3,
-README.txt +42 / -0. All files are still LF with no CR bytes.
+Port (`e824243` vs `1023a66`, `git diff --numstat`): GuildRecruiter.lua +526 / -252,
+GuildRecruiter.toc +3 / -3, README.txt +42 / -0.
+Key-press mode (working tree vs `e824243`): GuildRecruiter.lua +453 / -93,
+README.txt +44 / -7, PORT_NOTES.md, and a new Bindings.xml (9 lines). The .toc is
+unchanged: the client loads Bindings.xml by itself. All files are LF with no CR
+bytes, and GuildRecruiter.lua is still pure ASCII.
 
 Line counts below are lines of the 1.12 source (HEAD), counted with a tokenizer, so
 words in comments and strings are not counted.
@@ -114,6 +119,106 @@ When neither the modern nor the old API exists, the function raises an `error()`
 - A missing core API gives a named error instead of "attempt to call a nil value".
 - Pacing, defaults, saved-variable names, slash commands, the sweep algorithm, the A/B logic and the message formats are unchanged.
 
+### 1.9 Key-press mode: one /who or one invite per hardware event
+
+The wiki marks `C_FriendList.SendWho` and `C_GuildInfo.Invite` `#hwevent`, and the
+community Forever recruiters (Olympus Forever Guild Recruiter, ForeverRecruiter,
+Fast Guild Invite, GRIP) all send one /who or one invite per key press or click.
+The 1.12 run loop sent both from the OnUpdate timer, so it now waits for a press.
+
+**The switch.** `GR_Compat.RequiresHardwareEvent`, set once at load by feature
+detection: `true` when `C_FriendList and C_FriendList.SendWho` exists. When it is
+`false` (a client with only the old globals) every code path below is the 1.12
+one, step for step. This was not too invasive: the 1.12 branches are the old
+code moved into functions, and the new branches sit next to them.
+
+**What a press does** (`GuildRecruiter_NextStep` decides, `GuildRecruiter_NextPress` acts):
+at most one restricted call, in this order:
+1. the ready-to-invite list (`replyQueue`: whisper replies that passed the reply
+   rule) -> `C_GuildInfo.Invite`;
+2. the head of the contact queue, if its contact is not a plain whisper ->
+   `C_GuildInfo.Invite` (invite mode, Invite all), or the first whisper of
+   whisper-then-invite mode;
+3. otherwise the next /who of the sweep -> `C_FriendList.SendWho`.
+
+If the step's gap has not run out yet (invite delay or /who delay, each with
+jitter if on; server-throttle backoff; the /who reply still awaited), the press
+fires nothing and chat says `Next: wait Ns (...)`. Contacts held by combat or an
+instance do not hold the /who, as in 1.12, where only the throttle backoff held
+the sweep.
+
+**Entry points** (all key or click handlers, all calling `GuildRecruiter_Next()`):
+- the key binding `GUILDRECRUITER_NEXT` in **Bindings.xml** (header
+  `GUILDRECRUITER`; labels from the globals `BINDING_HEADER_GUILDRECRUITER` =
+  "Guild Rawcruiter" and `BINDING_NAME_GUILDRECRUITER_NEXT` = "Next: send one /who
+  or one invite", set in GuildRecruiter.lua). No default key; fires on key down;
+- the floating **Next** button (`GuildRecruiterNextButton`), anchored under the
+  minimap button, shown while a run is armed; it hides itself when the run ends;
+- a **Next (N)** button on the Lists-tab run strip, left of Stop;
+- `/gr next` (typed, or from a macro).
+
+`GuildRecruiter_Next` -> `GR_Compat.Press(GuildRecruiter_NextPress)` -> `pcall` ->
+the restricted call. Everything runs in the same call stack: no `C_Timer`, no
+OnUpdate hop, no coroutine. `pcall` is a synchronous call. It is there so that an
+error still ends in "Stopped on error" and the press flag is always cleared.
+
+**What the timer still does:** /who timeout and retry (`WHO_TIMEOUT`,
+`WHO_RETRIES`), reading /who results, judging whisper replies, auto-backoff,
+whispers in `whisper` mode (`GR_Compat.TimerContactModes = { whisper = true }`),
+the session cap, the auto-rescan rest, ending a swept band (`FinishSweep`, which
+sends no /who), and ending the run. It never calls SendWho or an invite.
+
+**Gate.** `GR_Compat.SendWho` and `GR_Compat.GuildInvite` (every invite method,
+including `/ginvite` typed from code) call `GR_Compat.CheckPress(label)` first.
+In key-press mode, reaching them outside a `GR_Compat.Press` raises an error, so
+the run stops with "Stopped on error: C_FriendList.SendWho needs a key press or
+click ... reached from a timer or event". That replaces a silent client block.
+`GuildRecruiter_InviteOne` (left-click on a candidate, `/gr invite <name>`)
+wraps its single invite in `GR_Compat.Press` too.
+
+**Detect and degrade.** `GR_Compat.WatchBlocked(f)` registers
+`ADDON_ACTION_BLOCKED` and `ADDON_ACTION_FORBIDDEN` (under `pcall`). When one names
+this addon (`GR_Compat.BlockedLine`, payload `(addonName, function)`), the run
+pauses quietly and prints one line, e.g. `The client blocked C_FriendList.SendWho()
+(ADDON_ACTION_BLOCKED); our last restricted call was C_FriendList.SendWho 0.0s ago
+-- run paused (/gr resume to try again, /gr stop to end).` The same applies on
+a timer-loop client.
+
+**Behaviour the player will notice (key-press mode only):**
+- `/gr start` (and minimap right-click) says "Armed (...)" and how to press Next;
+  it sends nothing.
+- A yes-reply prints "<name> replied -- ready to invite (N waiting). Press Next."
+  It is never invited from the CHAT_MSG_WHISPER handler. The button shows `[N]`.
+- The button text shows the next step and its gap: "Next: send /who",
+  "/who ready in 2s", "Invite Bob", "Whisper ready in 1s", "Waiting for /who",
+  "Rescan in 40s", "Held: in combat".
+- Contacts made by a press end with " -- N queued" / " -- N more ready to invite".
+  On Invite all / Send they end with " -- N left, click again" / " -- that was the last one".
+- Lists tab: the Invite-all confirm text says each click on Next sends one invite.
+- Auto-rescan: each new sweep prints "sweep N ... is ready -- press Next to start it".
+- `/gr status` adds a "Next: ..." line; `/gr help` lists `next`; the load line ends
+  with "Key-press mode: ...". The minimap tooltip shows the next step.
+- In `whisperinvite` mode every first whisper costs a press (the design said the
+  timer may whisper in `whisper` mode). To let the timer send those as well, add
+  `whisperinvite = true` to `GR_Compat.TimerContactModes`. The reply invite still
+  needs a press either way.
+
+**Small internal changes that also touch the timer-loop path, same behaviour:**
+- `Contact(name, v)` now takes the A/B variant. `GuildRecruiter_DealHead` deals it
+  once per queue head and remembers it, so the button can say "Invite" or
+  "Whisper" before the press. On the timer path it deals at contact time, as
+  `PickVariant` inside `Contact` did. Invite all still deals nothing. In key-press
+  mode the deal happens when a name reaches the head of the queue, so an A/B edit
+  made while that name waits there does not change its deal.
+- `SendNextWho` is split into `FinishSweep` (band done, no /who) and the send.
+  `NextQuery(peek)` can answer "is a slice left?" without moving the cursor.
+- `SendsBlocked()` returns the reason string ("in combat", ...) instead of `true`.
+- `Pause(quiet)`: the quiet form is used only by the block report.
+- `GR_Compat.GuildInvite` resolves the call through `GR_Compat.ResolveInvite`
+  (the same fallback order as before), so the gate can name it.
+- An error inside `/gr invite` / candidate left-click is re-raised after the press
+  flag is cleared.
+
 ## 2. Still unverified
 
 There was no game client and no Lua interpreter. Everything below is untested.
@@ -123,9 +228,9 @@ They do not say a restriction applies per flavour.
 
 | # | Blocker (REQUIREMENTS §3) | Isolated in | What the wiki says / what is still open |
 |---|---|---|---|
-| 1 | Do SendWho / C_FriendList.SendWho, GetNumWhoResults / GetWhoInfo and SetWhoToUI exist, and what are their throttle and hardware-event rules? | `GR_Compat.SendWho`, `GR_Compat.GetNumWhoResults`, `GR_Compat.GetWhoRow`, `GR_Compat.SetWhoToUI` (+ `GR_Compat.WhoPanel`) | All four `C_FriendList` calls are listed for Forever 1.60.1. **SendWho is marked `#hwevent` (needs a key or mouse press, since 8.2.5)** and is throttled server-side ("queries are not guaranteed to generate a response"). The origin argument was added in 10.2.0; the code passes `Enum.SocialWhoOrigin.Social` (1), which is my choice and unverified. The wiki says GetNumWhoResults "never seem[s] to go over 50". SetWhoToUi(true) sends every reply to WHO_LIST_UPDATE and FriendsFrame. Whether FriendsFrame is the frame that registers WHO_LIST_UPDATE on Forever (needed for Who-window suppression) is unknown. |
-| 2 | Are GuildInvite / GuildInviteByName / C_GuildInfo.Invite callable from addon code, and do they need a hardware event? | `GR_Compat.GuildInvite`, `GR_Compat.CanGuildInvite`, `GR_Compat.RunSlash` (method "chat"), `GR_Compat.InviteApiName` | `C_GuildInfo.Invite(name)` is listed for Forever 1.60.1 and **marked `#hwevent`**. Whether `CanGuildInvite` still exists on Forever is unknown (the call is feature-detected; if it's missing, invites are allowed, as in 1.12). |
-| 3 | Is a WHISPER via SendChatMessage / C_ChatInfo.SendChatMessage unrestricted for addon code? | `GR_Compat.SendWhisper` | The wiki marks only SAY, YELL and CHANNEL as hardware-event; WHISPER is not. The global `SendChatMessage` was deprecated in 11.2.0, and the 11.2.0 change list shows it as removed. `C_ChatInfo.SendChatMessage` is listed for Forever. The Forever 1.60.1 changes add a hardware-event requirement for EMOTE only (not used here). Behaviour under "chat messaging lockdown" (encounters, challenge mode, PvP) is unknown; the default "pause in instances" setting avoids most of it. |
+| 1 | Do SendWho / C_FriendList.SendWho, GetNumWhoResults / GetWhoInfo and SetWhoToUI exist, and what are their throttle and hardware-event rules? | `GR_Compat.SendWho` (gated by `GR_Compat.CheckPress`), `GR_Compat.GetNumWhoResults`, `GR_Compat.GetWhoRow`, `GR_Compat.SetWhoToUI` (+ `GR_Compat.WhoPanel`); mode switch `GR_Compat.RequiresHardwareEvent` | All four `C_FriendList` calls are listed for Forever 1.60.1. **SendWho is marked `#hwevent` (needs a key or mouse press, since 8.2.5)** and is throttled server-side ("queries are not guaranteed to generate a response"). **Handled by key-press mode (§1.9): one /who per press.** Still open: whether Forever actually enforces `#hwevent` here, and what a violation does (the wiki page doesn't say whether it errors, fails silently or fires ADDON_ACTION_BLOCKED; a silent drop would show up as a /who timeout and retry). The origin argument was added in 10.2.0; the code passes `Enum.SocialWhoOrigin.Social` (1), which is my choice and unverified. The wiki says GetNumWhoResults "never seem[s] to go over 50". SetWhoToUi(true) sends every reply to WHO_LIST_UPDATE and FriendsFrame. Whether FriendsFrame is the frame that registers WHO_LIST_UPDATE on Forever (needed for Who-window suppression) is unknown. |
+| 2 | Are GuildInvite / GuildInviteByName / C_GuildInfo.Invite callable from addon code, and do they need a hardware event? | `GR_Compat.GuildInvite` (gated by `GR_Compat.CheckPress`), `GR_Compat.ResolveInvite`, `GR_Compat.CanGuildInvite`, `GR_Compat.RunSlash` (method "chat"), `GR_Compat.InviteApiName` | `C_GuildInfo.Invite(name)` is listed for Forever 1.60.1 and **marked `#hwevent`**. **Handled by key-press mode (§1.9): one invite per press, including reply invites, Invite all and Send.** Still open: whether a key binding, a typed `/gr next` and a plain `UIPanelButtonTemplate` click all count as the hardware event (they do on Mainline as far as I know, and the community recruiters work per key press, but I have not seen it on Forever). Also open: whether the "chat" method (`/ginvite` sent from code) works at all. Whether `CanGuildInvite` still exists on Forever is unknown (the call is feature-detected; if it's missing, invites are allowed, as in 1.12). |
+| 3 | Is a WHISPER via SendChatMessage / C_ChatInfo.SendChatMessage unrestricted for addon code? | `GR_Compat.SendWhisper` | The wiki marks only SAY, YELL and CHANNEL as hardware-event; WHISPER is not. The global `SendChatMessage` was deprecated in 11.2.0, and the 11.2.0 change list shows it as removed. `C_ChatInfo.SendChatMessage` is listed for Forever. The Forever 1.60.1 changes add a hardware-event requirement for EMOTE only (not used here). Behaviour under "chat messaging lockdown" (encounters, challenge mode, PvP) is unknown; the default "pause in instances" setting avoids most of it. Key-press mode relies on this row: `whisper`-mode contacts still go out from the timer (`GR_Compat.TimerContactModes`). If WHISPER turns out to need a press too, set that table to `{}` and every contact will wait for Next. |
 | 4 | Are /who result fields secret values? | `GR_Compat.IsSecret`, `GR_Compat.GetWhoRow`, `GR_Compat.GetNumWhoResults` (also used by the guards in `GR_OnEvent` and `OnAddonMessage`, and by `GR_Compat.FilterSystemChat` and `GR_Compat.IsWhoNoise`) | The Secret_Values page does not mention /who or guild data. UnitName is secret only for non-player units in combat. Chat events can carry secrets while SecretInChatMessagingLockdown is active. The 1.60.1 notes say Midnight's addon restrictions, including secrets, apply on Forever. If /who levels did come back secret, every reply would look "foreign" (0 rows in band), and the sweep would run on timeouts and retries, finding nobody. |
 | 5 | Do `string.gfind`, `table.getn`, `getglobal`/`setglobal` and `SetBackdrop` exist? | **No longer needed:** the port uses only Lua 5.1 natives (`#`, `string.gmatch`, `_G`, `pairs`, `select`). SetBackdrop goes through `GR_Compat.BackdropFrame` / `SetBackdrop` / `SetBackdropColor` | Still open: whether Forever's "modified Lua 5.1" keeps the standard 5.1 core. The fan sources list only `goto`, `//`, bitwise operators and `_ENV` as banned. The same question applies to the deprecated templates (`GR_Compat.TemplateFrame`, `GR_Compat.FauxScroll*`) and to `SetColorTexture` (`GR_Compat.ColorTexture`). |
 | 6 | What exact chat strings does the Forever server send for guild join/decline, throttling and who results (CHAT_MSG_SYSTEM)? | `GR_Compat.IsThrottleMsg`, `GR_Compat.IsWhoNoise`. Join/decline stays where it was (`ToPattern`, `JOIN_PAT`/`DECLINE_PAT`), because it is already built from the client's own `ERR_GUILD_JOIN_S` / `ERR_GUILD_DECLINE_S` strings with an enUS fallback. | Nothing found on the wiki. Unknown: the wording of Forever's throttle message, and whether names in system messages are hyperlinked (`|Hplayer:...|h`) or plain. |
@@ -149,11 +254,45 @@ The addon's own load line then shows which invite, /who and whisper calls GR_Com
 - **Addon messages:** per the wiki, Forever trial and Veteran accounts cannot send addon messages, so guild sync fails silently for them. The per-prefix throttle is 10 messages, refilling at 1 per second. The result code is ignored, as before.
 - **Game data left unchanged** (per "no behaviour change"): the hard-coded class lists per faction (`FactionLists`: no Horde paladins, no Alliance shamans) and the 1-60 level range. These are vanilla values; if Forever differs, they need updating.
 - **Defaults:** the code's default contact mode is `invite`, but REQUIREMENTS N5 asks for `whisper` on first run. Left unchanged because the task said not to change defaults; this needs a decision.
-- `METHOD_SHORT` (line 65) still says "GuildInviteByName"/"GuildInvite". These are labels in a table nothing reads, so I left them.
+- `METHOD_SHORT` still says "GuildInviteByName"/"GuildInvite". These are labels in a table nothing reads, so I left them.
+
+### 2.2 Key-press mode: unverified (no client)
+
+- **Hardware context through `pcall`:** I assume the client's "this script runs for
+  a hardware event" state covers the whole synchronous call, including the
+  `pcall` inside `GR_Compat.Press`. That is how Mainline works as far as I know.
+  If it is wrong, every press is blocked; the block report (or a /who timeout)
+  would show it at once.
+- **Typed slash commands** (`/gr next`, `/gr invite`) run inside the Enter-key
+  press. Same assumption.
+- **ADDON_ACTION_BLOCKED / _FORBIDDEN:** the payload is `(addonName, function)`
+  and both are synchronous (wiki; both are listed for Forever 1.60.1). It is
+  unknown whether a `#hwevent` violation fires either of them, and in what
+  format the `function` string comes (the example line in §1.9 is illustrative).
+  The handler compares the first argument with the addon's folder name.
+- **Bindings.xml:** the wiki documents `name`, `header`, `runOnUp` and `default`
+  (no `category`). Where the entry shows up in Forever's Key Bindings window
+  (an "AddOns" group or a "Guild Rawcruiter" header) is unverified. No default
+  key is set, so nothing collides.
+- **`GetBindingKey`** (shows the bound key in chat and tooltips) is
+  feature-detected; without it the hints just leave the key out.
+- **Floating button position:** anchored under the minimap button, wherever the
+  player dragged it. On some minimap layouts it may overlap other UI.
+- **Taint:** the Next button, the binding and `/gr next` are plain addon code
+  calling non-protected `#hwevent` APIs. That needs no secure template on Mainline.
+  If Forever made these calls protected instead, they would be blocked even with
+  a press (shown by the block report).
+- **Server throttle per press:** the community tools pace by hand, so the
+  server's real minimum gap between /who queries is unknown. The /who delay
+  default (3 s) is unchanged.
+- **Lua 5.0 / real 1.12 clients:** the file is Lua 5.1 (`#`, `...` in the main
+  chunk), so it cannot load on a 1.12 Lua 5.0 client at all. The timer-loop path
+  (`RequiresHardwareEvent == false`) is for clients that run Lua 5.1 but lack
+  `C_FriendList.SendWho`. The 1.12 build itself stays on `main`.
 
 ## 3. What could not be ported safely
 
-1. **The automatic /who sweep and the automatic invites need hardware events (blockers 1 and 2).** If Forever enforces the wiki's `#hwevent` flags, then every `GR_Compat.SendWho` and `GR_Compat.GuildInvite` call made from the OnUpdate loop will be blocked: no Lua error, and the "Interface action failed because of an AddOn" counter goes up (fails N1). That covers the F4 sweep, invite mode, whisper-then-invite reply invites, and "Invite all" / "Send". Invites made inside a click or typed command should still work: Lists-tab left-click on a candidate, and `/gr invite <name>`. Whisper sending is not hardware-event restricted, but it gets its names from the sweep. Making this work means one /who or one invite per key press or click, which changes the recruiting behaviour. That is out of scope, so it is not done. A cheap follow-up would be to stop the run on `ADDON_ACTION_BLOCKED` for this addon instead of retrying forever; that is new behaviour, so also not done.
+1. **The automatic /who sweep and the automatic invites need hardware events (blockers 1 and 2). Addressed by key-press mode (§1.9).** The run now waits for a Next press for every /who and every invite: the F4 sweep, invite mode, reply invites, and Invite all / Send. Block reports pause the run. What it costs the player: one press per /who and per invite instead of an unattended run. In `whisper` mode only the /who needs a press. In `whisperinvite` mode the first whisper needs one too (see the end of §1.9). Not verified in game (§2.2).
 2. **The "chat" invite method** (`/ginvite` through `ChatEdit_SendText`) runs a slash command from addon code. It falls under the same hardware-event rule as C_GuildInfo.Invite and may taint the chat edit box.
 3. **The `ChatFrame_OnEvent` fallback** (used only if the message-filter API is missing) replaces a Blizzard global, which taints the chat frames on Mainline.
 
@@ -167,6 +306,50 @@ The addon's own load line then shows which invite, /who and whisper calls GR_Com
 - **Handler parameters:** any handler that used `self`, `button` or `elapsed` without declaring it would show up as a global read; none do. A negative test confirmed the checker reports exactly that case.
 - `file` says ASCII text (LF) for all edited files before and after, with 0 CR bytes.
 
+### 4.1 Key-press mode checks (same tools, plus a call graph)
+
+- **Parser, `e824243` to the working tree:** syntax OK to syntax OK (227 to 256
+  functions). Max upvalues 30 to 31: the slash handler, which now also reads
+  GR_Compat. Start stays at 30, GR_OnUpdate goes 25 to 27, GR_OnEvent stays at 20
+  (5.1 limit 60). Main-chunk locals 170 to 171 (`FinishSweep`; limit 200).
+  Generic-for over a non-call: 0.
+- **New global reads:** `GetBindingKey`, the frame names `GuildRecruiterMinimapButton`
+  and `GuildRecruiterNextButton` (made by `CreateFrame`), and the new
+  `GuildRecruiter_*` functions and `GuildRecruiter_dealt`. Every one of those is
+  also written in the file. The new global writes are those plus the two
+  `BINDING_*` labels.
+- **Call graph** (a script on the same parser, kept in the session scratchpad
+  and not committed). Its nodes are all functions; its edges are any reference to
+  a function, call or value. Its roots are the anonymous `SetScript` handlers
+  (8 OnUpdate, 1 OnEvent, 36 OnClick, ...) plus the two chat-filter callbacks. It
+  lists every path from an OnUpdate, OnEvent or chat-filter root to
+  `GR_Compat.SendWho` or `GR_Compat.GuildInvite`. There are 6 paths, all from the
+  run loop's OnUpdate. They cross exactly four call edges, and each edge is behind
+  a guard:
+  - `SendNextWho()` in GR_OnUpdate, inside `if not GR_Compat.RequiresHardwareEvent`;
+  - `GuildRecruiter_InviteReply()` in Drain, inside `#replyQueue > 0 and not hw`;
+  - `GuildRecruiter_ContactHead()` in Drain, inside `elseif not hw`;
+  - `GuildRecruiter_ContactHead()` in Drain, under `hw`, only if
+    `GuildRecruiter_TimerMay(v)`. That function is false for Invite all and true
+    only for mode `whisper` from the same `CfgOf(v)` that `Contact` reads, so
+    `Contact` takes its whisper branch.
+
+  No OnEvent or chat-filter root reaches either wrapper. The callers of the press
+  path are `GuildRecruiter_Next`, which is called from the two Next buttons'
+  OnClick, from `/gr next` and from Bindings.xml, and `GuildRecruiter_InviteOne`,
+  which is called from a candidate row's OnClick and from `/gr invite`. As a
+  negative test, I injected `GuildRecruiter_InviteReply(); SendNextWho()` into the
+  CHAT_MSG_WHISPER branch of a scratch copy. The script then reported the two new
+  OnEvent paths. The runtime gate (`GR_Compat.CheckPress`) backs up all four
+  guards.
+- **Bindings.xml:** it parses with `xml.etree` (root `Bindings`, one `Binding`
+  with `name="GUILDRECRUITER_NEXT" header="GUILDRECRUITER"`, body
+  `GuildRecruiter_Next()`). The name and header match the `BINDING_*` globals
+  and the `GetBindingKey("GUILDRECRUITER_NEXT")` calls. The file is not listed in
+  the .toc, per the wiki ("you should not list it"). The release workflow's
+  rsync excludes only `.git`, `.github`, `*.md` and `README*`, so Bindings.xml
+  ships in the zip.
+
 ### Wiki pages used (warcraft.wiki.gg, read 2026-11-04)
 
 - API_C_FriendList.SendWho, API_C_FriendList.GetWhoInfo, API_C_FriendList.GetNumWhoResults, API_C_FriendList.SetWhoToUi
@@ -177,6 +360,7 @@ The addon's own load line then shows which invite, /who and whisper calls GR_Com
 - Secret_Values, Patch_12.0.0/API_changes
 - Patch_1.60.1/API_changes (the Forever change list: "WoW Forever shares Mainline WoW's UI architecture, including the vast majority of APIs available in 12.1.5"; EMOTE now needs a hardware event; trial accounts can't send addon messages; Midnight's restrictions, including secrets, apply)
 - API_Ambiguate, API_FontInstance_SetFont, API_C_XMLUtil.GetTemplateInfo
+- For key-press mode: Bindings.xml (attributes, `BINDING_HEADER_`/`BINDING_NAME_`, auto-loaded), ADDON_ACTION_BLOCKED and ADDON_ACTION_FORBIDDEN (payload, synchronous, Forever 1.60.1 listed), API_C_FriendList.SendWho re-read (silent on what a violation does)
 - Patch_10.1.0/API_changes (FauxScrollFrameTemplate deprecated), Patch_10.0.0/API_changes (OptionsSliderTemplate deprecated; via search summary)
 
 Not confirmed on the wiki (my own Mainline knowledge, so unverified): the BackdropTemplate requirement (9.0), SetColorTexture (7.0), the Mainline `FauxScrollFrame_OnVerticalScroll(self, offset, itemHeight, fn)` signature, and the handler argument lists for OnClick, OnUpdate, OnEvent and the rest.
