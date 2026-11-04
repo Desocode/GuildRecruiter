@@ -1,4 +1,7 @@
---[[ Guild Rawcruiter -- vanilla 1.12 / Turtle WoW   (version: see .toc / VERSION below)
+--[[ Guild Rawcruiter -- WoW: Forever port (Mainline-style API, Lua 5.1) of the
+  vanilla 1.12 / Turtle WoW addon   (version: see .toc / VERSION below)
+  BETA: untested in game. Every client call whose Forever behaviour is not yet
+  verified goes through GR_Compat below; see PORT_NOTES.md.
 
   Scans online players with /who and sends paced guild contacts (invite and/or
   whisper) to players who are NOT already in a guild.
@@ -19,7 +22,304 @@
 
 GuildRecruiter_Settings = GuildRecruiter_Settings or {}
 
-local VERSION    = "3.22"
+local ADDON_NAME = (...) or "GuildRecruiter"   -- the client passes the folder name to each file
+
+-- ===========================================================================
+-- WoW: Forever compatibility layer (GR_Compat)
+-- ---------------------------------------------------------------------------
+-- Every call whose behaviour on the Forever client is UNVERIFIED lives here and
+-- nowhere else. Each function prefers the modern (Mainline-style) API when it is
+-- present and falls back to the old 1.12 global otherwise. The choice is made by
+-- FEATURE DETECTION at call time -- never by WOW_PROJECT_ID or a build number
+-- (WOW_PROJECT_ID read 1 on one Forever beta build and 18 on another).
+-- PORT_NOTES.md "Still unverified" maps each open blocker to its function here.
+-- ===========================================================================
+local GR_Compat = {}
+
+-- Secret values (Mainline 12.x, reportedly active on Forever): tainted code may
+-- not compare, index with, or do arithmetic on one. A secret is SKIPPED here,
+-- never compared or concatenated. nil-safe on clients without the API.
+local issecret    = issecretvalue  or function() return false end
+local issecrettab = issecrettable  or function() return false end
+GR_Compat.IsSecret = issecret
+
+-- Mainline chat/addon events name players "Name-Realm"; 1.12 used a bare "Name".
+-- Strip our own realm (Ambiguate "none") so history/seen/whisper keys match the
+-- /who and guild-message names. Other realms keep their suffix.
+function GR_Compat.ShortName(name)
+  if type(name) ~= "string" or issecret(name) then return nil end
+  if type(Ambiguate) == "function" then return Ambiguate(name, "none") end
+  return name
+end
+
+-- /who query (blocker 1). Mainline: C_FriendList.SendWho(filter, origin); the
+-- origin argument arrived in 10.2.0, and the wiki marks the call #hwevent
+-- (needs a key/mouse press) since 8.2.5.
+function GR_Compat.SendWho(filter)
+  if C_FriendList and C_FriendList.SendWho then
+    local origin = Enum and Enum.SocialWhoOrigin and Enum.SocialWhoOrigin.Social
+    C_FriendList.SendWho(filter, origin)
+  elseif type(SendWho) == "function" then
+    SendWho(filter)
+  else
+    error("no /who API on this client (C_FriendList.SendWho / SendWho)")
+  end
+end
+
+-- number of rows in the last /who reply (blocker 1). A missing ("ReturnNothing")
+-- or secret count reads as 0 rows.
+function GR_Compat.GetNumWhoResults()
+  local n
+  if C_FriendList and C_FriendList.GetNumWhoResults then
+    n = C_FriendList.GetNumWhoResults()
+  elseif type(GetNumWhoResults) == "function" then
+    n = GetNumWhoResults()
+  else
+    error("no /who result API on this client (C_FriendList.GetNumWhoResults / GetNumWhoResults)")
+  end
+  if type(n) ~= "number" or issecret(n) then return 0 end
+  return n
+end
+
+-- one /who row as the 1.12 tuple: name, guild, level, race, class, zone
+-- (blockers 1 + 4). Mainline returns a WhoInfo table {fullName, fullGuildName,
+-- level, raceStr, classStr, area}. A row whose name or guild is secret can't be
+-- judged (guildless? already seen?) so it is skipped (nil name); any other
+-- secret field reads as nil.
+function GR_Compat.GetWhoRow(i)
+  local name, guild, level, race, class, zone
+  if C_FriendList and C_FriendList.GetWhoInfo then
+    local info = C_FriendList.GetWhoInfo(i)
+    if type(info) ~= "table" or issecrettab(info) then return nil end
+    name, guild, level = info.fullName, info.fullGuildName, info.level
+    race, class, zone  = info.raceStr, info.classStr, info.area
+  elseif type(GetWhoInfo) == "function" then
+    name, guild, level, race, class, zone = GetWhoInfo(i)
+  else
+    error("no /who row API on this client (C_FriendList.GetWhoInfo / GetWhoInfo)")
+  end
+  if issecret(name) or issecret(guild) then return nil end
+  if issecret(level) then level = nil end
+  if issecret(race)  then race  = nil end
+  if issecret(class) then class = nil end
+  if issecret(zone)  then zone  = nil end
+  return GR_Compat.ShortName(name), guild, level, race, class, zone
+end
+
+-- route /who replies to WHO_LIST_UPDATE (true) or back to chat (false).
+-- Mainline renamed it C_FriendList.SetWhoToUi (lower-case i) and takes a boolean.
+function GR_Compat.SetWhoToUI(on)
+  if C_FriendList and C_FriendList.SetWhoToUi then
+    pcall(C_FriendList.SetWhoToUi, on and true or false)
+  elseif type(SetWhoToUI) == "function" then
+    pcall(SetWhoToUI, on and 1 or 0)
+  end
+end
+
+-- the default-UI frame that pops the Who list on WHO_LIST_UPDATE (1.12:
+-- FriendsFrame). Unverified on Forever; nil just turns Who-window hiding off.
+function GR_Compat.WhoPanel()
+  return FriendsFrame
+end
+
+-- guild invite (blocker 2). method = the saved setting auto|byname|invite|chat.
+-- Mainline: C_GuildInfo.Invite(name), marked #hwevent on the wiki. "auto" tries
+-- it first, then the 1.12 order (GuildInviteByName, GuildInvite, /ginvite).
+function GR_Compat.GuildInvite(name, method)
+  if method == "byname" and type(GuildInviteByName) == "function" then
+    GuildInviteByName(name)
+  elseif method == "invite" and type(GuildInvite) == "function" then
+    GuildInvite(name)
+  elseif method == "chat" then
+    GR_Compat.RunSlash("/ginvite "..name)
+  elseif C_GuildInfo and C_GuildInfo.Invite then
+    C_GuildInfo.Invite(name)
+  elseif type(GuildInviteByName) == "function" then
+    GuildInviteByName(name)
+  elseif type(GuildInvite) == "function" then
+    GuildInvite(name)
+  else
+    GR_Compat.RunSlash("/ginvite "..name)
+  end
+end
+
+-- which call "auto" invites with, for the load message
+function GR_Compat.InviteApiName()
+  if C_GuildInfo and C_GuildInfo.Invite then return "C_GuildInfo.Invite" end
+  if type(GuildInviteByName) == "function" then return "GuildInviteByName" end
+  if type(GuildInvite) == "function" then return "GuildInvite" end
+  return "/ginvite (chat fallback)"
+end
+
+-- invite permission (blocker 2). No API at all = unknown = allowed, as in 1.12.
+function GR_Compat.CanGuildInvite()
+  if type(CanGuildInvite) == "function" then return CanGuildInvite() and true or false end
+  return true
+end
+
+-- run a slash command as if typed (the "chat" invite method). ChatEdit_SendText
+-- is unverified on Forever's chat code; the fallback calls the edit box's own
+-- Enter handler with self (Mainline handlers take self, 1.12 read `this`).
+function GR_Compat.RunSlash(text)
+  local eb = ChatFrameEditBox or (DEFAULT_CHAT_FRAME and DEFAULT_CHAT_FRAME.editBox)
+  if not eb then return false end
+  eb:SetText(text)
+  if type(ChatEdit_SendText) == "function" then
+    ChatEdit_SendText(eb, 0)
+  else
+    local handler = eb:GetScript("OnEnterPressed")
+    if handler then handler(eb) end
+  end
+  eb:SetText("")
+  return true
+end
+
+-- whisper (blocker 3). The SendChatMessage global was deprecated in 11.2.0 for
+-- C_ChatInfo.SendChatMessage (same argument order). Per the wiki WHISPER is not
+-- hardware-event restricted.
+function GR_Compat.SendWhisper(text, target)
+  if C_ChatInfo and C_ChatInfo.SendChatMessage then
+    C_ChatInfo.SendChatMessage(text, "WHISPER", nil, target)
+  elseif type(SendChatMessage) == "function" then
+    SendChatMessage(text, "WHISPER", nil, target)
+  else
+    error("no chat send API on this client (C_ChatInfo.SendChatMessage / SendChatMessage)")
+  end
+end
+
+-- one line naming the who / invite / whisper calls in use, for the load message
+function GR_Compat.ApiSummary()
+  local who = (C_FriendList and C_FriendList.SendWho and "C_FriendList.SendWho")
+           or (type(SendWho) == "function" and "SendWho") or "none"
+  local wsp = (C_ChatInfo and C_ChatInfo.SendChatMessage and "C_ChatInfo.SendChatMessage")
+           or (type(SendChatMessage) == "function" and "SendChatMessage") or "none"
+  return "Invite API: "..GR_Compat.InviteApiName().." (who: "..who..", whisper: "..wsp..")"
+end
+
+-- guild sync. Mainline moved both calls to C_ChatInfo (8.0.1) and delivers
+-- CHAT_MSG_ADDON only for a REGISTERED prefix (16 chars max); 1.12 needs no
+-- registration. Registrations don't survive a /reload, so register at load.
+function GR_Compat.RegisterAddonPrefix(prefix)
+  if C_ChatInfo and C_ChatInfo.RegisterAddonMessagePrefix then
+    C_ChatInfo.RegisterAddonMessagePrefix(prefix)
+  elseif type(RegisterAddonMessagePrefix) == "function" then
+    RegisterAddonMessagePrefix(prefix)
+  end
+end
+
+function GR_Compat.SendAddonMessage(prefix, text, channel)
+  if C_ChatInfo and C_ChatInfo.SendAddonMessage then
+    C_ChatInfo.SendAddonMessage(prefix, text, channel)
+  elseif type(SendAddonMessage) == "function" then
+    SendAddonMessage(prefix, text, channel)
+  else
+    error("no addon-message API on this client (C_ChatInfo.SendAddonMessage / SendAddonMessage)")
+  end
+end
+
+-- server chat wording (blocker 6): the 1.12 / enUS strings, kept verbatim.
+-- Re-check the Forever server's CHAT_MSG_SYSTEM text in game.
+-- the /who summary lines hidden while a run is active ("3 Players Total", ...)
+function GR_Compat.IsWhoNoise(m)
+  if type(m) ~= "string" or issecret(m) then return false end
+  if string.find(m, "[Pp]layers? [Tt]otal") then return true end  -- "3 Players Total"
+  if string.find(m, "^There are %d")          then return true end
+  if string.find(m, "[Nn]o players")          then return true end  -- "No players found"
+  return false
+end
+
+-- a server throttle message ("too many / too quickly"); m is lower-cased
+function GR_Compat.IsThrottleMsg(m)
+  if string.find(m, "too quickly") or string.find(m, "too many")
+     or (string.find(m, "wait") and string.find(m, "invit")) then return true end
+  return false
+end
+
+-- hide CHAT_MSG_SYSTEM lines for which hide(msg) is true. Mainline has the
+-- message-filter API (2.4+); replacing ChatFrame_OnEvent (the 1.12 trick) taints
+-- Mainline chat frames, so it is only the fallback, with the 3.0+ signature.
+function GR_Compat.FilterSystemChat(hide)
+  if type(ChatFrame_AddMessageEventFilter) == "function" then
+    ChatFrame_AddMessageEventFilter("CHAT_MSG_SYSTEM", function(frame, ev, msg)
+      if issecret(msg) then return false end
+      return hide(msg) and true or false
+    end)
+  elseif type(ChatFrame_OnEvent) == "function" then
+    local orig = ChatFrame_OnEvent
+    ChatFrame_OnEvent = function(self, ev, ...)
+      local msg = ...
+      if ev == "CHAT_MSG_SYSTEM" and not issecret(msg) and hide(msg) then return end
+      return orig(self, ev, ...)
+    end
+  end
+end
+
+-- frames that draw a backdrop. Mainline (9.0+) has SetBackdrop only through
+-- BackdropTemplate; 1.12 frames have it natively. With neither, the frame still
+-- works, just without its border/background.
+function GR_Compat.BackdropFrame(kind, name, parent)
+  return CreateFrame(kind, name, parent, BackdropTemplateMixin and "BackdropTemplate" or nil)
+end
+function GR_Compat.SetBackdrop(frame, backdrop)
+  if frame.SetBackdrop then frame:SetBackdrop(backdrop) end
+end
+function GR_Compat.SetBackdropColor(frame, r, g, b, a)
+  if frame.SetBackdropColor then frame:SetBackdropColor(r, g, b, a) end
+end
+
+-- a solid-colour texture: Texture:SetTexture(r, g, b, a) became SetColorTexture in 7.0
+function GR_Compat.ColorTexture(tex, r, g, b, a)
+  if tex.SetColorTexture then tex:SetColorTexture(r, g, b, a) else tex:SetTexture(r, g, b, a) end
+end
+
+-- does the client define this XML template? C_XMLUtil.GetTemplateInfo returns nil
+-- for an unknown one. With no way to ask (1.12), assume the stock template exists.
+local function HasTemplate(t)
+  if C_XMLUtil and C_XMLUtil.GetTemplateInfo then return C_XMLUtil.GetTemplateInfo(t) ~= nil end
+  return true
+end
+
+-- CreateFrame with a stock template that Mainline deprecated (OptionsSliderTemplate
+-- in 10.0.0, FauxScrollFrameTemplate in 10.1.0 "will be removed in a future patch").
+-- If the client lacks it the frame is made plain, so the window still opens; that
+-- one control just loses its stock look. Returns the frame and whether it was templated.
+function GR_Compat.TemplateFrame(kind, name, parent, template)
+  if HasTemplate(template) then return CreateFrame(kind, name, parent, template), true end
+  return CreateFrame(kind, name, parent), false
+end
+
+-- the Lists tab's faux scroll frame + its FrameXML helpers (same deprecated file).
+-- Without them the list shows only its first rows instead of erroring.
+function GR_Compat.FauxScrollFrame(name, parent)
+  local sf, ok = GR_Compat.TemplateFrame("ScrollFrame", name, parent, "FauxScrollFrameTemplate")
+  sf.grFaux = ok and type(FauxScrollFrame_Update) == "function"
+          and type(FauxScrollFrame_GetOffset) == "function"
+          and type(FauxScrollFrame_OnVerticalScroll) == "function"
+  return sf
+end
+function GR_Compat.FauxScrollOffset(sf)
+  if sf.grFaux then return FauxScrollFrame_GetOffset(sf) end
+  return 0
+end
+function GR_Compat.FauxScrollUpdate(sf, n, shown, rowH)
+  if sf.grFaux then FauxScrollFrame_Update(sf, n, shown, rowH) end
+end
+-- Mainline signature (self, offset, itemHeight, fn); 1.12's was (itemHeight, fn)
+-- with this/arg1 globals
+function GR_Compat.FauxScrollOnVertical(sf, offset, rowH, fn)
+  if sf.grFaux then FauxScrollFrame_OnVerticalScroll(sf, offset, rowH, fn) end
+end
+
+-- set a stock template's caption FontString. 1.12 templates name it
+-- "<frame><suffix>" (e.g. ...SliderText); Mainline ones also carry a parentKey
+-- (.Text/.Low/.High, or .text on check buttons). nil-safe.
+function GR_Compat.SetChildText(frame, suffix, text)
+  local nm = frame:GetName()
+  local fs = (nm and _G[nm..suffix]) or frame[suffix] or frame[string.lower(suffix)]
+  if fs then fs:SetText(text) end
+end
+
+local VERSION    = "4.0.0-forever.1"
 local CAP_HINT   = 49      -- treat a query returning >= this many as truncated
 local START_WIDTH = 10     -- initial level-band width to try
 local WHO_TIMEOUT = 15     -- give up waiting on a /who reply after this many seconds (then retry)
@@ -140,7 +440,7 @@ end
 
 local function CountTable(t)
   local n = 0
-  for _ in t do n = n + 1 end
+  for _ in pairs(t) do n = n + 1 end
   return n
 end
 
@@ -149,14 +449,15 @@ end
 -- window never opens at all -- no open-then-hide flicker. Restored when we stop.
 local whoSuppressed = false
 local function SuppressWho(on)
-  if not FriendsFrame then return end
+  local wp = GR_Compat.WhoPanel()
+  if not wp then return end
   if on then
     if not whoSuppressed and GuildRecruiter_Settings.hideWho then
-      FriendsFrame:UnregisterEvent("WHO_LIST_UPDATE")
+      wp:UnregisterEvent("WHO_LIST_UPDATE")
       whoSuppressed = true
     end
   elseif whoSuppressed then
-    FriendsFrame:RegisterEvent("WHO_LIST_UPDATE")
+    wp:RegisterEvent("WHO_LIST_UPDATE")
     whoSuppressed = false
   end
 end
@@ -189,11 +490,11 @@ local function Defaults()
   end
   if not s.negatives then   -- editable refusal-word list ("notno" mode skips these)
     s.negatives = {}
-    for i = 1, table.getn(NEGATIVES) do s.negatives[NEGATIVES[i]] = true end
+    for i = 1, #NEGATIVES do s.negatives[NEGATIVES[i]] = true end
   end
   if not s.affirmatives then   -- editable yes-word list ("yesonly" mode requires these)
     s.affirmatives = {}
-    for i = 1, table.getn(AFFIRM_DEFAULTS) do s.affirmatives[AFFIRM_DEFAULTS[i]] = true end
+    for i = 1, #AFFIRM_DEFAULTS do s.affirmatives[AFFIRM_DEFAULTS[i]] = true end
   end
   if not s.profiles then s.profiles = {} end
   if not s.tally then s.tally = {} end
@@ -212,7 +513,7 @@ local function Defaults()
   -- Settings tab (the control), so it is never stored here.
   if not s.abVariants then s.abVariants = {} end
   local chal, used = {}, {}                       -- max 3 challengers; names B/C/D, kept stable
-  for i = 1, table.getn(s.abVariants) do
+  for i = 1, #s.abVariants do
     local v = s.abVariants[i]
     if type(v) == "string" then                   -- legacy: flagged-profile-name string -> table
       local p = s.profiles and s.profiles[v]
@@ -222,7 +523,7 @@ local function Defaults()
     -- "A" used to be a stored variant; it's the control now, so drop it. Keep an
     -- already-valid, unused B/C/D name as-is (so stats stay attached); only mint
     -- a new name for a bad/missing/duplicate one. Never reshuffle on load.
-    if v.name ~= "A" and table.getn(chal) < 3 then
+    if v.name ~= "A" and #chal < 3 then
       local nm = v.name
       if (nm ~= "B" and nm ~= "C" and nm ~= "D") or used[nm] then
         nm = nil
@@ -237,7 +538,7 @@ local function Defaults()
   -- prune history past the cooldown so the saved table can't grow forever
   if s.reinviteDays > 0 then
     local cutoff = time() - s.reinviteDays * 86400
-    for n, e in s.history do
+    for n, e in pairs(s.history) do
       local et = (type(e) == "table") and e.t or e   -- entries are {t,p} now; tolerate old numbers
       if (et or 0) < cutoff then s.history[n] = nil end
     end
@@ -245,7 +546,7 @@ local function Defaults()
     -- reinviteDays == 0 ("never re-invite") skips time-pruning, so history grows
     -- forever. Cap the SavedVariables at ~1 year of entries to bound memory.
     local cutoff = time() - 365 * 86400
-    for n, e in s.history do
+    for n, e in pairs(s.history) do
       local et = (type(e) == "table") and e.t or e
       if (et or 0) < cutoff then s.history[n] = nil end
     end
@@ -291,13 +592,13 @@ local function ShouldInvite(reply, vname)
   if mode == "any" then return true end
   local norm = Normalize(reply)
   if mode == "yesonly" then
-    for phrase in (GuildRecruiter_Settings.affirmatives or {}) do
+    for phrase in pairs(GuildRecruiter_Settings.affirmatives or {}) do
       if string.find(norm, " " .. phrase .. " ", 1, true) then return true end
     end
     return false
   end
   -- "notno": invite unless a refusal word appears
-  for phrase in (GuildRecruiter_Settings.negatives or {}) do
+  for phrase in pairs(GuildRecruiter_Settings.negatives or {}) do
     if string.find(norm, " " .. phrase .. " ", 1, true) then return false end
   end
   return true
@@ -343,7 +644,7 @@ local RecomputeBand  -- forward decl (defined below; used by the message handler
 
 local function Broadcast(payload)
   if GuildRecruiter_Settings.guildSync and IsInGuild() then
-    SendAddonMessage(SYNC_PREFIX, "V1 "..payload, "GUILD")
+    GR_Compat.SendAddonMessage(SYNC_PREFIX, "V1 "..payload, "GUILD")
   end
 end
 
@@ -352,10 +653,10 @@ local function ActiveNames()
   local me = UnitName("player")
   local names = {}
   if running then tinsert(names, me) end
-  for n, _ in recruiters do
+  for n, _ in pairs(recruiters) do
     if n ~= me then tinsert(names, n) end
   end
-  if table.getn(names) == 0 then tinsert(names, me) end  -- always at least self
+  if #names == 0 then tinsert(names, me) end  -- always at least self
   table.sort(names)
   return names
 end
@@ -369,7 +670,7 @@ RecomputeBand = function()
     myLo, myHi = loL, hiL
   else
     local names = ActiveNames()
-    local total = table.getn(names)
+    local total = #names
     local me = UnitName("player")
     local idx = 1
     for i = 1, total do if names[i] == me then idx = i end end
@@ -387,12 +688,15 @@ RecomputeBand = function()
   if running and GuildRecruiter_runKind == "scan" and not scanning and lo <= myHi then scanning = true end
 end
 
-local function OnAddonMessage()
-  if arg1 ~= SYNC_PREFIX then return end
+-- CHAT_MSG_ADDON payload: (prefix, text, channel, sender)
+local function OnAddonMessage(prefix, text, channel, sender)
+  local sec = GR_Compat.IsSecret
+  if sec(prefix) or sec(text) or sec(sender) then return end   -- unreadable: skip, never compare
+  if prefix ~= SYNC_PREFIX then return end
   local me = UnitName("player")
-  local sender = arg4
-  if sender == me then return end                 -- ignore our own echo
-  local _, _, ver, kind, rest = string.find(arg2 or "", "^(%S+)%s+(%S+)%s*(.*)$")
+  sender = GR_Compat.ShortName(sender)             -- Mainline sends "Name-Realm"
+  if not sender or sender == me then return end   -- ignore our own echo
+  local _, _, ver, kind, rest = string.find(text or "", "^(%S+)%s+(%S+)%s*(.*)$")
   if ver ~= "V1" then return end
   if kind == "INV" then
     if rest and rest ~= "" then
@@ -415,40 +719,11 @@ end
 -- ---------------------------------------------------------------------------
 -- Contacting: invite and/or whisper
 -- ---------------------------------------------------------------------------
-local function RunChatCommand(text)
-  local eb = ChatFrameEditBox or (DEFAULT_CHAT_FRAME and DEFAULT_CHAT_FRAME.editBox)
-  if not eb then return false end
-  eb:SetText(text)
-  if ChatEdit_SendText then
-    ChatEdit_SendText(eb, 0)
-  else
-    local handler = eb:GetScript("OnEnterPressed")
-    if handler then
-      local prev = this
-      this = eb; handler(); this = prev
-    end
-  end
-  eb:SetText("")
-  return true
-end
-
--- GuildInviteByName is Turtle's canonical name-taking invite; auto prefers it
--- because bare GuildInvite() invites your TARGET on some cores.
+-- The invite call itself is chosen in GR_Compat.GuildInvite: C_GuildInfo.Invite
+-- where it exists, else GuildInviteByName (Turtle's name-taking invite; bare
+-- GuildInvite() invites your TARGET on some cores), else GuildInvite, else /ginvite.
 local function DoGuildInvite(name, method)
-  local m = method or GuildRecruiter_Settings.inviteMethod or "auto"
-  if m == "byname" and type(GuildInviteByName) == "function" then
-    GuildInviteByName(name)
-  elseif m == "invite" and type(GuildInvite) == "function" then
-    GuildInvite(name)
-  elseif m == "chat" then
-    RunChatCommand("/ginvite "..name)
-  elseif type(GuildInviteByName) == "function" then
-    GuildInviteByName(name)
-  elseif type(GuildInvite) == "function" then
-    GuildInvite(name)
-  else
-    RunChatCommand("/ginvite "..name)
-  end
+  GR_Compat.GuildInvite(name, method or GuildRecruiter_Settings.inviteMethod or "auto")
 end
 
 local function WhisperBody(name, msg)
@@ -476,7 +751,7 @@ end
 -- it's switched on AND at least one challenger exists (so the pool is A + >=1).
 function GuildRecruiter_ABActive()
   local s = GuildRecruiter_Settings
-  return s.abOn and s.abVariants and table.getn(s.abVariants) >= 1
+  return s.abOn and s.abVariants and #s.abVariants >= 1
 end
 
 -- deal a variant to a contact, weighted by each variant's frequency. nil =
@@ -487,11 +762,11 @@ function GuildRecruiter_PickVariant()
   local av = s.abVariants
   local wA = s.abWeightA or 1
   local total = wA
-  for i = 1, table.getn(av) do total = total + (av[i].weight or 1) end
+  for i = 1, #av do total = total + (av[i].weight or 1) end
   local r = random(1, total)
   if r <= wA then return nil end        -- landed in the control's share
   r = r - wA
-  for i = 1, table.getn(av) do
+  for i = 1, #av do
     local w = av[i].weight or 1
     if r <= w then return av[i] end
     r = r - w
@@ -533,7 +808,7 @@ end
 function GuildRecruiter_VariantByName(nm)
   local av = GuildRecruiter_Settings.abVariants
   if nm and av then
-    for i = 1, table.getn(av) do if av[i].name == nm then return av[i] end end
+    for i = 1, #av do if av[i].name == nm then return av[i] end end
   end
   return nil
 end
@@ -552,11 +827,11 @@ local function Contact(name)
   -- (A/B off) it's just the active profile, for sequential profile comparison.
   local vname = (v and v.name) or (GuildRecruiter_ABActive() and "A") or GuildRecruiter_Settings.activeProfile
   if cfg.mode == "whisper" then
-    SendChatMessage(WhisperBody(name, cfg.whisperMsg), "WHISPER", nil, name)
+    GR_Compat.SendWhisper(WhisperBody(name, cfg.whisperMsg), name)
     stats.whispered = stats.whispered + 1; TallyBump("whispered")
     RecordHandled(name, vname)
   elseif cfg.mode == "whisperinvite" then
-    SendChatMessage(WhisperBody(name, cfg.whisperMsg), "WHISPER", nil, name)
+    GR_Compat.SendWhisper(WhisperBody(name, cfg.whisperMsg), name)
     stats.whispered = stats.whispered + 1; TallyBump("whispered")
     whispered[name] = { t = GetTime(), v = vname }
     RecordHandled(name, vname)
@@ -581,7 +856,7 @@ local function BuildFilter(s)
 end
 
 local function NextQuery()
-  if table.getn(pending) > 0 then
+  if #pending > 0 then
     current = tremove(pending, 1)
     return true
   end
@@ -615,14 +890,14 @@ local function SendNextWho()
     if GuildRecruiter_Settings.collectOnly then
       Print("Scan complete: "..stats.queries.." queries, collected "..stats.collected.." (list now "..CountTable(GuildRecruiter_Settings.candidates).."). Send from the Lists tab.")
     else
-      Print("Scan complete: "..stats.queries.." queries, "..table.getn(contactQueue).." left to contact.")
+      Print("Scan complete: "..stats.queries.." queries, "..#contactQueue.." left to contact.")
     end
     return
   end
   awaiting = true
   whoTimeout = WHO_TIMEOUT
   stats.queries = stats.queries + 1
-  SendWho(BuildFilter(current))
+  GR_Compat.SendWho(BuildFilter(current))
 end
 
 local function ClassAllowed(class)
@@ -633,11 +908,12 @@ end
 
 local function ProcessWho()
   local me = UnitName("player")
-  local num = GetNumWhoResults()
+  local num = GR_Compat.GetNumWhoResults()
   local inBand = 0
   for i = 1, num do
-    -- 1.12: name, guild, level, race, class, zone
-    local name, guild, level, race, class = GetWhoInfo(i)
+    -- 1.12 order: name, guild, level, race, class, zone (GR_Compat maps the
+    -- Mainline WhoInfo table onto it and returns a nil name for a secret row)
+    local name, guild, level, race, class = GR_Compat.GetWhoRow(i)
     if name then
       stats.scanned = stats.scanned + 1
       -- Name-corpus collector: record EVERY player seen in /who (guilded or not),
@@ -724,11 +1000,11 @@ local function ProcessWho()
         if width < 1 then width = 1 end
         if GuildRecruiter_Settings.debug then Print("  -> capped: subdividing to "..lo.."-"..(lo + width - 1)) end
       else
-        for i = 1, table.getn(classes) do
+        for i = 1, #classes do
           tinsert(pending, { lo = c.lo, hi = c.lo, class = classes[i] })
         end
         lo = c.lo + 1; width = 1
-        if GuildRecruiter_Settings.debug then Print("  -> lvl "..c.lo.." capped: splitting by class ("..table.getn(classes).." queries)") end
+        if GuildRecruiter_Settings.debug then Print("  -> lvl "..c.lo.." capped: splitting by class ("..#classes.." queries)") end
       end
     else
       lo = c.hi + 1
@@ -805,7 +1081,7 @@ local function Abort(reason)
   running, scanning, awaiting, paused = false, false, false, false
   GuildRecruiter_rescanWait = 0
   SuppressWho(false)
-  if type(SetWhoToUI) == "function" then pcall(SetWhoToUI, 0) end   -- RestoreWho (defined later; inline to avoid a forward ref)
+  GR_Compat.SetWhoToUI(false)   -- = RestoreWho (defined later; called directly to avoid a forward ref)
   Print("|cffff4040Stopped on error:|r "..tostring(reason))
 end
 
@@ -814,25 +1090,30 @@ end
 -- ---------------------------------------------------------------------------
 local InitMinimap  -- forward decl
 
-local function GR_OnEvent()
-  if event == "VARIABLES_LOADED" then
+-- Mainline hands the event payload to the handler as arguments (1.12 used the
+-- globals event / arg1..argN), so GR_OnEvent(event, ...) receives exactly it.
+local initDone = false
+local function GR_OnEvent(event, ...)
+  local a1, a2 = ...
+  if event == "ADDON_LOADED" or event == "VARIABLES_LOADED" then
+    -- ADDON_LOADED(our folder) = our SavedVariables are in. VARIABLES_LOADED (the
+    -- 1.12 init event) is kept as a fallback. Init runs once.
+    if initDone or (event == "ADDON_LOADED" and a1 ~= ADDON_NAME) then return end
+    initDone = true
     GuildRecruiter_Settings = GuildRecruiter_Settings or {}
     Defaults()
     InitMinimap()
-    local api = (type(GuildInviteByName) == "function" and "GuildInviteByName")
-             or (type(GuildInvite) == "function" and "GuildInvite")
-             or "/ginvite (chat fallback)"
-    Print("v"..VERSION.." loaded. Invite API: "..api..". /gr for commands, /gr config for settings.")
+    Print("v"..VERSION.." loaded. "..GR_Compat.ApiSummary()..". /gr for commands, /gr config for settings.")
   elseif event == "WHO_LIST_UPDATE" and running then
     ProcessWho()
     if GuildRecruiter_Settings.hideWho then hideSoon = true end
   elseif event == "CHAT_MSG_ADDON" then
-    OnAddonMessage()
+    OnAddonMessage(...)
   elseif event == "CHAT_MSG_SYSTEM" then
-    local raw = arg1 or ""
+    if GR_Compat.IsSecret(a1) then return end   -- unreadable system text: skip, never compare
+    local raw = a1 or ""
     local m = string.lower(raw)
-    if string.find(m, "too quickly") or string.find(m, "too many")
-       or (string.find(m, "wait") and string.find(m, "invit")) then
+    if GR_Compat.IsThrottleMsg(m) then
       backoffUntil = GetTime() + BACKOFF_SECS
       Print("|cffffcc00Server throttle detected -- pausing sends "..BACKOFF_SECS.."s.|r")
     end
@@ -858,10 +1139,12 @@ local function GR_OnEvent()
       end
     end
   elseif event == "CHAT_MSG_WHISPER" then
-    local sender = arg2
+    -- payload (text, sender, ...); a secret text or sender is skipped, never compared
+    if GR_Compat.IsSecret(a1) or GR_Compat.IsSecret(a2) then return end
+    local sender = GR_Compat.ShortName(a2)   -- Mainline sends "Name-Realm"
     local w = sender and whispered[sender]
     if w then
-      if ShouldInvite(arg1, w.v) then   -- judge with the variant that whispered them
+      if ShouldInvite(a1, w.v) then   -- judge with the variant that whispered them
         whispered[sender] = nil
         tinsert(replyQueue, sender)   -- reply passes the policy: invite (paced)
       end
@@ -874,6 +1157,7 @@ local function GR_OnEvent()
   end
 end
 
+f:RegisterEvent("ADDON_LOADED")
 f:RegisterEvent("VARIABLES_LOADED")
 f:RegisterEvent("WHO_LIST_UPDATE")
 f:RegisterEvent("CHAT_MSG_ADDON")
@@ -881,8 +1165,9 @@ f:RegisterEvent("CHAT_MSG_SYSTEM")
 f:RegisterEvent("CHAT_MSG_WHISPER")
 f:RegisterEvent("PLAYER_REGEN_DISABLED")
 f:RegisterEvent("PLAYER_REGEN_ENABLED")
-f:SetScript("OnEvent", function()
-  local ok, err = pcall(GR_OnEvent)
+GR_Compat.RegisterAddonPrefix(SYNC_PREFIX)   -- Mainline delivers CHAT_MSG_ADDON only for registered prefixes
+f:SetScript("OnEvent", function(self, event, ...)
+  local ok, err = pcall(GR_OnEvent, event, ...)
   if not ok then Abort(err) end
 end)
 
@@ -890,7 +1175,7 @@ end)
 -- Main loop
 -- ---------------------------------------------------------------------------
 local function HasOutstandingWhispers()
-  for _, w in whispered do
+  for _, w in pairs(whispered) do
     if GetTime() - (w.t or 0) < WHISPER_WAIT then return true end
   end
   return false
@@ -900,10 +1185,10 @@ end
 -- GR_OnUpdate's upvalue count safely under the Lua 5.0 limit of 32.
 function GuildRecruiter_Drain(e)
   -- contacting / inviting (paced; replies take priority)
-  if table.getn(replyQueue) > 0 or table.getn(contactQueue) > 0 then
+  if #replyQueue > 0 or #contactQueue > 0 then
     inviteTimer = inviteTimer - e
     if inviteTimer <= 0 and not SendsBlocked() then
-      if table.getn(replyQueue) > 0 then
+      if #replyQueue > 0 then
         local name = tremove(replyQueue, 1)
         DoGuildInvite(name)
         if not GuildRecruiter_Settings.history then GuildRecruiter_Settings.history = {} end
@@ -932,7 +1217,7 @@ function GuildRecruiter_Drain(e)
       else
         -- session cap hit with names still queued: end the run instead of hanging
         -- "Running" forever (the queue kept this branch alive but nothing drained)
-        Print("Session cap ("..GuildRecruiter_Settings.sessionCap..") reached -- dropping "..table.getn(contactQueue).." queued name(s).")
+        Print("Session cap ("..GuildRecruiter_Settings.sessionCap..") reached -- dropping "..#contactQueue.." queued name(s).")
         contactQueue = {}
         scanning = false
         GuildRecruiter_rescanWait = 0
@@ -949,7 +1234,7 @@ function GuildRecruiter_Drain(e)
       local kind = GuildRecruiter_runKind
       GuildRecruiter_runKind = nil
       SuppressWho(false)
-      if type(SetWhoToUI) == "function" then pcall(SetWhoToUI, 0) end   -- restore manual /who to chat (RestoreWho is defined later in the file)
+      GR_Compat.SetWhoToUI(false)   -- restore manual /who to chat (RestoreWho is defined later in the file)
       Broadcast("BYE")
       if kind == "blast" or kind == "send" then
         Print("Done. "..(kind == "blast" and "Invited " or "Contacted ")..stats.contacted.." of "..(GuildRecruiter_runTotal or stats.contacted)..". "..CountTable(GuildRecruiter_Settings.candidates).." candidate(s) remain.")
@@ -962,13 +1247,14 @@ function GuildRecruiter_Drain(e)
   end
 end
 
-local function GR_OnUpdate()
+-- e = seconds since the last frame (OnUpdate's elapsed argument; 1.12 put it in arg1)
+local function GR_OnUpdate(e)
   if not running or paused then return end
-  local e = arg1
 
   if hideSoon then
     hideSoon = false
-    if FriendsFrame and FriendsFrame:IsVisible() then HideUIPanel(FriendsFrame) end
+    local wp = GR_Compat.WhoPanel()
+    if wp and wp:IsVisible() then HideUIPanel(wp) end
   end
 
   -- presence ping + peer pruning
@@ -980,13 +1266,13 @@ local function GR_OnUpdate()
     end
   end
   local pruned = false
-  for n, t in recruiters do
+  for n, t in pairs(recruiters) do
     if GetTime() - t > PRESENCE_TTL then recruiters[n] = nil; pruned = true end
   end
   if pruned then RecomputeBand() end
 
   -- forget whisper targets who never replied
-  for n, w in whispered do
+  for n, w in pairs(whispered) do
     if GetTime() - (w.t or 0) > WHISPER_WAIT then whispered[n] = nil end
   end
 
@@ -1028,48 +1314,36 @@ local function GR_OnUpdate()
   GuildRecruiter_Drain(e)
 end
 
-f:SetScript("OnUpdate", function()
-  local ok, err = pcall(GR_OnUpdate)
+f:SetScript("OnUpdate", function(self, elapsed)
+  local ok, err = pcall(GR_OnUpdate, elapsed)
   if not ok then Abort(err) end
 end)
 
--- Quiet the /who chat spam during a run. There's no message-filter API on 1.12,
--- so we wrap ChatFrame_OnEvent and drop the /who summary/result system lines
--- while we're scanning. Our own CHAT_MSG_SYSTEM handler (on frame f) is separate
--- and still fires, so throttle-detection keeps working.
-local function IsWhoNoise(m)
-  if not m then return false end
-  if string.find(m, "[Pp]layers? [Tt]otal") then return true end  -- "3 Players Total"
-  if string.find(m, "^There are %d")          then return true end
-  if string.find(m, "[Nn]o players")          then return true end  -- "No players found"
-  return false
-end
-
-local Orig_ChatFrame_OnEvent = ChatFrame_OnEvent
-function ChatFrame_OnEvent(ev)
-  if running and GuildRecruiter_Settings.quietWho
-     and ev == "CHAT_MSG_SYSTEM" and IsWhoNoise(arg1) then
-    return
-  end
-  Orig_ChatFrame_OnEvent(ev)
-end
+-- Quiet the /who chat spam during a run: drop the /who summary/result system
+-- lines while we're scanning. GR_Compat.FilterSystemChat uses the chat message
+-- filter API where it exists (1.12 had none, so it wrapped ChatFrame_OnEvent).
+-- Our own CHAT_MSG_SYSTEM handler (on frame f) is separate and still fires, so
+-- throttle-detection keeps working.
+GR_Compat.FilterSystemChat(function(msg)
+  return running and GuildRecruiter_Settings.quietWho and GR_Compat.IsWhoNoise(msg)
+end)
 
 -- ---------------------------------------------------------------------------
 -- Run control
 -- ---------------------------------------------------------------------------
 local function ForceWhoToEvent()
-  if type(SetWhoToUI) == "function" then pcall(SetWhoToUI, 1) end
+  GR_Compat.SetWhoToUI(true)
 end
 -- undo ForceWhoToEvent when a run ends -- otherwise the player's own /who stays
 -- routed to the UI (results stop printing to chat) until a /reload
 local function RestoreWho()
-  if type(SetWhoToUI) == "function" then pcall(SetWhoToUI, 0) end
+  GR_Compat.SetWhoToUI(false)
 end
 -- an invite sent without permission fails SILENTLY while we still record + broadcast
 -- the contact, poisoning the guild-wide re-invite cooldown -- so block invite runs early
 local function CheckInvitePerms(mode)
   if mode == "whisper" then return true end          -- whisper-only runs send no invites
-  if type(CanGuildInvite) == "function" and not CanGuildInvite() then
+  if not GR_Compat.CanGuildInvite() then
     Print("|cffff4040You don't have guild-invite permission|r -- invites would fail silently. Ask an officer, or use whisper mode.")
     return false
   end
@@ -1117,7 +1391,7 @@ local function Stop()
   if wasSend then
     Print("Stopped. Invited "..stats.contacted.." this run; "..CountTable(GuildRecruiter_Settings.candidates).." candidate(s) remain on the list.")
   else
-    Print("Stopped. Contacted "..stats.contacted.." this run; "..table.getn(contactQueue).." still queued.")
+    Print("Stopped. Contacted "..stats.contacted.." this run; "..#contactQueue.." still queued.")
   end
 end
 
@@ -1132,22 +1406,22 @@ function GuildRecruiter_SendToCandidates(blast)
   Defaults()
   local s = GuildRecruiter_Settings
   local names = {}
-  for n in s.candidates do tinsert(names, n) end
-  if table.getn(names) == 0 then Print("No collected candidates. Turn on Collect (Settings) and scan first.") return end
+  for n in pairs(s.candidates) do tinsert(names, n) end
+  if #names == 0 then Print("No collected candidates. Turn on Collect (Settings) and scan first.") return end
   running, scanning, awaiting, paused = true, false, false, false
   GuildRecruiter_rescanWait = 0                          -- auto-rescan is scan-runs-only
   GuildRecruiter_runKind = blast and "blast" or "send"   -- fast invite-all vs paced send
-  GuildRecruiter_runTotal = table.getn(names)            -- for N-of-M progress
+  GuildRecruiter_runTotal = #names            -- for N-of-M progress
   current = nil
   pending, contactQueue, replyQueue, seen, whispered = {}, {}, {}, {}, {}
   whoTimer, inviteTimer, whoTimeout, presenceTimer = 0, 0, 0, 0
   stats = { contacted=0, invited=0, whispered=0, guilded=0, scanned=0, queries=0, dropped=0, cooldown=0, collected=0 }
-  for i = 1, table.getn(names) do tinsert(contactQueue, names[i]) end
+  for i = 1, #names do tinsert(contactQueue, names[i]) end
   if s.guildSync and IsInGuild() then Broadcast("HI") end
   if blast then
-    Print("Inviting all "..table.getn(names).." candidate(s) as fast as the server allows (auto-backs-off if throttled). /gr stop to cancel.")
+    Print("Inviting all "..#names.." candidate(s) as fast as the server allows (auto-backs-off if throttled). /gr stop to cancel.")
   else
-    Print("Sending to "..table.getn(names).." collected candidate(s) ("..(MODE_LABEL[s.mode] or "?").."). /gr stop to cancel.")
+    Print("Sending to "..#names.." collected candidate(s) ("..(MODE_LABEL[s.mode] or "?").."). /gr stop to cancel.")
   end
 end
 
@@ -1178,7 +1452,7 @@ local function Pause()
     SuppressWho(false)  -- let manual /who work normally while paused
     Broadcast("BYE")    -- yield my band to others while paused
   end
-  Print("Paused. "..table.getn(contactQueue).." left. /gr resume to continue.")
+  Print("Paused. "..#contactQueue.." left. /gr resume to continue.")
 end
 
 local function Resume()
@@ -1210,20 +1484,20 @@ local LIST_TITLE = { candidates = "Candidates (collected)", queue = "Queue (this
 local function BuildListData()
   listData = {}
   if listMode == "candidates" then
-    for n in GuildRecruiter_Settings.candidates do tinsert(listData, n) end
+    for n in pairs(GuildRecruiter_Settings.candidates) do tinsert(listData, n) end
     table.sort(listData)
   elseif listMode == "queue" then
-    for i = 1, table.getn(contactQueue) do tinsert(listData, contactQueue[i]) end
+    for i = 1, #contactQueue do tinsert(listData, contactQueue[i]) end
   elseif listMode == "blacklist" then
-    for n in GuildRecruiter_Settings.blacklist do tinsert(listData, n) end
+    for n in pairs(GuildRecruiter_Settings.blacklist) do tinsert(listData, n) end
     table.sort(listData)
   elseif listMode == "negatives" then
-    for n in GuildRecruiter_Settings.negatives do tinsert(listData, n) end
+    for n in pairs(GuildRecruiter_Settings.negatives) do tinsert(listData, n) end
   elseif listMode == "affirmatives" then
-    for n in GuildRecruiter_Settings.affirmatives do tinsert(listData, n) end
+    for n in pairs(GuildRecruiter_Settings.affirmatives) do tinsert(listData, n) end
     table.sort(listData)
   else
-    for n in GuildRecruiter_Settings.history do tinsert(listData, n) end
+    for n in pairs(GuildRecruiter_Settings.history) do tinsert(listData, n) end
     table.sort(listData)
   end
 end
@@ -1232,7 +1506,7 @@ local function RemoveListItem(name)
   if listMode == "candidates" then
     GuildRecruiter_Settings.candidates[name] = nil
   elseif listMode == "queue" then
-    for i = 1, table.getn(contactQueue) do
+    for i = 1, #contactQueue do
       if contactQueue[i] == name then tremove(contactQueue, i); break end
     end
   elseif listMode == "blacklist" then
@@ -1294,18 +1568,18 @@ local function BuildListsPanel(parent)
 
   fr.cycle = CreateFrame("Button", nil, fr, "UIPanelButtonTemplate")
   fr.cycle:SetPoint("TOP", 0, -38); fr.cycle:SetWidth(260); fr.cycle:SetHeight(22)
-  fr.cycle:SetScript("OnClick", function()
-    GuildRecruiter_OpenMenu(this, LIST_ORDER, LIST_TITLE, function(v) listMode = v; UpdateList() end)
+  fr.cycle:SetScript("OnClick", function(self)
+    GuildRecruiter_OpenMenu(self, LIST_ORDER, LIST_TITLE, function(v) listMode = v; UpdateList() end)
   end)
   GuildRecruiter_DDArrow(fr.cycle)
 
   fr.hint = fr:CreateFontString(nil, "ARTWORK", "GameFontDisableSmall")
   fr.hint:SetPoint("TOP", 0, -62); fr.hint:SetText(LIST_HINT)
 
-  local scroll = CreateFrame("ScrollFrame", "GuildRecruiterListScroll", fr, "FauxScrollFrameTemplate")
+  local scroll = GR_Compat.FauxScrollFrame("GuildRecruiterListScroll", fr)
   scroll:SetPoint("TOPLEFT", 16, -78)
   scroll:SetPoint("BOTTOMRIGHT", -34, 52)
-  scroll:SetScript("OnVerticalScroll", function() FauxScrollFrame_OnVerticalScroll(ROW_HEIGHT, UpdateList) end)
+  scroll:SetScript("OnVerticalScroll", function(self, offset) GR_Compat.FauxScrollOnVertical(self, offset, ROW_HEIGHT, UpdateList) end)
   fr.scroll = scroll
 
   for i = 1, NUM_ROWS do
@@ -1319,11 +1593,11 @@ local function BuildListsPanel(parent)
     local t = row:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
     t:SetPoint("LEFT", 6, 0); t:SetJustifyH("LEFT"); row.text = t
     row:RegisterForClicks("LeftButtonUp", "RightButtonUp")
-    row:SetScript("OnClick", function()
-      if not this.pname then return end
-      local nm = this.pname
+    row:SetScript("OnClick", function(self, button)
+      if not self.pname then return end
+      local nm = self.pname
       if listMode == "candidates" then
-        if arg1 == "RightButton" then RemoveListItem(nm)               -- drop a false positive
+        if button == "RightButton" then RemoveListItem(nm)             -- drop a false positive
         else GuildRecruiter_InviteOne(nm) end                          -- left-click invites this one
         UpdateList()
       elseif listMode == "blacklist" or listMode == "history" then     -- persistent: confirm
@@ -1358,8 +1632,8 @@ local function BuildListsPanel(parent)
   local addBtn = CreateFrame("Button", nil, fr, "UIPanelButtonTemplate")
   addBtn:SetPoint("LEFT", addEdit, "RIGHT", 8, 0); addBtn:SetWidth(92); addBtn:SetHeight(22)
   addBtn:SetText("Add"); addBtn:SetScript("OnClick", doAdd)
-  addEdit:SetScript("OnEnterPressed", function() doAdd(); this:ClearFocus() end)
-  addEdit:SetScript("OnEscapePressed", function() this:ClearFocus() end)
+  addEdit:SetScript("OnEnterPressed", function(self) doAdd(); self:ClearFocus() end)
+  addEdit:SetScript("OnEscapePressed", function(self) self:ClearFocus() end)
 
   -- act on the collected candidate list: Invite all (fast guild invites) or
   -- Send (paced, respects Mode -- e.g. a whisper campaign)
@@ -1390,8 +1664,8 @@ local function BuildListsPanel(parent)
   fr.lstopBtn:Hide()
   -- keep the run strip / launch buttons live while this tab is shown
   fr.ltick = 0
-  fr:SetScript("OnUpdate", function()
-    fr.ltick = fr.ltick - (arg1 or 0)
+  fr:SetScript("OnUpdate", function(self, elapsed)
+    fr.ltick = fr.ltick - (elapsed or 0)
     if fr.ltick > 0 then return end
     fr.ltick = 0.3
     GuildRecruiter_ListControls(fr)
@@ -1404,8 +1678,8 @@ end
 UpdateList = function()
   if not listFrame then return end
   BuildListData()
-  local n = table.getn(listData)
-  local offset = FauxScrollFrame_GetOffset(listFrame.scroll)
+  local n = #listData
+  local offset = GR_Compat.FauxScrollOffset(listFrame.scroll)
   for i = 1, NUM_ROWS do
     local idx = offset + i
     local row = listFrame.rows[i]
@@ -1425,7 +1699,7 @@ UpdateList = function()
       row.pname = nil; row:Hide()
     end
   end
-  FauxScrollFrame_Update(listFrame.scroll, n, NUM_ROWS, ROW_HEIGHT)
+  GR_Compat.FauxScrollUpdate(listFrame.scroll, n, NUM_ROWS, ROW_HEIGHT)
   listFrame.cycle:SetText("View: "..(LIST_TITLE[listMode] or listMode).."  ("..n..")")
   GuildRecruiter_ListControls(listFrame)   -- idle launch buttons vs live run strip
 end
@@ -1460,33 +1734,33 @@ local function ApplyWho(v)    GuildRecruiter_Settings.whoDelay    = clamp(math.f
 
 local function CycleMethod()
   local cur, idx = GuildRecruiter_Settings.inviteMethod or "auto", 1
-  for i = 1, table.getn(METHOD_ORDER) do if METHOD_ORDER[i] == cur then idx = i end end
-  idx = idx + 1; if idx > table.getn(METHOD_ORDER) then idx = 1 end
+  for i = 1, #METHOD_ORDER do if METHOD_ORDER[i] == cur then idx = i end end
+  idx = idx + 1; if idx > #METHOD_ORDER then idx = 1 end
   GuildRecruiter_Settings.inviteMethod = METHOD_ORDER[idx]; RefreshConfig()
 end
 
 local function CycleMode()
   local cur, idx = GuildRecruiter_Settings.mode or "invite", 1
-  for i = 1, table.getn(MODE_ORDER) do if MODE_ORDER[i] == cur then idx = i end end
-  idx = idx + 1; if idx > table.getn(MODE_ORDER) then idx = 1 end
+  for i = 1, #MODE_ORDER do if MODE_ORDER[i] == cur then idx = i end end
+  idx = idx + 1; if idx > #MODE_ORDER then idx = 1 end
   GuildRecruiter_Settings.mode = MODE_ORDER[idx]; RefreshConfig()
 end
 
 local function MakeSlider(parent, prefix, label, alo, ahi, y, applyFn)
-  local sl = CreateFrame("Slider", prefix.."Slider", parent, "OptionsSliderTemplate")
+  local sl = GR_Compat.TemplateFrame("Slider", prefix.."Slider", parent, "OptionsSliderTemplate")
   sl:SetPoint("TOPLEFT", parent, "TOPLEFT", 22, y)
   sl:SetWidth(168); sl:SetHeight(16)
   sl:SetMinMaxValues(alo, ahi); sl:SetValueStep(1)
-  getglobal(prefix.."SliderText"):SetText(label)
-  getglobal(prefix.."SliderLow"):SetText(alo)
-  getglobal(prefix.."SliderHigh"):SetText(ahi)
+  GR_Compat.SetChildText(sl, "Text", label)   -- 1.12: _G[prefix.."SliderText"]
+  GR_Compat.SetChildText(sl, "Low", alo)
+  GR_Compat.SetChildText(sl, "High", ahi)
   local ed = CreateFrame("EditBox", prefix.."Edit", parent, "InputBoxTemplate")
   ed:SetPoint("LEFT", sl, "RIGHT", 26, 0)
   ed:SetWidth(38); ed:SetHeight(20)
   ed:SetAutoFocus(false); ed:SetNumeric(true); ed:SetMaxLetters(3)
-  sl:SetScript("OnValueChanged", function() if not configFrame or not configFrame.updating then applyFn(this:GetValue()) end end)
-  ed:SetScript("OnEnterPressed", function() local v = tonumber(this:GetText()); if v then applyFn(v) end; this:ClearFocus() end)
-  ed:SetScript("OnEscapePressed", function() this:ClearFocus() end)
+  sl:SetScript("OnValueChanged", function(self) if not configFrame or not configFrame.updating then applyFn(self:GetValue()) end end)
+  ed:SetScript("OnEnterPressed", function(self) local v = tonumber(self:GetText()); if v then applyFn(v) end; self:ClearFocus() end)
+  ed:SetScript("OnEscapePressed", function(self) self:ClearFocus() end)
   return sl, ed
 end
 
@@ -1494,9 +1768,9 @@ local function MakeCheck(parent, name, label, x, y, settingKey)
   local cb = CreateFrame("CheckButton", name, parent, "UICheckButtonTemplate")
   cb:SetPoint("TOPLEFT", parent, "TOPLEFT", x, y)
   cb:SetWidth(22); cb:SetHeight(22)
-  getglobal(name.."Text"):SetText(label)
-  cb:SetScript("OnClick", function()
-    GuildRecruiter_Settings[settingKey] = (this:GetChecked() and true) or false
+  GR_Compat.SetChildText(cb, "Text", label)   -- 1.12: _G[name.."Text"]
+  cb:SetScript("OnClick", function(self)
+    GuildRecruiter_Settings[settingKey] = (self:GetChecked() and true) or false
     if settingKey == "guildSync" then RecomputeBand() end
   end)
   return cb
@@ -1507,8 +1781,8 @@ local function MakeNumBox(parent, name, x, y, w, maxLetters, applyFn)
   ed:SetPoint("TOPLEFT", parent, "TOPLEFT", x, y)
   ed:SetWidth(w); ed:SetHeight(20)
   ed:SetAutoFocus(false); ed:SetNumeric(true); ed:SetMaxLetters(maxLetters)
-  ed:SetScript("OnEnterPressed", function() local v = tonumber(this:GetText()); if v then applyFn(v) end; this:ClearFocus() end)
-  ed:SetScript("OnEscapePressed", function() this:ClearFocus() end)
+  ed:SetScript("OnEnterPressed", function(self) local v = tonumber(self:GetText()); if v then applyFn(v) end; self:ClearFocus() end)
+  ed:SetScript("OnEscapePressed", function(self) self:ClearFocus() end)
   return ed
 end
 
@@ -1526,7 +1800,7 @@ local function Header(parent, text, x, y, w)
   h:SetPoint("TOPLEFT", parent, "TOPLEFT", x, y)
   h:SetText(text); h:SetTextColor(1, 0.82, 0)
   local ln = parent:CreateTexture(nil, "ARTWORK")
-  ln:SetTexture(1, 0.82, 0, 0.3)
+  GR_Compat.ColorTexture(ln, 1, 0.82, 0, 0.3)
   ln:SetPoint("TOPLEFT", parent, "TOPLEFT", x, y - 15)
   ln:SetWidth(w); ln:SetHeight(1)
   return h
@@ -1601,7 +1875,7 @@ function GuildRecruiter_ScanNow()
   if not current then return "(preparing)" end
   local b = current.lo..(current.hi and current.hi ~= current.lo and ("-"..current.hi) or "")
   if current.class then b = b.." c-"..current.class end
-  local pend = table.getn(pending)
+  local pend = #pending
   return b.."  (query "..stats.queries..(pend > 0 and (", +"..pend.." queued") or "")..")"
 end
 
@@ -1609,10 +1883,10 @@ local function StatusLine()
   if not running then return "Idle." end
   -- sweep position: where the band cursor sits (@lvl) and the current band width
   local pos = "band "..myLo.."-"..myHi.." @"..lo.." w"..width
-  if paused then return "Paused -- /who "..GuildRecruiter_ScanNow().." | "..pos.." | queued "..table.getn(contactQueue) end
+  if paused then return "Paused -- /who "..GuildRecruiter_ScanNow().." | "..pos.." | queued "..#contactQueue end
   if (GuildRecruiter_rescanWait or 0) > 0 then
     return "rescanning in "..math.ceil(GuildRecruiter_rescanWait).."s | "..pos
-         .." | queued "..table.getn(contactQueue).." | sent "..stats.contacted
+         .." | queued "..#contactQueue.." | sent "..stats.contacted
   end
   if scanning and GuildRecruiter_Settings.collectOnly then
     return "collecting  /who "..GuildRecruiter_ScanNow().."  "..pos
@@ -1620,11 +1894,11 @@ local function StatusLine()
   end
   if scanning then
     return "scan  /who "..GuildRecruiter_ScanNow().."  "..pos
-         .."  queued "..table.getn(contactQueue).." sent "..stats.contacted
+         .."  queued "..#contactQueue.." sent "..stats.contacted
          ..(stats.dropped > 0 and (" drop "..stats.dropped) or "")
          ..(CountTable(recruiters) > 0 and (" peers "..CountTable(recruiters)) or "")
   end
-  return "draining  queued "..table.getn(contactQueue).." | sent "..stats.contacted
+  return "draining  queued "..#contactQueue.." | sent "..stats.contacted
        .." ("..stats.invited.." inv, "..stats.whispered.." wh) | peers "..CountTable(recruiters)
 end
 
@@ -1633,8 +1907,8 @@ end
 -- BuildSettingsPanel, which sits near Lua 5.0's 32-upvalue-per-function limit.
 function GuildRecruiter_CycleReplyMode()
   local cur, idx = GuildRecruiter_Settings.replyMode or "notno", 1
-  for i = 1, table.getn(REPLY_ORDER) do if REPLY_ORDER[i] == cur then idx = i end end
-  idx = idx + 1; if idx > table.getn(REPLY_ORDER) then idx = 1 end
+  for i = 1, #REPLY_ORDER do if REPLY_ORDER[i] == cur then idx = i end end
+  idx = idx + 1; if idx > #REPLY_ORDER then idx = 1 end
   GuildRecruiter_Settings.replyMode = REPLY_ORDER[idx]
   RefreshConfig()
 end
@@ -1651,9 +1925,9 @@ local DD_DEF = {
 local ddPopup   -- shared option list, built lazily
 
 local function BuildDDPopup()
-  local p = CreateFrame("Frame", "GuildRecruiterDDPopup", UIParent)
+  local p = GR_Compat.BackdropFrame("Frame", "GuildRecruiterDDPopup", UIParent)
   p:SetFrameStrata("FULLSCREEN_DIALOG")
-  p:SetBackdrop({
+  GR_Compat.SetBackdrop(p, {
     bgFile = "Interface\\DialogFrame\\UI-DialogBox-Background",
     edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
     tile = true, tileSize = 16, edgeSize = 14,
@@ -1671,9 +1945,9 @@ local function BuildDDPopup()
     ht:SetBlendMode("ADD"); ht:SetAlpha(0.5)
     local t = ob:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
     t:SetPoint("LEFT", 4, 0); t:SetPoint("RIGHT", -4, 0); t:SetJustifyH("LEFT"); ob.text = t
-    ob:SetScript("OnClick", function()
-      if this.cb then this.cb(this.value)          -- generic menu (e.g. Lists view)
-      else this.target[this.key] = this.value end  -- settings/variant dropdown
+    ob:SetScript("OnClick", function(self)
+      if self.cb then self.cb(self.value)          -- generic menu (e.g. Lists view)
+      else self.target[self.key] = self.value end  -- settings/variant dropdown
       p:Hide(); GuildRecruiter_RefreshOpen()
     end)
     p.opts[i] = ob
@@ -1712,7 +1986,7 @@ function GuildRecruiter_OpenMenu(btn, order, label, cb, target, key)
   if not ddPopup then BuildDDPopup() end
   if ddPopup:IsShown() and ddPopup.owner == btn then ddPopup:Hide(); return end
   ddPopup.owner = btn
-  local n = table.getn(order)
+  local n = #order
   for i = 1, 6 do
     local ob = ddPopup.opts[i]
     if i <= n then
@@ -1740,10 +2014,10 @@ end
 local msgEditor
 
 local function BuildMsgEditor()
-  local f = CreateFrame("Frame", "GuildRecruiterMsgEditor", UIParent)
+  local f = GR_Compat.BackdropFrame("Frame", "GuildRecruiterMsgEditor", UIParent)
   f:SetFrameStrata("FULLSCREEN_DIALOG")
   f:SetWidth(430); f:SetHeight(200); f:SetPoint("CENTER", 0, 80)
-  f:SetBackdrop({
+  GR_Compat.SetBackdrop(f, {
     bgFile = "Interface\\DialogFrame\\UI-DialogBox-Background",
     edgeFile = "Interface\\DialogFrame\\UI-DialogBox-Border",
     tile = true, tileSize = 32, edgeSize = 24,
@@ -1757,27 +2031,27 @@ local function BuildMsgEditor()
   local hint = f:CreateFontString(nil, "ARTWORK", "GameFontNormalSmall")
   hint:SetPoint("TOPLEFT", 20, -40); hint:SetText("|cff999999%p = player name    %g = guild name|r")
 
-  local box = CreateFrame("Frame", nil, f)
+  local box = GR_Compat.BackdropFrame("Frame", nil, f)
   box:SetPoint("TOPLEFT", 18, -58); box:SetPoint("TOPRIGHT", -18, -58); box:SetHeight(80)
-  box:SetBackdrop({
+  GR_Compat.SetBackdrop(box, {
     bgFile = "Interface\\ChatFrame\\ChatFrameBackground",
     edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
     tile = true, tileSize = 16, edgeSize = 14,
     insets = { left = 4, right = 4, top = 4, bottom = 4 },
   })
-  box:SetBackdropColor(0, 0, 0, 0.6)
+  GR_Compat.SetBackdropColor(box, 0, 0, 0, 0.6)
 
   local eb = CreateFrame("EditBox", "GuildRecruiterMsgEditBox", box)
   eb:SetPoint("TOPLEFT", 8, -6); eb:SetPoint("BOTTOMRIGHT", -8, 6)
   if eb.SetMultiLine then eb:SetMultiLine(true) end
-  eb:SetFont("Fonts\\FRIZQT__.TTF", 12)
+  eb:SetFont("Fonts\\FRIZQT__.TTF", 12, "")   -- explicit empty flags: newer clients may reject the 2-arg form
   eb:SetMaxLetters(255); eb:SetAutoFocus(false); eb:SetTextInsets(2, 2, 2, 2)
   eb:SetScript("OnEscapePressed", function() f:Hide() end)
   f.eb = eb
 
   f.countFS = f:CreateFontString(nil, "ARTWORK", "GameFontDisableSmall")
   f.countFS:SetPoint("TOPRIGHT", box, "BOTTOMRIGHT", 0, -4)
-  eb:SetScript("OnTextChanged", function() f.countFS:SetText(string.len(this:GetText()).."/255") end)
+  eb:SetScript("OnTextChanged", function(self) f.countFS:SetText(string.len(self:GetText()).."/255") end)
 
   local save = CreateFrame("Button", nil, f, "UIPanelButtonTemplate")
   save:SetWidth(96); save:SetHeight(24); save:SetPoint("BOTTOMRIGHT", -18, 14); save:SetText("Save")
@@ -1840,17 +2114,17 @@ local function BuildSettingsPanel(parent)
   Label(fr, "Method:", 298, -82)
   fr.methodBtn = CreateFrame("Button", "GuildRecruiterConfigMethodBtn", fr, "UIPanelButtonTemplate")
   fr.methodBtn:SetPoint("TOPLEFT", 352, -78); fr.methodBtn:SetWidth(186); fr.methodBtn:SetHeight(22)
-  fr.methodBtn:SetScript("OnClick", function() GuildRecruiter_OpenDD(this, "method") end)
+  fr.methodBtn:SetScript("OnClick", function(self) GuildRecruiter_OpenDD(self, "method") end)
   GuildRecruiter_DDArrow(fr.methodBtn)
   Label(fr, "Mode:", 298, -108)
   fr.modeBtn = CreateFrame("Button", "GuildRecruiterConfigModeBtn", fr, "UIPanelButtonTemplate")
   fr.modeBtn:SetPoint("TOPLEFT", 352, -104); fr.modeBtn:SetWidth(186); fr.modeBtn:SetHeight(22)
-  fr.modeBtn:SetScript("OnClick", function() GuildRecruiter_OpenDD(this, "mode") end)
+  fr.modeBtn:SetScript("OnClick", function(self) GuildRecruiter_OpenDD(self, "mode") end)
   GuildRecruiter_DDArrow(fr.modeBtn)
   Label(fr, "Reply:", 298, -134)
   fr.replyBtn = CreateFrame("Button", "GuildRecruiterConfigReplyBtn", fr, "UIPanelButtonTemplate")
   fr.replyBtn:SetPoint("TOPLEFT", 352, -130); fr.replyBtn:SetWidth(186); fr.replyBtn:SetHeight(22)
-  fr.replyBtn:SetScript("OnClick", function() GuildRecruiter_OpenDD(this, "reply") end)
+  fr.replyBtn:SetScript("OnClick", function(self) GuildRecruiter_OpenDD(self, "reply") end)
   GuildRecruiter_DDArrow(fr.replyBtn)
   fr.syncCheck   = MakeCheck(fr, "GuildRecruiterConfigSync",   "Guild sync (dedup + split)",   298, -160, "guildSync")
   Label(fr, "Whisper message:", 298, -188)
@@ -1883,7 +2157,7 @@ local function BuildSettingsPanel(parent)
   fr.bar:SetStatusBarColor(0.2, 0.8, 0.3)
   fr.bar:SetMinMaxValues(0, 1); fr.bar:SetValue(0)
   local barbg = fr.bar:CreateTexture(nil, "BACKGROUND")
-  barbg:SetAllPoints(fr.bar); barbg:SetTexture(0, 0, 0, 0.4)
+  barbg:SetAllPoints(fr.bar); GR_Compat.ColorTexture(barbg, 0, 0, 0, 0.4)
   fr.barText = fr.bar:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
   fr.barText:SetPoint("CENTER", fr.bar, "CENTER", 0, 0)   -- says what the bar means (scan vs drain)
 
@@ -1905,8 +2179,8 @@ local function BuildSettingsPanel(parent)
   fr.autoScanCheck = MakeCheck(fr, "GuildRecruiterConfigAutoScan", "Auto-rescan", 0, 0, "autoScan")
   fr.autoScanCheck:ClearAllPoints()
   fr.autoScanCheck:SetPoint("BOTTOMLEFT", fr, "BOTTOMLEFT", 344, 15)
-  fr.autoScanCheck:SetScript("OnEnter", function()
-    GameTooltip:SetOwner(this, "ANCHOR_TOPLEFT")
+  fr.autoScanCheck:SetScript("OnEnter", function(self)
+    GameTooltip:SetOwner(self, "ANCHOR_TOPLEFT")
     GameTooltip:AddLine("Auto-rescan")
     GameTooltip:AddLine("Keep scanning: after a full /who sweep finishes, rest for the gap and sweep again, catching players who log in later. Runs until you press Stop.", 1, 1, 1, 1)
     GameTooltip:AddLine("Gap: "..(GuildRecruiter_Settings.autoScanDelay or 60).."s  (edit the box, or /gr autoscan <seconds>)", 0.6, 0.8, 1, 1)
@@ -1922,8 +2196,8 @@ local function BuildSettingsPanel(parent)
 
   -- throttled live refresh of the status line + bar
   fr.tick = 0
-  fr:SetScript("OnUpdate", function()
-    fr.tick = fr.tick - (arg1 or 0)
+  fr:SetScript("OnUpdate", function(self, elapsed)
+    fr.tick = fr.tick - (elapsed or 0)
     if fr.tick > 0 then return end
     fr.tick = 0.3
     fr.status:SetText(StatusLine())
@@ -1938,7 +2212,7 @@ local function BuildSettingsPanel(parent)
     elseif (GuildRecruiter_rescanWait or 0) > 0 then fr.barText:SetText("Rescanning in "..math.ceil(GuildRecruiter_rescanWait).."s")
     elseif scanning and GuildRecruiter_Settings.collectOnly then fr.barText:SetText("Collecting "..math.floor(prog * 100 + 0.5).."%   /who "..GuildRecruiter_ScanNow())
     elseif scanning then fr.barText:SetText("Scanning "..math.floor(prog * 100 + 0.5).."%   /who "..GuildRecruiter_ScanNow())
-    else fr.barText:SetText("Sending queued contacts ("..table.getn(contactQueue).." left)") end
+    else fr.barText:SetText("Sending queued contacts ("..#contactQueue.." left)") end
   end)
 
   configFrame = fr
@@ -1951,7 +2225,7 @@ end
 local function CopyValue(v)
   if type(v) == "table" then
     local c = {}
-    for k, x in v do c[k] = CopyValue(x) end
+    for k, x in pairs(v) do c[k] = CopyValue(x) end
     return c
   end
   return v
@@ -1961,7 +2235,7 @@ local function SaveProfile(name)
   if not name or name == "" then return false end
   GuildRecruiter_Settings.profiles = GuildRecruiter_Settings.profiles or {}
   local p = {}
-  for i = 1, table.getn(PROFILE_KEYS) do
+  for i = 1, #PROFILE_KEYS do
     local k = PROFILE_KEYS[i]
     p[k] = CopyValue(GuildRecruiter_Settings[k])
   end
@@ -1973,7 +2247,7 @@ end
 local function LoadProfile(name)
   local prof = GuildRecruiter_Settings.profiles and GuildRecruiter_Settings.profiles[name]
   if not prof then return false end
-  for i = 1, table.getn(PROFILE_KEYS) do
+  for i = 1, #PROFILE_KEYS do
     local k = PROFILE_KEYS[i]
     if prof[k] ~= nil then GuildRecruiter_Settings[k] = CopyValue(prof[k]) end
   end
@@ -2008,7 +2282,7 @@ local function BuildStatsPanel(parent)
   local pedit = CreateFrame("EditBox", "GuildRecruiterStatsProfile", fr, "InputBoxTemplate")
   pedit:SetPoint("TOPLEFT", 70, -60); pedit:SetWidth(150); pedit:SetHeight(20)
   pedit:SetAutoFocus(false); pedit:SetMaxLetters(24)
-  pedit:SetScript("OnEscapePressed", function() this:ClearFocus() end)
+  pedit:SetScript("OnEscapePressed", function(self) self:ClearFocus() end)
   local saveB = CreateFrame("Button", nil, fr, "UIPanelButtonTemplate")
   saveB:SetPoint("TOPLEFT", 18, -86); saveB:SetWidth(80); saveB:SetHeight(22); saveB:SetText("Save")
   local loadB = CreateFrame("Button", nil, fr, "UIPanelButtonTemplate")
@@ -2045,8 +2319,8 @@ local function BuildStatsPanel(parent)
   end)
 
   fr.tick = 0
-  fr:SetScript("OnUpdate", function()
-    fr.tick = fr.tick - (arg1 or 0)
+  fr:SetScript("OnUpdate", function(self, elapsed)
+    fr.tick = fr.tick - (elapsed or 0)
     if fr.tick > 0 then return end
     fr.tick = 1.0
     RefreshStats()
@@ -2068,9 +2342,9 @@ RefreshStats = function()
   tinsert(lines, " ")
   tinsert(lines, "|cffffd100Recent days|r")
   local keys = {}
-  for d in t.days do tinsert(keys, d) end
+  for d in pairs(t.days) do tinsert(keys, d) end
   table.sort(keys)
-  local n = table.getn(keys)
+  local n = #keys
   if n == 0 then tinsert(lines, "(no activity yet)") end
   local first = n - 2; if first < 1 then first = 1 end
   for i = first, n do
@@ -2086,22 +2360,22 @@ RefreshStats = function()
   local s = GuildRecruiter_Settings
   tinsert(lines, " ")
   tinsert(lines, "|cffffd100By variant / profile|r   A/B test: "..(GuildRecruiter_ABActive() and "|cff40ff40ON|r" or "off")
-               .."  (A + "..table.getn(s.abVariants or {}).." variant(s), * = active)")
+               .."  (A + "..#(s.abVariants or {}).." variant(s), * = active)")
   -- names currently in the live A/B test: "A" (control) + each challenger
   local active = {}
   if GuildRecruiter_ABActive() then
     active["A"] = true
-    for j = 1, table.getn(s.abVariants) do active[s.abVariants[j].name] = true end
+    for j = 1, #s.abVariants do active[s.abVariants[j].name] = true end
   end
   local vs = s.varStats or {}
   local vnames = {}
-  for v in vs do tinsert(vnames, v) end
+  for v in pairs(vs) do tinsert(vnames, v) end
   table.sort(vnames)
-  if table.getn(vnames) == 0 then
+  if #vnames == 0 then
     tinsert(lines, "no per-variant data yet -- run an A/B test (A/B tab) or load profiles, then recruit")
   else
-    for i = 1, table.getn(vnames) do
-      if i > 6 then tinsert(lines, "(+"..(table.getn(vnames) - 6).." more)"); break end
+    for i = 1, #vnames do
+      if i > 6 then tinsert(lines, "(+"..(#vnames - 6).." more)"); break end
       local v = vnames[i]; local r = vs[v]
       local c = r.contacted or 0
       local conv = (c > 0) and (math.floor((r.joined or 0) / c * 100 + 0.5).."%") or "--"
@@ -2114,11 +2388,11 @@ RefreshStats = function()
 
   local pnames = {}
   if GuildRecruiter_Settings.profiles then
-    for nm in GuildRecruiter_Settings.profiles do tinsert(pnames, nm) end
+    for nm in pairs(GuildRecruiter_Settings.profiles) do tinsert(pnames, nm) end
   end
   table.sort(pnames)
   statsFrame.profileText:SetText("Active profile: |cff33ff99"..(GuildRecruiter_Settings.activeProfile or "(unsaved)")
-    .."|r\nSaved: "..(table.getn(pnames) > 0 and table.concat(pnames, ", ") or "(none)"))
+    .."|r\nSaved: "..(#pnames > 0 and table.concat(pnames, ", ") or "(none)"))
 end
 
 -- ---------------------------------------------------------------------------
@@ -2168,10 +2442,10 @@ local function BuildABPanel(parent)
   fr.addBtn:SetPoint("LEFT", fr.toggle, "RIGHT", 8, 0); fr.addBtn:SetWidth(120); fr.addBtn:SetHeight(22); fr.addBtn:SetText("+ Add variant")
   fr.addBtn:SetScript("OnClick", function()
     local av = GuildRecruiter_Settings.abVariants
-    if table.getn(av) >= MAX_CHAL then return end
+    if #av >= MAX_CHAL then return end
     local s = GuildRecruiter_Settings
     local used = {}
-    for i = 1, table.getn(av) do used[av[i].name] = true end
+    for i = 1, #av do used[av[i].name] = true end
     local letter                          -- first free challenger letter B/C/D
     for i = 1, MAX_CHAL do local c = string.sub("BCD", i, i); if not used[c] then letter = c; break end end
     -- seeded from A (live) so a new challenger starts identical, then you tweak
@@ -2194,8 +2468,8 @@ local function BuildABPanel(parent)
   cr.wtBtn = CreateFrame("Button", nil, cr, "UIPanelButtonTemplate")
   cr.wtBtn:SetPoint("TOPLEFT", 14, -22); cr.wtBtn:SetWidth(132); cr.wtBtn:SetHeight(20)
   cr.wtBtn:RegisterForClicks("LeftButtonUp", "RightButtonUp")
-  cr.wtBtn:SetScript("OnClick", function() GuildRecruiter_BumpWeight(nil, arg1 == "RightButton" and -1 or 1) end)
-  cr.wtBtn:SetScript("OnEnter", function() GuildRecruiter_WeightTip(this) end)
+  cr.wtBtn:SetScript("OnClick", function(self, button) GuildRecruiter_BumpWeight(nil, button == "RightButton" and -1 or 1) end)
+  cr.wtBtn:SetScript("OnEnter", function(self) GuildRecruiter_WeightTip(self) end)
   cr.wtBtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
   cr.msgFS = cr:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
   cr.msgFS:SetPoint("TOPLEFT", 154, -24); cr.msgFS:SetWidth(236); cr.msgFS:SetHeight(14); cr.msgFS:SetJustifyH("LEFT")
@@ -2211,24 +2485,24 @@ local function BuildABPanel(parent)
     cv:SetPoint("LEFT", nm, "RIGHT", 12, 0); row.convFS = cv
     local rm = CreateFrame("Button", nil, row, "UIPanelButtonTemplate")
     rm:SetPoint("TOPRIGHT", 0, 0); rm:SetWidth(72); rm:SetHeight(20); rm:SetText("Remove"); rm.idx = i
-    rm:SetScript("OnClick", function() tremove(GuildRecruiter_Settings.abVariants, this.idx); RefreshABPanel() end)
+    rm:SetScript("OnClick", function(self) tremove(GuildRecruiter_Settings.abVariants, self.idx); RefreshABPanel() end)
     local md = CreateFrame("Button", nil, row, "UIPanelButtonTemplate")
     md:SetPoint("TOPLEFT", 14, -22); md:SetWidth(150); md:SetHeight(20)
-    md:SetScript("OnClick", function() GuildRecruiter_OpenDD(this, "mode", this.variant) end)
+    md:SetScript("OnClick", function(self) GuildRecruiter_OpenDD(self, "mode", self.variant) end)
     GuildRecruiter_DDArrow(md); row.modeBtn = md
     local rp = CreateFrame("Button", nil, row, "UIPanelButtonTemplate")
     rp:SetPoint("LEFT", md, "RIGHT", 8, 0); rp:SetWidth(150); rp:SetHeight(20)
-    rp:SetScript("OnClick", function() GuildRecruiter_OpenDD(this, "reply", this.variant) end)
+    rp:SetScript("OnClick", function(self) GuildRecruiter_OpenDD(self, "reply", self.variant) end)
     GuildRecruiter_DDArrow(rp); row.replyBtn = rp
     local mb = CreateFrame("Button", nil, row, "UIPanelButtonTemplate")
     mb:SetPoint("LEFT", rp, "RIGHT", 8, 0); mb:SetWidth(140); mb:SetHeight(20); mb:SetText("Edit message...")
-    mb:SetScript("OnClick", function() GuildRecruiter_EditMessage(this.variant) end)
+    mb:SetScript("OnClick", function(self) GuildRecruiter_EditMessage(self.variant) end)
     row.msgBtn = mb
     local wb = CreateFrame("Button", nil, row, "UIPanelButtonTemplate")
     wb:SetPoint("TOPLEFT", 16, -46); wb:SetWidth(132); wb:SetHeight(20)
     wb:RegisterForClicks("LeftButtonUp", "RightButtonUp")
-    wb:SetScript("OnClick", function() GuildRecruiter_BumpWeight(this.variant, arg1 == "RightButton" and -1 or 1) end)
-    wb:SetScript("OnEnter", function() GuildRecruiter_WeightTip(this) end)
+    wb:SetScript("OnClick", function(self, button) GuildRecruiter_BumpWeight(self.variant, button == "RightButton" and -1 or 1) end)
+    wb:SetScript("OnEnter", function(self) GuildRecruiter_WeightTip(self) end)
     wb:SetScript("OnLeave", function() GameTooltip:Hide() end)
     row.wtBtn = wb
     row.msgFS = row:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
@@ -2245,7 +2519,7 @@ RefreshABPanel = function()
   if not abFrame then return end
   local s = GuildRecruiter_Settings
   local av = s.abVariants
-  local n = table.getn(av)               -- challenger count
+  local n = #av               -- challenger count
   if not s.abOn then abFrame.toggle:SetText("A/B: Off")
   elseif n < 1 then abFrame.toggle:SetText("A/B: |cffffcc00On (inactive)|r")   -- on, but no variant to split = no-op
   else abFrame.toggle:SetText("A/B: |cff40ff40Running|r") end
@@ -2295,8 +2569,8 @@ local TAB_DEFS = { { "settings", "Settings" }, { "lists", "Lists" }, { "stats", 
 local function ShowTab(name)
   activeTab = name
   if ddPopup then ddPopup:Hide() end   -- don't leave a dropdown list floating across tabs
-  for n, p in tabPanels do if n == name then p:Show() else p:Hide() end end
-  for n, b in tabButtons do
+  for n, p in pairs(tabPanels) do if n == name then p:Show() else p:Hide() end end
+  for n, b in pairs(tabButtons) do
     if n == name then b:LockHighlight() else b:UnlockHighlight() end
   end
   if name == "settings" then RefreshConfig()
@@ -2306,21 +2580,21 @@ local function ShowTab(name)
 end
 
 local function BuildUI()
-  local m = CreateFrame("Frame", "GuildRecruiterUI", UIParent)
+  local m = GR_Compat.BackdropFrame("Frame", "GuildRecruiterUI", UIParent)
   m:SetWidth(560); m:SetHeight(470)
   m:SetPoint("CENTER", 0, 0)
   m:SetFrameStrata("DIALOG")
-  m:SetBackdrop({
+  GR_Compat.SetBackdrop(m, {
     bgFile = "Interface\\DialogFrame\\UI-DialogBox-Background",
     edgeFile = "Interface\\DialogFrame\\UI-DialogBox-Border",
     tile = true, tileSize = 32, edgeSize = 32,
     insets = { left = 11, right = 12, top = 12, bottom = 11 },
   })
   m:EnableMouse(true); m:SetMovable(true); m:RegisterForDrag("LeftButton")
-  m:SetScript("OnDragStart", function() this:StartMoving() end)
-  m:SetScript("OnDragStop", function() this:StopMovingOrSizing() end)
+  m:SetScript("OnDragStart", function(self) self:StartMoving() end)
+  m:SetScript("OnDragStop", function(self) self:StopMovingOrSizing() end)
   m:SetScript("OnHide", function() if ddPopup then ddPopup:Hide() end end)  -- no orphan dropdown
-  m:SetScript("OnUpdate", function() GuildRecruiter_HeaderTick(this, arg1) end)  -- run state on every tab
+  m:SetScript("OnUpdate", function(self, elapsed) GuildRecruiter_HeaderTick(self, elapsed) end)  -- run state on every tab
   tinsert(UISpecialFrames, "GuildRecruiterUI")   -- Escape closes the window (house rule)
   m:Hide()
 
@@ -2348,7 +2622,7 @@ local function BuildUI()
 
   -- tabs hang just below the frame
   local prev
-  for i = 1, table.getn(TAB_DEFS) do
+  for i = 1, #TAB_DEFS do
     local id, label = TAB_DEFS[i][1], TAB_DEFS[i][2]
     local b = CreateFrame("Button", "GuildRecruiterUITab"..i, m, "UIPanelButtonTemplate")
     b:SetWidth(106); b:SetHeight(24)
@@ -2429,15 +2703,15 @@ InitMinimap = function()
   border:SetTexture("Interface\\Minimap\\MiniMap-TrackingBorder")
   border:SetPoint("TOPLEFT", 0, 0)
 
-  mb:SetScript("OnClick", function()
-    if arg1 == "RightButton" then
+  mb:SetScript("OnClick", function(self, button)
+    if button == "RightButton" then
       if running then Stop() else Start() end
     else
       ToggleConfig()
     end
   end)
-  mb:SetScript("OnDragStart", function()
-    this:SetScript("OnUpdate", function()
+  mb:SetScript("OnDragStart", function(self)
+    self:SetScript("OnUpdate", function()
       local mx, my = GetCursorPosition()
       local scale = Minimap:GetEffectiveScale()
       mx, my = mx / scale, my / scale
@@ -2446,20 +2720,20 @@ InitMinimap = function()
       MinimapUpdatePos()
     end)
   end)
-  mb:SetScript("OnDragStop", function() this:SetScript("OnUpdate", nil) end)
-  mb:SetScript("OnEnter", function()
-    GuildRecruiter_MinimapTip(this)
+  mb:SetScript("OnDragStop", function(self) self:SetScript("OnUpdate", nil) end)
+  mb:SetScript("OnEnter", function(self)
+    GuildRecruiter_MinimapTip(self)
     -- keep the tooltip live while hovering, so status updates in real time
-    this.tipTick = 0
-    this:SetScript("OnUpdate", function()
-      this.tipTick = (this.tipTick or 0) + (arg1 or 0)
-      if this.tipTick < 0.3 then return end
-      this.tipTick = 0
-      GuildRecruiter_MinimapTip(this)   -- OnLeave clears this OnUpdate, so it only runs while hovered
+    self.tipTick = 0
+    self:SetScript("OnUpdate", function(btn, elapsed)
+      btn.tipTick = (btn.tipTick or 0) + (elapsed or 0)
+      if btn.tipTick < 0.3 then return end
+      btn.tipTick = 0
+      GuildRecruiter_MinimapTip(btn)   -- OnLeave clears this OnUpdate, so it only runs while hovered
     end)
   end)
-  mb:SetScript("OnLeave", function()
-    this:SetScript("OnUpdate", nil)
+  mb:SetScript("OnLeave", function(self)
+    self:SetScript("OnUpdate", nil)
     GameTooltip:Hide()
   end)
 
@@ -2523,7 +2797,7 @@ SlashCmdList["GUILDRECRUITER"] = function(msg)
       DeleteProfile(pname); Print("Deleted profile '"..pname.."'.")
     elseif sub == "list" then
       local names = ""
-      if GuildRecruiter_Settings.profiles then for nm in GuildRecruiter_Settings.profiles do names = names..nm..", " end end
+      if GuildRecruiter_Settings.profiles then for nm in pairs(GuildRecruiter_Settings.profiles) do names = names..nm..", " end end
       Print("Profiles: "..(names ~= "" and names or "(none)").."  -- active: "..(GuildRecruiter_Settings.activeProfile or "(unsaved)"))
     else
       Print("Usage: /gr profile save|load|delete <name> | profile list")
@@ -2536,7 +2810,7 @@ SlashCmdList["GUILDRECRUITER"] = function(msg)
       GuildRecruiter_Settings.negatives[phrase] = nil; Print("Removed refusal word '"..phrase.."'.")
     elseif sub == "list" then
       local a = ""
-      for p in GuildRecruiter_Settings.negatives do a = a..p..", " end
+      for p in pairs(GuildRecruiter_Settings.negatives) do a = a..p..", " end
       Print("Refusal words: "..a)
     else
       Print("Usage: /gr noword add|remove <phrase> | noword list")
@@ -2549,7 +2823,7 @@ SlashCmdList["GUILDRECRUITER"] = function(msg)
       GuildRecruiter_Settings.affirmatives[phrase] = nil; Print("Removed yes word '"..phrase.."'.")
     elseif sub == "list" then
       local a = ""
-      for p in GuildRecruiter_Settings.affirmatives do a = a..p..", " end
+      for p in pairs(GuildRecruiter_Settings.affirmatives) do a = a..p..", " end
       Print("Yes words: "..a)
     else
       Print("Usage: /gr yesword add|remove <phrase> | yesword list")
@@ -2565,7 +2839,7 @@ SlashCmdList["GUILDRECRUITER"] = function(msg)
     local sub = string.lower(larg or "")
     if sub == "on" or sub == "off" then
       GuildRecruiter_Settings.abOn = (sub == "on"); GuildRecruiter_RefreshOpen()
-      Print("Simultaneous A/B "..(GuildRecruiter_Settings.abOn and "ON" or "OFF").."  (A + "..table.getn(GuildRecruiter_Settings.abVariants).." variant(s)).")
+      Print("Simultaneous A/B "..(GuildRecruiter_Settings.abOn and "ON" or "OFF").."  (A + "..#GuildRecruiter_Settings.abVariants.." variant(s)).")
     elseif sub == "clear" then
       GuildRecruiter_Settings.abVariants = {}; GuildRecruiter_RefreshOpen(); Print("A/B variants cleared (variant A = your Settings is unaffected).")
     else
@@ -2622,7 +2896,7 @@ SlashCmdList["GUILDRECRUITER"] = function(msg)
       GuildRecruiter_Settings.blacklist[who] = nil; Print("Un-blacklisted "..who..".")
     elseif sub == "list" then
       local names = ""
-      for n in GuildRecruiter_Settings.blacklist do names = names..n..", " end
+      for n in pairs(GuildRecruiter_Settings.blacklist) do names = names..n..", " end
       Print("Blacklist: "..(names ~= "" and names or "(empty)"))
     else
       Print("Usage: /gr black add <name> | black remove <name> | black list")
@@ -2632,7 +2906,7 @@ SlashCmdList["GUILDRECRUITER"] = function(msg)
       GuildRecruiter_Settings.classFilter = nil; Print("Class filter cleared (all classes).")
     else
       local cf = {}
-      for c in string.gfind(larg, "[^%s,]+") do cf[c] = true end
+      for c in string.gmatch(larg, "[^%s,]+") do cf[c] = true end
       GuildRecruiter_Settings.classFilter = cf; Print("Class filter set: "..larg)
     end
   elseif cmd == "set" then

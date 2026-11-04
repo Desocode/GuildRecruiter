@@ -1,6 +1,48 @@
 Guild Rawcruiter  --  vanilla 1.12 / Turtle WoW guild recruitment helper
 ==============================================================================
 
+
+WoW: FOREVER BUILD  (branch "forever", version 4.0.0-forever.1)
+-----------------------------------------------------------------
+This is a BETA port to the WoW: Forever client (## Interface: 16001, modified
+Lua 5.1, Mainline-style API). It has NOT been tested in game -- it was ported
+and checked offline only. The 1.12 / Turtle build stays on the "main" branch;
+the text below this section describes that build's features, which the port
+keeps unchanged (same settings, defaults, slash commands and pacing).
+
+What changed: the Lua 5.0 code was converted to Lua 5.1 (no table.getn,
+string.gfind, getglobal, `this` or arg1 globals), and every client call whose
+Forever behaviour is unconfirmed now goes through one small compatibility
+layer, GR_Compat, at the top of GuildRecruiter.lua. Each GR_Compat function
+checks which API the client actually has (feature detection, never a version
+check) and uses the modern one when present, else the old 1.12 global:
+  /who            C_FriendList.SendWho / GetNumWhoResults / GetWhoInfo /
+                  SetWhoToUi          (else SendWho, GetWhoInfo, SetWhoToUI)
+  guild invite    C_GuildInfo.Invite  (else GuildInviteByName, GuildInvite,
+                                       then the /ginvite chat command)
+  whisper         C_ChatInfo.SendChatMessage      (else SendChatMessage)
+  guild sync      C_ChatInfo.SendAddonMessage + RegisterAddonMessagePrefix
+  window frames   BackdropTemplate when the client has it
+Values the client marks secret (issecretvalue) are skipped, never compared.
+On load the addon prints which invite, /who and whisper calls it picked.
+
+KNOWN RISK: the warcraft.wiki.gg pages for C_FriendList.SendWho and
+C_GuildInfo.Invite say both need a hardware event (a key or mouse press). If
+Forever enforces that, the automatic /who sweep and the automatic invites,
+which run on a timer, will be blocked ("Interface action failed because of an
+AddOn"). Sending a whisper is not restricted, but whisper mode still needs the
+/who sweep to find people. Details are in PORT_NOTES.md.
+
+Before trusting it, run this in game and send the output along with any error:
+  /dump select(4, GetBuildInfo())
+  /run print(C_FriendList and C_FriendList.SendWho, SendWho, GuildInvite, C_GuildInfo and C_GuildInfo.Invite, string.gfind, table.getn, BackdropTemplateMixin)
+
+Install path on the Forever beta was reported as
+  World of Warcraft\_classic_beta_\Interface\AddOns\GuildRecruiter\
+(this may change). The folder must stay named "GuildRecruiter".
+
+==============================================================================
+
 Scans online players with /who and sends paced guild contacts (invite and/or
 whisper) to players who are NOT already in a guild. Built for vanilla (1.12)
 clients and Turtle WoW.
