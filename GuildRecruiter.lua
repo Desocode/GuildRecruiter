@@ -250,31 +250,19 @@ function GR_Compat.SetSecureInvite(name)
   if type(name) ~= "string" or not string.find(name, "^[^%c/|]+$") or string.find(name, "^%s") or string.find(name, "%s$") then
     error("not a player name for /ginvite: "..tostring(name), 0)   -- no newlines/slashes/escapes in a macro line
   end
-  -- A secure /ginvite macro was tried on a real Forever client and refused: "A macro
-  -- script has been blocked from an action only available to the Blizzard UI".
-  -- So the addon does not send the invite. It types "/ginvite <name>" into the chat
-  -- box and the PLAYER presses Enter (typed chat is Blizzard UI). The secure
-  -- button's action stays empty.
-  GR_Compat.lastCall, GR_Compat.lastCallAt = "/ginvite typed into chat for "..name, GetTime()
-  if not GR_Compat.PrefillChat("/ginvite "..name) then
-    if DEFAULT_CHAT_FRAME then DEFAULT_CHAT_FRAME:AddMessage("|cffff8000Rawcruiter:|r couldn't open the chat box -- type: /ginvite "..name) end
+  -- Real Forever client results: a direct C_GuildInfo.Invite is FORBIDDEN, a secure
+  -- /ginvite macro is refused ("macro script has been blocked ... Blizzard UI"), and
+  -- typing "/ginvite <name>" into the chat box from addon code is ALSO forbidden
+  -- (the addon touching the edit box taints the command the player then sends:
+  -- "The client forbids Invite() for addons"). So the addon never sends the invite
+  -- and never touches the chat box. It prints the name as a clickable player link;
+  -- the PLAYER invites with Blizzard's own menu (right-click > Invite to Guild) or
+  -- types the command by hand. Untested whether the menu entry works from a link.
+  local link = "|Hplayer:"..name.."|h["..name.."]|h"
+  if DEFAULT_CHAT_FRAME then
+    DEFAULT_CHAT_FRAME:AddMessage("|cffff8000Rawcruiter:|r invite "..link
+      .." -- right-click the name > Invite to Guild, or type: /ginvite "..name)
   end
-end
-
--- put text in the chat box ready to send; the player presses Enter. Unverified on
--- Forever (the Forever dev guide warns against ChatFrame_OpenChat /
--- ChatEdit_ActivateChat), so every call is pcall-guarded and false means "failed".
-function GR_Compat.PrefillChat(text)
-  if type(ChatFrame_OpenChat) == "function" and DEFAULT_CHAT_FRAME
-     and pcall(ChatFrame_OpenChat, text, DEFAULT_CHAT_FRAME) then
-    return true
-  end
-  local eb = DEFAULT_CHAT_FRAME and DEFAULT_CHAT_FRAME.editBox
-  if eb and type(ChatEdit_ActivateChat) == "function" and pcall(ChatEdit_ActivateChat, eb) then
-    eb:SetText(text)
-    return true
-  end
-  return false
 end
 
 -- empty the secure button's action. Between clicks it is always empty: PostClick
