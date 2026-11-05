@@ -859,7 +859,7 @@ do
   if type(ns) == "table" then ns.Compat = GR_Compat else GuildRecruiter_Compat = GR_Compat end
 end
 
-local VERSION    = "4.0.0-forever.1"
+local VERSION    = "4.0.0-forever.2"
 
 -- Key Bindings entry (Bindings.xml in this folder, loaded by the client): a
 -- CLICK binding on the secure button GuildRecruiterNextButton. FrameXML labels
