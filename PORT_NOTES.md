@@ -4,8 +4,11 @@ Version `4.0.0-forever.1`, branch `forever`, based on `1023a66` (the v3.22 sourc
 plus REQUIREMENTS.md). Status: **ported and checked offline; a few player tests
 on a Forever client** (§1.10, §1.11). Committed: the port `e824243`, key-press
 mode (§1.9) `716a33b`, the secure button and the copy box (§1.10) `dccd448` to
-`520c586`, the API audit `0c17add`. **Not committed:** automatic whispers and
-the Ready list (§1.11), on top of `0c17add`.
+`520c586`, the API audit `0c17add`, automatic whispers and the Ready list
+(§1.11) `1856b3e`, then the clipboard, the "Rawcruiter" chat tab, the Free
+Trial detection / `C_GuildInfo.Invite` post-hook and the chat tidy-up
+(`5755cd5` to `94ef08a`). **Not committed:** the guide window (§1.12), on top
+of `94ef08a`.
 
 Port (`e824243` vs `1023a66`, `git diff --numstat`): GuildRecruiter.lua +526 / -252,
 GuildRecruiter.toc +3 / -3, README.txt +42 / -0.
@@ -18,6 +21,10 @@ Automatic whispers + Ready list (working tree vs `0c17add`): GuildRecruiter.lua
 +669 / -142, README.txt +104 / -70, PORT_NOTES.md. The .toc and Bindings.xml are
 unchanged. All files are LF with no CR bytes, and GuildRecruiter.lua is still
 pure ASCII.
+Guide window (working tree vs `94ef08a`, §1.12): GuildRecruiterGuide.lua (new,
+992 lines), GuildRecruiter.lua +79 / -26, GuildRecruiter.toc +1, README.txt +34,
+.github/workflows/package.yml +14, PORT_NOTES.md. Both .lua files are ASCII,
+LF, 0 CR bytes.
 
 Line counts below are lines of the 1.12 source (HEAD), counted with a tokenizer, so
 words in comments and strings are not counted.
@@ -518,6 +525,187 @@ the same pair, `Blizzard_FrameXML/Mainline/ReadyCheck.lua:71-72`). Both under
 `pcall` and feature-detected. `PlaySoundFile` is not in the Forever docs and is
 not used.
 
+### 1.12 The guide window (GuildRecruiterGuide.lua)
+
+Goal (the player's words): "someone can pick this up and roll intuitively". One
+plain window, `GuildRecruiterGuide`, in a new file listed in the .toc after
+GuildRecruiter.lua. Opened by `/gr` (bare), `/gr guide`, a left-click on the
+minimap button (shift-left-click opens the old settings window), and by itself
+at login (`PLAYER_ENTERING_WORLD`, once per session) until the player ticks
+"Don't show again". `/gr help` still lists the commands. The file reaches
+`GR_Compat` through the addon's private table (`ns.Compat`, set in the main
+file; a global `GuildRecruiter_Compat` only if the client passes no table).
+Everything in it is a global `GuildRecruiter_Guide*` function or a field on our
+own frames, so the main file's locals (171) and upvalues are untouched.
+
+**Layout.** 380 x 500, default top-right (`TOPRIGHT -16, -200`) so it stays
+clear of Blizzard's Guild window (`CommunitiesFrame`, 814 px wide in the left
+panel area, Invite Member at its bottom-right: `CommunitiesFrame.xml:303-306,
+582-585`) and of the chat (bottom-left); draggable, position saved in
+`guidePos`. Strata HIGH. Two views and a footer:
+
+- *Setup* (first run until Finish): three cards with a tick each in the top
+  row, Back / Next (Finish on card 3; a card left as it is just keeps its
+  setting).
+  1. "How should we reach people?" -- [Whisper first (recommended)] =
+     `mode=whisperinvite, inviteDelay=5, jitter=true, sessionCap=30,
+     replyMode=notno`; [Direct] = `mode=invite`. Presets only
+     (`GuildRecruiter_GuideApproach`); the tick is `guideCards.approach`.
+  2. "What should the whisper say?" -- three templates (Short = the existing
+     default `NEW_WHISPER`, Friendly, Dungeons & raids; `%p`/`%g`, all well
+     under 255 and capped by `WhisperBody` anyway), [Write your own...] opens
+     the existing editor (`GuildRecruiter_EditMessage`), and a live preview
+     through `GuildRecruiter_WhisperPreview` = `WhisperBody("Sam", msg)` with the
+     player's real guild name. Tick: `guideCards.message`.
+  3. "Where do the names show up?" -- no tab: [Create the Rawcruiter chat tab]
+     (`GR_Compat.MakeChatTab`, i.e. `/gr chattab`), then [Reload now]
+     (`C_UI.Reload`, else `ReloadUI`, under `pcall`; it also sets `guideDone`).
+     Tab found and not made just now: [I already made it] (= Finish). The tick
+     is live: `GR_Compat.ListFrame() ~= nil`. Skipped: the live guide's step 3
+     becomes "Find the name in your chat" with a [Print] button.
+- *Live guide*: "WHAT TO DO NOW", ONE headline, one sub line, one warning line
+  (combat, or the player's own trial account), ONE big button (Start / Next /
+  Resume, from `GuildRecruiter_GuideState`) with small [Pause] [Stop] beside it
+  while a run is armed. Below: "INVITE THE PEOPLE WHO SAID YES" -- either
+  "Nobody has said yes yet." (or "Invited Bob. Nobody else is waiting.") or
+  the four numbered steps with ticks, the first unticked one highlighted with
+  a gold ">", then "Waiting (3), longest first: Bob 2m, ..." and [List] (the
+  old Ready panel with Copy and Done). Then "YOUR SETTINGS": Approach (one
+  button that switches the two presets), Levels (two number boxes, same
+  setters as the Settings tab: `GuildRecruiter_SetMinLevel/SetMaxLevel`),
+  Message (preview + [Change], which opens card 2 alone with a Done button),
+  and the "Today:" strip (whispered, said yes, invited, free trial skipped,
+  from today's tally bucket).
+- *Footer*: [Setup] (cards again), [Advanced...] (the existing
+  Settings/Lists/Stats window, `GuildRecruiter_GotoSettings`), and the "Don't
+  show again" check (`guideSeen`). Every button, box and check has a one-line
+  tooltip (`frame.tip`, `GuildRecruiter_GuideTip`).
+
+**What to do now** (`GuildRecruiter_GuideState`, read-only: it calls
+`GuildRecruiter_NextStep`, `GuildRecruiter_RunState`, `GuildRecruiter_ReadyCount`,
+`IsInGuild`, `GetGuildInfo`, `CanGuildInvite`, `IsTrialAccount`,
+`IsVeteranTrialAccount`, `InCombatLockdown`; none of them changes anything and
+NextStep never deals the A/B variant). In this order:
+
+| State | Headline | Big button |
+|---|---|---|
+| `not IsInGuild()` | Join a guild first | Start, disabled |
+| guild data loaded, mode not whisper-only, `CanGuildInvite()` false | Your rank can't invite people -- ask an officer | Start, disabled |
+| not running, a single invite set (`act == "one"`) | Press Next for that player's name | the Next press |
+| not running | Press Start | Start -> `GuildRecruiter_StartRun` = `Start()` |
+| paused by a block report (`GR_Compat.pausedByBlock`) | Paused: the game blocked the /who search (or a whisper / an invite / an action, from `GR_Compat.blockLine`) | Resume -> `GuildRecruiter_TogglePause` |
+| paused by the player | Paused | Resume |
+| `act == "who"`, rest / awaiting / wait / due | Resting Ns ... / Searching -- waiting for the game's answer / Next search in Ns / Press Next to search for players | "Next: search" (enabled only when due) |
+| `act == "contact"` (Direct) | Press Next for the next player to invite (or Next name in Ns, or In combat ...) | "Next: Invite Bob" |
+| `short` "Whispering (N)" | Whispering 12 players -- nothing to do | disabled |
+| `short` "Held: ..." | On hold: in combat | disabled |
+| "Cap reached" / "Sweep done" / waiting | Reached your limit of 30 for this run / Search finished -- waiting for replies / Waiting for replies -- nothing to do | disabled |
+| any of the above with N > 0 on the Ready list | N people said yes -- invite them below (when every waiting entry is a reply; with Direct prompts on the list: N people waiting for your invite -- see below). The run state moves to the sub line, "Meanwhile: ..." | unchanged |
+
+**The press reuses the existing code** (`GuildRecruiter_GuidePress`): Start ->
+`Start()`; Resume -> `GuildRecruiter_TogglePause`; Next -> exactly the secure
+Next button's PreClick code `GuildRecruiter_SecurePreClick(btn, ...)` when the
+click came through the guide's secure twin, or `GuildRecruiter_Next()` (= typed
+`/gr next`) when it came through the plain stand-in button (in combat). No
+press logic is duplicated, and the state is re-read at the click.
+
+**Read-only detectors** for the four invite steps (`GuildRecruiter_GuideSteps`,
+polled every 0.2 s while the window is shown):
+
+| Step | Done when (all reads) | Secure button / fallback hint |
+|---|---|---|
+| 1 Open the Guild window | `CommunitiesFrame:IsShown()` (or a `GuildFrame:IsShown()`), or the invite box is already open | [Open] = `GuildRecruiterGuideOpenGuild`; hint "(or press J)" from `GetBindingKey("TOGGLEGUILDTAB")` (Bindings_Camelot.xml:1244), else "(Guild button on your bar)" |
+| 2 Click Invite Member | `StaticPopup_Visible("ADD_GUILDMEMBER")` or `("ADD_GUILDMEMBER_WITH_FINDER_LINK")` (StaticPopup.lua:179, a `securecallfunction` read) | none: the button is `CommunitiesFrame.InviteButton`, a parentKey with no global name. Text: "Click Invite Member (bottom of the Guild window)" |
+| 3 Switch to the Rawcruiter tab | `GR_Compat.ListFrame():IsVisible()` (docked and selected, or floating) | [Show] = `GuildRecruiterGuideShowTab`; hint "Switch your chat to the Rawcruiter tab". No tab: "Find the name in your chat" + a plain [Print] (prints up to 5 waiting names with `GR_Compat.PrintLink`, one line each) |
+| 4 Shift-click a name, press Accept | `GR_Compat.lastInvite` set by the `C_GuildInfo.Invite` post-hook (`GR_Compat.OnInviteSent`) within the last 8 s; shows "Invited Bob" or "Bob is a Free Trial account -- skipped" | none. With the Guild Finder box open: "Type the name (this box ignores shift-click), press Accept" |
+
+**Secure buttons** (all three `SecureActionButtonTemplate,UIPanelButtonTemplate`,
+parented AND anchored to UIParent only, strata HIGH, level = guide + 20,
+`RegisterForClicks("LeftButtonUp")`, `useOnKeyDown=false`). The guide window
+stays a plain frame: each secure button is laid over a plain placeholder slot
+at the slot's screen position (`GuildRecruiter_GuidePlace`, the same
+UIParent-units sum as `GuildRecruiter_PlaceNext`); anchoring or parenting it to
+the window would make the window protected (ScriptRegion_IsProtected, §1.10).
+
+| Button | Attributes | Set where (all out of combat only) |
+|---|---|---|
+| `GuildRecruiterGuideNext` (the big button) | `useOnKeyDown=false` only; NO action attribute ever. PreClick -> `GuildRecruiter_GuidePress(self, button, down, true)`; PostClick -> `GuildRecruiter_SecurePostClick` (empties nothing: there is nothing to empty) | `GuildRecruiter_GuideSecureButton`, once, from `GuildRecruiter_GuideMakeSecure`, which returns if `InCombatLockdown()` |
+| `GuildRecruiterGuideOpenGuild` | `type="click"`, `clickbutton=GuildMicroButton` | `GuildRecruiter_GuideSync`, which returns at once if `InCombatLockdown()`; set again only if the reference changed |
+| `GuildRecruiterGuideShowTab` | `type="click"`, `clickbutton=_G["ChatFrame"..N.."Tab"]`, N = the chat frame `GR_Compat.ListFrame()` returns | same |
+
+`type="click"` is the template's own `SECURE_ACTIONS.click`
+(`Blizzard_FrameXML/SecureTemplates.lua:557-564`): `delegate:Click(button)`
+after the same `HasAccessConstraints` / `ScriptedInput` checks that a `/click`
+macro makes (`SlashCommands.lua:726-743`), without the macro parser or the
+restricted `C_Macro.RunMacroText` (UIMacrosDocumentation.lua:41-43). If it
+does not work in game, `type="macro"`, `macrotext="/click GuildMicroButton"`
+is the drop-in alternative. `GuildMicroButton` exists on Forever: the
+Mainline XML loads as `[Family]` (`Blizzard_MicroMenu.toc`;
+`Mainline/MainMenuBarMicroButtons.xml:229`) and the Camelot container lists it
+(`Camelot/MicroMenuContainerOverrides.lua:11`); its OnClick is
+`ToggleGuildFrame()` (`MainMenuBarMicroButtons.lua:1310-1318` ->
+`Blizzard_Game/Mainline/Game.lua:1-26` -> `ToggleCommunitiesFrame`). The chat
+tab's OnClick is `FCF_Tab_OnClick` (FloatingChatFrame.lua:1697-1735), which
+writes `SELECTED_CHAT_FRAME` -- the reason it must run from Blizzard's secure
+code and never from ours.
+
+Combat: `PLAYER_REGEN_DISABLED` (just before lockdown) hides all three
+(`GuildRecruiter_GuideSecureHide`); `GuildRecruiter_GuideSync` does nothing in
+lockdown; `PLAYER_REGEN_ENABLED` re-syncs. In combat the plain big button
+(`GuildRecruiterGuide.live.primary`) stands in, and the steps keep their hints;
+the warning line says "In combat: the Open and Show buttons come back when it
+ends." The secure buttons are also hidden while the window is dragged, closed
+or on the setup view. The OnUpdate path reaches them only through
+`GuildRecruiter_GuideSync`, i.e. never in lockdown.
+
+**Changes in GuildRecruiter.lua** (no recruiting logic, pacing default,
+SavedVariables name or invite counting changed):
+- `ns.Compat = GR_Compat` (private table; global fallback), before `VERSION`.
+- `GR_Compat.OnInviteSent`: `GR_Compat.lastInvite = p` (read by step 4).
+  `GR_Compat.OnTrialError`: `p.trial = true` and `GR_Compat.Tally("trial")`
+  (`GR_Compat.Tally = TallyBump`, set after TallyBump). Counts only.
+- `GuildRecruiter_ReadyAdd`: `TallyBump("yes")` for a new yes-reply (a count
+  only). Instead of popping the Ready panel it calls
+  `GuildRecruiter_GuideNotify(name)`, which opens the live guide and returns
+  true unless "Don't show again" is ticked; then `GuildRecruiter_ReadyRefresh()`
+  still redraws the Rawcruiter tab. Otherwise the panel pops as before.
+  `GuildRecruiter_ReadyLoad` the same. The guide's tick calls
+  `GuildRecruiter_ReadyRefresh` once a second (expiry + the tab), as the
+  panel's own OnUpdate did.
+- `Pause`: `GR_Compat.pausedByBlock = quiet` (the quiet form is used only by
+  the block report). `GuildRecruiter_PauseBlocked`: `GR_Compat.blockLine = line`.
+- New read-only / wrapper globals: `GuildRecruiter_RunState`,
+  `GuildRecruiter_StartRun`, `GuildRecruiter_SetMinLevel/SetMaxLevel`,
+  `GuildRecruiter_WhisperPreview`, `GuildRecruiter_TodayTally`.
+- Slash: `""` and `guide` -> `GuildRecruiter_GuideToggle`; help mentions the
+  guide and `chattab`; the load line says "/gr opens the guide, /gr help lists
+  commands." Minimap: left-click = guide, shift-left-click = settings.
+- Labels (plain words): `MODE_LABEL` invite "Invite only" -> "Direct",
+  whisperinvite "Whisper, invite on reply" -> "Whisper first" (whisper stays
+  "Whisper only"; used in chat lines, the Settings and A/B dropdowns; `/gr set
+  mode` keys unchanged). Settings tab: "Mode:" -> "Contact style:", "Reply:" ->
+  "How they reply:", "Invite/contact delay (s)" -> "Delay between whispers (s)",
+  "/who delay (s)" -> "Delay between searches (s)", "Random delays
+  (anti-detection)" -> "Random delays", "Session cap (0=off)" -> "Max per run
+  (0=off)"; the Method label and dropdown are hidden in key-press mode (the
+  setting is kept); the three dropdowns moved from x 352 / 186 wide to x 380 /
+  160 wide to fit the longer labels; the mode notes use the new words.
+
+**New saved fields** (seed-once in `GuildRecruiter_GuideSeed`, called by every
+guide entry point): `guideSeen` (false), `guideDone` (false), `guideCards` ({}),
+plus `guidePos` (written only when the window is dragged). New keys inside the
+existing tally: `yes`, `trial` (per day and in totals; the Stats tab reads named
+fields only, so it ignores them).
+
+**Chat output.** The guide adds no chat lines of its own except one line, once
+per session, if the guide itself errors ("guide window error (recruiting is not
+affected): ..."). [Print] prints one existing prompt line per name. Everything
+else is the existing one-line output of Start, Next, MakeChatTab, ReadyPrune.
+
+**Escape** does not close the guide: adding it to `UISpecialFrames` writes into
+a Blizzard table that the Escape handler walks, and that is not worth any risk
+to the invite flow. The close button, `/gr` and the minimap button close it.
+
 ## 2. Still unverified
 
 There was no game client and no Lua interpreter. The facts from a real
@@ -672,6 +860,49 @@ invite step. Still untested:
   `/gr start`). Not changed here (it is a timing default).
 - **Panel layout**: the instruction line, rows and buttons were sized by
   reasoning, not seen; long "First Surname" names may be cut at 180 px.
+
+### 2.5 The guide window: unverified (no client)
+
+Nothing in §1.12 has been seen in game. In particular:
+
+- **The three secure buttons.** `type="click"` with `clickbutton` =
+  `GuildMicroButton` (Open) or `ChatFrame<N>Tab` (Show), and the guide's own
+  `GuildRecruiterGuideNext` (no action attribute; its PreClick runs the
+  press). Read in the Forever source, never run. Open questions: whether the
+  click opens the Guild window / selects the tab at all; whether a Guild window
+  opened this way, or a tab selected this way, leaves the later Invite Member
+  Accept untainted (the whole point; if Accept is refused after using [Open]
+  or [Show], hide them and keep the hints); whether `GuildMicroButton` is shown
+  and enabled on Forever (`Enum.GameRule.CommunitiesPanelDisabled`); whether a
+  disabled or hidden micro button still takes `:Click()`. Fallback if "click"
+  does nothing: `type="macro"`, `macrotext="/click GuildMicroButton"`. Every
+  step also has its hint ("or press J", "Switch your chat to the Rawcruiter
+  tab"), shown in combat and whenever the button is missing.
+- **The guide's Next through its secure twin**, i.e. the /who sent from the
+  PreClick of a second secure button (`GuildRecruiter_GuidePress` ->
+  `GuildRecruiter_SecurePreClick`). Same code path as the minimap Next button,
+  which was seen working from a key press; a mouse up-click on a different
+  secure button was not tried. The plain stand-in (`GuildRecruiter_Next`, as
+  typed `/gr next`) is used in combat.
+- **Hiding at PLAYER_REGEN_DISABLED.** Relies on the wiki's "lockdown starts
+  after this event" (as `SecureClear` already does). If a secure button is
+  still shown when lockdown starts, it stays where it was until combat ends.
+- **Layout and strata**: every position and width was reasoned, not seen.
+  Default top-right spot vs action bars / quest tracker; whether 344 px of
+  text fits each line (long "First Surname" names in "Waiting ..."); the
+  secure buttons sit at level guide + 20 in HIGH strata, so another HIGH frame
+  dragged over the guide (e.g. the Ready panel) would show them on top. The
+  Settings tab's moved dropdowns (x 380, 160 wide) and new label widths.
+- **Detectors**: `CommunitiesFrame:IsShown()` as "the Guild window is open"
+  (a community page also counts); `StaticPopup_Visible` read from addon code
+  (a `securecallfunction` wrapper, expected harmless); `IsVisible()` of the
+  Rawcruiter chat frame as "its tab is selected"; `CanGuildInvite()` /
+  `GetGuildInfo("player")` right after login; `IsTrialAccount` /
+  `IsVeteranTrialAccount` on Forever.
+- **Step 4** depends on the `C_GuildInfo.Invite` post-hook (confirmed by the
+  player) and on a trial error arriving within 2.5 s (unchanged code).
+- **C_UI.Reload from a button** (Reload now) and `FCF_OpenNewWindow` from a
+  button click rather than a typed command (the same `GR_Compat.MakeChatTab`).
 
 ### 2.3 Settled by the Forever UI source (2026-11-05; evidence in API_AUDIT.md)
 
@@ -915,6 +1146,68 @@ invite step. Still untested:
   code hits (comments only). The only `StaticPopup_Show` is the addon's own
   `GUILDRECRUITER_CONFIRM` dialog, as before.
 - `file`: GuildRecruiter.lua and README.txt ASCII text, LF, 0 CR bytes.
+
+### 4.4 Guide window checks (same tools)
+
+- **Parser, `94ef08a` to the working tree.** GuildRecruiter.lua: syntax OK to
+  syntax OK (323 to 329 functions); max upvalues 31 to 31 (the slash
+  handler), Start 30, BuildSettingsPanel 28, GR_OnUpdate 27, GR_OnEvent 20,
+  all unchanged (5.1 limit 60); main-chunk locals 171 to 171 (limit 200: the
+  new code is globals and `GR_Compat` fields; the `ns` local lives in a `do`
+  block). GuildRecruiterGuide.lua (new): syntax OK, 76 functions, max
+  upvalues 5, main-chunk locals 21. Generic-for over a non-call: 0 in both.
+- **Globals.** GuildRecruiter.lua new reads: `select` (Lua),
+  `GuildRecruiter_GuideNotify`, `GuildRecruiter_GuideToggle` (both written by
+  the guide file); new writes: the six wrapper/read-only globals of §1.12 and
+  `GuildRecruiter_Compat` (only without a private table). No global was
+  removed. The guide file reads, besides its own and the main file's globals,
+  only: `C_UI`, `ReloadUI` (Reload now), `CommunitiesFrame`, `GuildFrame`
+  (`:IsShown()` only), `StaticPopup_Visible` (call, read-only), `GuildMicroButton`
+  and `_G["ChatFrame<N>Tab"]` (used only as the `clickbutton` value on OUR
+  secure button), `IsInGuild`, `GetGuildInfo`, `IsTrialAccount`,
+  `IsVeteranTrialAccount`, `GetTime`, `CreateFrame`, `UIParent` (parent and
+  anchor of our own frames), `GameTooltip` (our tooltips), `DEFAULT_CHAT_FRAME`
+  (the one error line), and Lua's own `string`, `table`, `math`, `pairs`,
+  `pcall`, `tinsert`, `tonumber`, `tostring`, `type`. It writes no Blizzard
+  global and no Blizzard frame.
+- **Grep of the guide code (comments stripped).** No `SetItemRef`,
+  `StaticPopup_Show`, `OnAccept`, `.Invite`, `GuildInvite`, `ginvite`,
+  `ChatEdit_*`, `editBox`, `RunMacroText`, `macrotext`, `FCF_*`, `InsertLink`,
+  `SendChatMessage`/`SendWho` calls (the two string hits are `BlockWhat`'s
+  text matches), `HookScript`, `hooksecurefunc` or `UISpecialFrames`.
+  `SetScript` is called only on frames this file creates. Exactly five
+  `SetAttribute` calls, all on our secure buttons: `useOnKeyDown` in
+  `GuildRecruiter_GuideSecureButton` (reached only from
+  `GuildRecruiter_GuideMakeSecure`, which returns in lockdown) and
+  `type`/`clickbutton` twice in `GuildRecruiter_GuideSync` (returns at once in
+  lockdown).
+- **Call graph** (`callgraph3.py`, branch-blind, run on `specialise.py`'s
+  key-press copy of GuildRecruiter.lua concatenated with the guide file; all six
+  cuts matched once). Sinks `GR_Compat.SendWho`, `SetSecureInvite`,
+  `ResolveInvite`, `InviteByChat`, `RunSlash`:
+  - `GR_Compat.SendWho`: only from the minimap Next button's PreClick, the
+    guide's secure Next PreClick, the guide's plain big button's OnClick and
+    the slash handler (`/gr next`). No OnUpdate, OnEvent, OnShow or
+    chat-filter path.
+  - `ResolveInvite`, `InviteByChat`, `RunSlash`: no path from any root.
+  - `SetSecureInvite` (which now only prints the link): from the same press
+    roots, plus the pre-existing run-timer `Drain -> ContactHead` whisper path
+    (`TimerMay`, §4.2). The guide adds no timer or event path.
+  - `GuildRecruiter_GuidePress` is referenced only by the guide's plain
+    OnClick and secure PreClick. `GuildRecruiter_GuideSecureHide` only from the
+    guide's OnEvent (PLAYER_REGEN_DISABLED). `GuildRecruiter_GuideSync` from
+    the guide's drag/hide handlers and `GuildRecruiter_GuideRefresh` (OnShow,
+    OnUpdate, OnEvent), always behind the lockdown check.
+  - Negative test: calling `GuildRecruiter_GuidePress` from
+    `GuildRecruiter_GuideTick` in a scratch copy made the script report two
+    new OnUpdate paths to `GR_Compat.SendWho`.
+- **Release zip.** The workflow's rsync already ships every file except
+  `.git*`, `.github`, `*.md` and `README*`, so GuildRecruiterGuide.lua ships.
+  A new step fails the job if any .lua/.xml the .toc lists, or Bindings.xml,
+  is missing from the staged folder (simulated locally: passes; with the
+  guide file removed it reports it). The YAML parses.
+- `file`: GuildRecruiter.lua, GuildRecruiterGuide.lua and the .toc are ASCII
+  text, LF, 0 CR bytes.
 
 ### Forever UI source read for §1.10 (Gethe/wow-ui-source, branch `forever`, 1.60.1 build 70790, read 2026-11-05)
 

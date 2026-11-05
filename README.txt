@@ -2,6 +2,24 @@ Guild Rawcruiter  --  vanilla 1.12 / Turtle WoW guild recruitment helper
 ==============================================================================
 
 
+QUICK START IN 4 STEPS  (WoW: Forever)
+--------------------------------------
+1. Type /gr (or left-click the minimap button). The guide window also opens
+   by itself the first time.
+2. Go through its three setup cards: how to reach people ("Whisper first" is
+   the recommended one), what the whisper says (pick one of three or write
+   your own), and the "Rawcruiter" chat tab (one button makes it, then press
+   "Reload now"). You can skip any card.
+3. Press Start, then Next whenever the guide says "Press Next to search for
+   players". Whispers go out by themselves; the guide says when there is
+   nothing to do.
+4. When someone says yes, follow the four steps in the guide. Each one ticks
+   itself: open the Guild window, click Invite Member, switch to the
+   Rawcruiter tab, shift-click the name and press Accept.
+Everything else is under "Advanced..." in the guide (or /gr config). Tick
+"Don't show again" and the guide stops opening by itself; /gr still opens it.
+
+
 WoW: FOREVER BUILD  (branch "forever", version 4.0.0-forever.1)
 -----------------------------------------------------------------
 This is a BETA port to the WoW: Forever client (## Interface: 16001, modified
@@ -111,6 +129,19 @@ If the client blocks a call (ADDON_ACTION_BLOCKED / FORBIDDEN naming this
 addon), the run pauses and one chat line names the call; a refused /who is not
 counted and is not waited for. On a client without C_FriendList.SendWho the old
 automatic timer loop runs unchanged and Next is not needed.
+
+THE GUIDE WINDOW (Forever): /gr (bare) or /gr guide, or a left-click on the
+minimap button (shift-left-click opens the settings window). It shows one
+"What to do now" line and one big button for that step (Start, Next, Resume),
+the four invite steps with ticks, the approach, the level range, the message
+and a "Today" line (whispered, said yes, invited, free trial skipped). While
+the guide is in use, a yes-reply opens the guide instead of the Ready panel;
+with "Don't show again" ticked the Ready panel pops up as before. The [List]
+button in the guide (or /gr ready) still shows the panel with Copy and Done.
+The guide's "Open" (Guild window) and "Show" (Rawcruiter tab) buttons are
+secure buttons that click Blizzard's own buttons for you; they are not shown
+in combat, and each step also says how to do it by hand (e.g. "or press J").
+They have not been tried on a live client yet.
 
 New commands (Forever):  /gr ready  (show/hide the Ready panel)
                          /gr alert on|off  (reply sound + taskbar flash, default on)
@@ -274,6 +305,9 @@ ANTI-PATTERN / SAFETY OPTIONS
 
 ALL COMMANDS  (slash:  /gr)
 ---------------------------
+  (nothing) | guide     (Forever build) Open the step-by-step guide window.
+  help                  List the commands in chat.
+  chattab               (Forever build) Make the "Rawcruiter" chat tab, then /reload.
   start | stop | pause | resume | status | config
   next                  (Forever build) Send the next /who -- one per press.
                         Invite-mode prompts need the Next button, its key

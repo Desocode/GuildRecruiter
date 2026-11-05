@@ -5,3 +5,4 @@
 ## Version: 4.0.0-forever.1
 ## SavedVariables: GuildRecruiter_Settings
 GuildRecruiter.lua
+GuildRecruiterGuide.lua

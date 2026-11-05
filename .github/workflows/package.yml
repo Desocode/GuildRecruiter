@@ -48,6 +48,20 @@ jobs:
             ./ "staging/$ADDON/"
           (cd staging && zip -r "../$ADDON.zip" "$ADDON")
 
+      # The addon is more than one file: the .toc lists GuildRecruiter.lua and
+      # GuildRecruiterGuide.lua (the guide window), and the client loads
+      # Bindings.xml by itself. Fail before attaching if any of them is missing.
+      - name: Check the zip holds every file the .toc lists
+        run: |
+          ADDON="${{ github.event.repository.name }}"
+          missing=0
+          for f in $(tr -d '\r' < "staging/$ADDON/$ADDON.toc" | grep -v '^[[:space:]]*#' | grep -E '\.(lua|xml)$'); do
+            if [ ! -f "staging/$ADDON/$f" ]; then echo "missing from the zip: $f"; missing=1; fi
+          done
+          if [ ! -f "staging/$ADDON/Bindings.xml" ]; then echo "missing from the zip: Bindings.xml"; missing=1; fi
+          unzip -l "$ADDON.zip"
+          exit $missing
+
       - name: Attach the zip to the release
         uses: softprops/action-gh-release@v2
         with:

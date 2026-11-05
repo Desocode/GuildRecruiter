@@ -468,6 +468,7 @@ function GR_Compat.OnInviteSent(name)
   if type(name) ~= "string" or issecret(name) or name == "" then return end
   local p = { name = name, t = GetTime() }
   GR_Compat.pendingInvite = p
+  GR_Compat.lastInvite = p      -- read-only for the guide window's step 4 tick (GuildRecruiterGuide.lua)
   if C_Timer and C_Timer.After then
     C_Timer.After(2.5, function()
       if GR_Compat.pendingInvite == p then                -- no trial error arrived
@@ -483,10 +484,12 @@ function GR_Compat.OnTrialError()
   local p = GR_Compat.pendingInvite
   if not p then return end                               -- not an answer to an invite of ours
   GR_Compat.pendingInvite = nil
+  p.trial = true                                         -- the guide says "Free Trial, skipped" for it
   local s = GuildRecruiter_Settings
   s.trial = s.trial or {}
   s.trial[string.lower(p.name)] = time()
   s.trialCount = (s.trialCount or 0) + 1
+  if GR_Compat.Tally then GR_Compat.Tally("trial") end   -- the guide's "Today" strip (a count only)
   local key = s.ready and GR_Compat.FindKey(s.ready, p.name)
   if key then s.ready[key] = nil end                      -- not an invite: nothing counted
   if DEFAULT_CHAT_FRAME then
@@ -848,6 +851,14 @@ function GR_Compat.SetChildText(frame, suffix, text)
   if fs then fs:SetText(text) end
 end
 
+-- GuildRecruiterGuide.lua (the next file in the .toc) reaches GR_Compat through the
+-- addon's private table (the second value of each file's "..."), so GR_Compat
+-- stays out of the global namespace. A client that passes no table gets a global.
+do
+  local ns = select(2, ...)
+  if type(ns) == "table" then ns.Compat = GR_Compat else GuildRecruiter_Compat = GR_Compat end
+end
+
 local VERSION    = "4.0.0-forever.1"
 
 -- Key Bindings entry (Bindings.xml in this folder, loaded by the client): a
@@ -878,10 +889,11 @@ local METHOD_LABEL = {
   chat   = "Use /ginvite command",
 }
 local MODE_ORDER = { "invite", "whisper", "whisperinvite" }
+-- plain names, the same words the guide window uses (GuildRecruiterGuide.lua)
 local MODE_LABEL = {
-  invite        = "Invite only",
+  invite        = "Direct",          -- no whisper: you invite each name yourself
   whisper       = "Whisper only",
-  whisperinvite = "Whisper, invite on reply",
+  whisperinvite = "Whisper first",   -- whisper; a yes-reply goes to the Ready list
 }
 -- shorter text for the compact config buttons (full labels above are for chat)
 local METHOD_SHORT = { auto = "Auto", byname = "GuildInviteByName", invite = "GuildInvite", chat = "/ginvite" }
@@ -1107,6 +1119,14 @@ local function TallyBump(field)
   if not t.days[d] then t.days[d] = { invited=0, whispered=0, joined=0, declined=0 } end
   t.days[d][field] = (t.days[d][field] or 0) + 1
 end
+GR_Compat.Tally = TallyBump   -- for GR_Compat.OnTrialError, which is defined above TallyBump
+
+-- READ-ONLY: today's tally bucket (whispered / yes / invited / trial ...), or {}.
+-- For the guide window's "Today" strip.
+function GuildRecruiter_TodayTally()
+  local t = GuildRecruiter_Settings.tally
+  return (t and t.days and t.days[Today()]) or {}
+end
 
 -- ---------------------------------------------------------------------------
 -- Affirmative-reply detection
@@ -1277,6 +1297,8 @@ local function WhisperBody(name, msg)
   if string.len(msg) > 255 then msg = string.sub(msg, 1, 255) end
   return msg
 end
+-- the whisper exactly as it would be sent to `name` (the guide window's preview)
+function GuildRecruiter_WhisperPreview(name, msg) return WhisperBody(name, msg) end
 
 -- global so contact/event code adds no upvalues; per-profile conversion counters
 function GuildRecruiter_VarBump(profile, field)
@@ -1668,7 +1690,7 @@ local function GR_OnEvent(event, ...)
     Defaults()
     InitMinimap()
     GuildRecruiter_SyncNext()   -- key-press mode: build the secure Next button (hidden) out of combat
-    Print("v"..VERSION.." loaded. "..GR_Compat.ApiSummary()..". /gr for commands, /gr config for settings.")
+    Print("v"..VERSION.." loaded. "..GR_Compat.ApiSummary()..". /gr opens the guide, /gr help lists commands.")
     GuildRecruiter_ReadyLoad()  -- names still waiting from before the reload: show the Ready panel
   elseif event == "WHO_LIST_UPDATE" and running then
     ProcessWho()
@@ -2147,6 +2169,7 @@ end
 -- GLOBALS so the main-window header (shown on every tab) can show run state and
 -- a Stop button without adding upvalues to BuildUI.
 function GuildRecruiter_StopRun() Stop() end
+function GuildRecruiter_StartRun() Start() end   -- the guide window's Start
 function GuildRecruiter_HeaderTick(m, elapsed)
   m.htick = (m.htick or 0) - (elapsed or 0)
   if m.htick > 0 then return end
@@ -2168,6 +2191,7 @@ local function Pause(quiet)
   if not running then if not quiet then Print("Not running.") end return end
   if paused then if not quiet then Print("Already paused. /gr resume to continue.") end return end
   paused = true
+  GR_Compat.pausedByBlock = quiet and true or false   -- the guide says why (the quiet form is the block report)
   if GuildRecruiter_runKind == "scan" then
     SuppressWho(false)  -- let manual /who work normally while paused
     Broadcast("BYE")    -- yield my band to others while paused
@@ -2190,6 +2214,15 @@ end
 
 -- GLOBAL so header / Lists play-pause buttons add no upvalues to their builders
 function GuildRecruiter_TogglePause() if paused then Resume() else Pause() end end
+
+-- READ-ONLY snapshot of the run for the guide window (GuildRecruiterGuide.lua),
+-- which polls it a few times a second. Changes nothing.
+function GuildRecruiter_RunState()
+  return { running = running, paused = paused, scanning = scanning, awaiting = awaiting,
+           queued = #contactQueue, waitingReplies = CountTable(whispered),
+           rest = GuildRecruiter_rescanWait or 0, kind = GuildRecruiter_runKind,
+           contacted = stats.contacted, cap = GuildRecruiter_Settings.sessionCap or 0 }
+end
 
 -- ---------------------------------------------------------------------------
 -- Key-press mode (GR_Compat.RequiresHardwareEvent): the Next action
@@ -2235,6 +2268,7 @@ function GuildRecruiter_TogglePause() if paused then Resume() else Pause() end e
 
 -- the client reported a blocked call naming this addon (GR_Compat.BlockedLine)
 function GuildRecruiter_PauseBlocked(line)
+  GR_Compat.blockLine = line   -- the guide turns it into one plain sentence
   -- the block came from our own /who (the event is synchronous, so it lands
   -- inside the press that sent it: lastCall is the /who, 0s ago)
   local whoBlocked = GR_Compat.lastCall and string.find(GR_Compat.lastCall, "SendWho", 1, true)
@@ -2617,12 +2651,19 @@ function GuildRecruiter_ReadyAdd(name, kind, v, quiet)
   if GR_Compat.FindKey(s.ready, name) then return end
   s.ready[name] = { t = time(), kind = kind, v = v }
   if kind == "reply" then
+    TallyBump("yes")   -- "said yes" in the guide window's Today strip (a count only)
     -- the player link in this chat line is the shift-click target for an open
     -- Guild > Invite Member box (handled by Blizzard's own chat link code)
     Print(GR_Compat.PlayerLink(name).." replied -- "..GuildRecruiter_ReadyCount().." waiting"..(GR_Compat.ListFrame() and "" or " (shift-click in Guild > Invite Member)"))
     if s.readyAlert and not quiet then GR_Compat.Alert() end
   end
-  GuildRecruiter_ReadyShow(true, name)
+  -- the guide window (GuildRecruiterGuide.lua) shows the invite steps instead of
+  -- this panel, unless the player ticked its "Don't show again"
+  if GuildRecruiter_GuideNotify and GuildRecruiter_GuideNotify(name) then
+    GuildRecruiter_ReadyRefresh()   -- the Rawcruiter chat tab (and the panel, if open) still update
+  else
+    GuildRecruiter_ReadyShow(true, name)
+  end
   GuildRecruiter_ListRefresh()
 end
 
@@ -2842,7 +2883,8 @@ function GuildRecruiter_ReadyLoad()
   local n = GuildRecruiter_ReadyCount()
   if n > 0 then
     Print(n.." name(s) still on the Ready list, waiting for your invite (/gr ready).")
-    GuildRecruiter_ReadyShow(true)
+    if GuildRecruiter_GuideNotify and GuildRecruiter_GuideNotify() then GuildRecruiter_ReadyRefresh()
+    else GuildRecruiter_ReadyShow(true) end
   end
 end
 
@@ -3162,6 +3204,9 @@ local function SetMaxLevel(v)
   if GuildRecruiter_Settings.minLevel > v then GuildRecruiter_Settings.minLevel = v; Print("Min lowered to "..v.." to keep min <= max.") end
   RecomputeBand(); RefreshConfig()
 end
+-- the guide window's two level boxes use the same setters
+function GuildRecruiter_SetMinLevel(v) SetMinLevel(v) end
+function GuildRecruiter_SetMaxLevel(v) SetMaxLevel(v) end
 
 local function ApplyInvite(v) GuildRecruiter_Settings.inviteDelay = clamp(math.floor(v + 0.5), INVITE_MIN, INVITE_MAX); RefreshConfig() end
 local function ApplyWho(v)    GuildRecruiter_Settings.whoDelay    = clamp(math.floor(v + 0.5), WHO_MIN, WHO_MAX); RefreshConfig() end
@@ -3281,13 +3326,14 @@ RefreshConfig = function()
   -- tell the user WHY some Invite controls are greyed for the current mode
   local hw = GR_Compat.RequiresHardwareEvent   -- Forever: the addon never sends the invite itself
   if mode == "invite" then
-    configFrame.modeNote:SetText(hw and "Invite-only: each Next press puts one name on the Ready list; you send the invite. Reply & Message aren't used."
-      or "Invite-only: sends a guild invite straight away. Reply & Message aren't used.")
+    configFrame.modeNote:SetText(hw and "Direct: each Next press gives you one name to invite yourself. The message and 'How they reply' aren't used."
+      or "Direct: sends a guild invite straight away. The message and 'How they reply' aren't used.")
   elseif mode == "whisper" then
-    configFrame.modeNote:SetText("Whisper-only: just messages them. Method & Reply aren't used.")
+    configFrame.modeNote:SetText(hw and "Whisper only: just messages them. 'How they reply' isn't used."
+      or "Whisper only: just messages them. Method and 'How they reply' aren't used.")
   else
-    configFrame.modeNote:SetText(hw and "Whisper (automatic); a reply that passes the Reply rule goes to the Ready list (/gr ready) and you invite."
-      or "Whisper, then invite when they reply (per the Reply rule).")
+    configFrame.modeNote:SetText(hw and "Whisper first: whispers go out by themselves; a reply that passes 'How they reply' waits for your invite (/gr guide)."
+      or "Whisper first, then invite when they reply (per 'How they reply').")
   end
 
   configFrame.updating = false
@@ -3528,9 +3574,9 @@ local function BuildSettingsPanel(parent)
 
   -- LEFT column: Speed / Safety / Targets --------------------------------
   Header(fr, "Speed", 18, -44, 250)
-  fr.inviteSlider, fr.inviteEdit = MakeSlider(fr, "GuildRecruiterConfigInvite", "Invite/contact delay (s)", INVITE_MIN, INVITE_MAX, -84, ApplyInvite)
-  fr.whoSlider,    fr.whoEdit    = MakeSlider(fr, "GuildRecruiterConfigWho",    "/who delay (s)",           WHO_MIN,    WHO_MAX,    -132, ApplyWho)
-  fr.jitterCheck   = MakeCheck(fr, "GuildRecruiterConfigJitter", "Random delays (anti-detection)", 20, -162, "jitter")
+  fr.inviteSlider, fr.inviteEdit = MakeSlider(fr, "GuildRecruiterConfigInvite", "Delay between whispers (s)", INVITE_MIN, INVITE_MAX, -84, ApplyInvite)
+  fr.whoSlider,    fr.whoEdit    = MakeSlider(fr, "GuildRecruiterConfigWho",    "Delay between searches (s)", WHO_MIN,    WHO_MAX,    -132, ApplyWho)
+  fr.jitterCheck   = MakeCheck(fr, "GuildRecruiterConfigJitter", "Random delays", 20, -162, "jitter")
 
   Header(fr, "Safety", 18, -196, 250)
   fr.quietCheck    = MakeCheck(fr, "GuildRecruiterConfigQuiet",    "Quiet /who chat",    20, -222, "quietWho")
@@ -3542,25 +3588,28 @@ local function BuildSettingsPanel(parent)
   fr.minEdit = MakeNumBox(fr, "GuildRecruiterConfigMin", 150, -326, 34, 2, function(v) SetMinLevel(v) end)
   Label(fr, "to", 192, -330)
   fr.maxEdit = MakeNumBox(fr, "GuildRecruiterConfigMax", 214, -326, 34, 2, function(v) SetMaxLevel(v) end)
-  Label(fr, "Session cap (0=off)", 24, -354)
+  Label(fr, "Max per run (0=off)", 24, -354)
   fr.capEdit = MakeNumBox(fr, "GuildRecruiterConfigCap", 150, -350, 34, 4, function(v) GuildRecruiter_Settings.sessionCap = clamp(math.floor(v), 0, 9999) end)
 
   -- RIGHT column: Invites -------------------------------------------------
   Header(fr, "Invites", 292, -44, 250)
-  -- three uniform inline dropdown rows: label at 298, dropdown aligned at 352
-  Label(fr, "Method:", 298, -82)
+  -- three uniform inline dropdown rows: label at 298, dropdown aligned at 380
+  -- (plain-word labels; "Method" picks an invite call, and on Forever the addon
+  -- never invites, so that row is hidden there -- the setting is kept)
+  local methodLbl = Label(fr, "Method:", 298, -82)
   fr.methodBtn = CreateFrame("Button", "GuildRecruiterConfigMethodBtn", fr, "UIPanelButtonTemplate")
-  fr.methodBtn:SetPoint("TOPLEFT", 352, -78); fr.methodBtn:SetWidth(186); fr.methodBtn:SetHeight(22)
+  fr.methodBtn:SetPoint("TOPLEFT", 380, -78); fr.methodBtn:SetWidth(160); fr.methodBtn:SetHeight(22)
   fr.methodBtn:SetScript("OnClick", function(self) GuildRecruiter_OpenDD(self, "method") end)
   GuildRecruiter_DDArrow(fr.methodBtn)
-  Label(fr, "Mode:", 298, -108)
+  if GR_Compat.RequiresHardwareEvent then methodLbl:Hide(); fr.methodBtn:Hide() end
+  Label(fr, "Contact style:", 298, -108)
   fr.modeBtn = CreateFrame("Button", "GuildRecruiterConfigModeBtn", fr, "UIPanelButtonTemplate")
-  fr.modeBtn:SetPoint("TOPLEFT", 352, -104); fr.modeBtn:SetWidth(186); fr.modeBtn:SetHeight(22)
+  fr.modeBtn:SetPoint("TOPLEFT", 380, -104); fr.modeBtn:SetWidth(160); fr.modeBtn:SetHeight(22)
   fr.modeBtn:SetScript("OnClick", function(self) GuildRecruiter_OpenDD(self, "mode") end)
   GuildRecruiter_DDArrow(fr.modeBtn)
-  Label(fr, "Reply:", 298, -134)
+  Label(fr, "How they reply:", 298, -134)
   fr.replyBtn = CreateFrame("Button", "GuildRecruiterConfigReplyBtn", fr, "UIPanelButtonTemplate")
-  fr.replyBtn:SetPoint("TOPLEFT", 352, -130); fr.replyBtn:SetWidth(186); fr.replyBtn:SetHeight(22)
+  fr.replyBtn:SetPoint("TOPLEFT", 380, -130); fr.replyBtn:SetWidth(160); fr.replyBtn:SetHeight(22)
   fr.replyBtn:SetScript("OnClick", function(self) GuildRecruiter_OpenDD(self, "reply") end)
   GuildRecruiter_DDArrow(fr.replyBtn)
   fr.syncCheck   = MakeCheck(fr, "GuildRecruiterConfigSync",   "Guild sync (dedup + split)",   298, -160, "guildSync")
@@ -4116,7 +4165,8 @@ function GuildRecruiter_MinimapTip(btn)
   local nr = GuildRecruiter_ReadyCount()
   if nr > 0 then GameTooltip:AddLine("Ready to invite: "..nr.."  (/gr ready)", 0.3, 1, 0.3) end
   GameTooltip:AddLine(" ")
-  GameTooltip:AddLine("Left-click: settings", 1, 1, 1)
+  GameTooltip:AddLine("Left-click: the guide (what to do now)", 1, 1, 1)
+  GameTooltip:AddLine("Shift-left-click: settings", 1, 1, 1)
   GameTooltip:AddLine("Right-click: "..(running and "stop" or (hw and "arm (then press Next per /who or invite)" or "start")), 1, 1, 1)
   GameTooltip:Show()
 end
@@ -4150,8 +4200,10 @@ InitMinimap = function()
   mb:SetScript("OnClick", function(self, button)
     if button == "RightButton" then
       if running then Stop() else Start() end
-    else
+    elseif IsShiftKeyDown and IsShiftKeyDown() then
       ToggleConfig()
+    else
+      GuildRecruiter_GuideToggle()   -- the step-by-step guide window (GuildRecruiterGuide.lua)
     end
   end)
   mb:SetScript("OnDragStart", function(self)
@@ -4211,7 +4263,8 @@ SlashCmdList["GUILDRECRUITER"] = function(msg)
   cmd = string.lower(cmd or "")
   local larg = string.lower(arg or "")
 
-  if cmd == "start" then Start()
+  if cmd == "" or cmd == "guide" then GuildRecruiter_GuideToggle()   -- the step-by-step guide window
+  elseif cmd == "start" then Start()
   elseif cmd == "stop" then Stop()
   elseif cmd == "pause" then Pause()
   elseif cmd == "resume" then Resume()
@@ -4410,8 +4463,8 @@ SlashCmdList["GUILDRECRUITER"] = function(msg)
     RefreshConfig()
     Print(cmd.." "..(GuildRecruiter_Settings[key] and "ON" or "OFF"))
   else
-    Print("|cff33ff99Guild Rawcruiter v"..VERSION.."|r  --  /gr config, /gr list, /gr stats")
-    Print("start | stop | pause | resume | status | reset | forget | hide")
+    Print("|cff33ff99Guild Rawcruiter v"..VERSION.."|r  --  /gr (or /gr guide) opens the step-by-step guide; /gr config, /gr list, /gr stats")
+    Print("start | stop | pause | resume | status | reset | forget | hide | chattab")
     if GR_Compat.RequiresHardwareEvent then
       Print("next -- the next /who (one press each; whispers go out by themselves). Invite prompts need the Next button by the minimap, its key (Key Bindings > Guild Rawcruiter) or a macro with /click GuildRecruiterNextButton; not in combat")
       Print("ready -- the Ready list: yes-replies wait there for YOUR invite (Guild > Invite Member; shift-click the name in chat, or Copy + paste; then Done) | alert on|off | set readyttl <min>")
