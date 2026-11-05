@@ -441,6 +441,70 @@ function GR_Compat.PrintLink(name)
   end
 end
 
+-- FREE TRIAL ACCOUNTS. Inviting one makes the client show the red error
+-- "Free Trial accounts cannot join guilds" (player-reported, exact text). It does
+-- not name the player, so the error is attributed to the invite Blizzard's own
+-- Invite Member box just sent: we post-hook C_GuildInfo.Invite with hooksecurefunc
+-- (a hook runs AFTER Blizzard's call and cannot change or taint it) which gives us
+-- the invited name. That hook also lets us count a real invite without the player
+-- pressing Done: if no trial error follows within 2.5 s the invite counts and the
+-- name leaves the Ready list.
+GR_Compat.pendingInvite = nil
+GR_Compat.TRIAL_DAYS = 30        -- a trial player may upgrade; try again after this long
+
+function GR_Compat.IsTrialMsg(text)
+  if type(text) ~= "string" or issecret(text) then return false end
+  local m = string.lower(text)
+  return (string.find(m, "trial", 1, true) and string.find(m, "guild", 1, true)) and true or false
+end
+
+function GR_Compat.IsTrialListed(name)
+  local t = GuildRecruiter_Settings and GuildRecruiter_Settings.trial
+  local at = t and type(name) == "string" and t[string.lower(name)]
+  return (at and (time() - at) < GR_Compat.TRIAL_DAYS * 86400) and true or false
+end
+
+-- the post-hook: Blizzard's own UI just called C_GuildInfo.Invite(name)
+function GR_Compat.OnInviteSent(name)
+  if type(name) ~= "string" or issecret(name) or name == "" then return end
+  local p = { name = name, t = GetTime() }
+  GR_Compat.pendingInvite = p
+  if C_Timer and C_Timer.After then
+    C_Timer.After(2.5, function()
+      if GR_Compat.pendingInvite == p then                -- no trial error arrived
+        GR_Compat.pendingInvite = nil
+        GuildRecruiter_ReadyDone(name, "sent")
+      end
+    end)
+  end
+end
+
+-- the red "Free Trial accounts cannot join guilds" text arrived (UI error or system chat)
+function GR_Compat.OnTrialError()
+  local p = GR_Compat.pendingInvite
+  if not p then return end                               -- not an answer to an invite of ours
+  GR_Compat.pendingInvite = nil
+  local s = GuildRecruiter_Settings
+  s.trial = s.trial or {}
+  s.trial[string.lower(p.name)] = time()
+  s.trialCount = (s.trialCount or 0) + 1
+  local key = s.ready and GR_Compat.FindKey(s.ready, p.name)
+  if key then s.ready[key] = nil end                      -- not an invite: nothing counted
+  if DEFAULT_CHAT_FRAME then
+    DEFAULT_CHAT_FRAME:AddMessage("|cffff8000Rawcruiter:|r "..p.name.." has a Free Trial account (cannot join guilds) -- skipped, and not contacted again for "
+      ..GR_Compat.TRIAL_DAYS.." days. Free Trial total: "..s.trialCount..".")
+  end
+  GuildRecruiter_ReadyRefresh()
+  GuildRecruiter_ListRefresh()
+end
+
+function GR_Compat.HookInvite()
+  if GR_Compat.inviteHooked or not (C_GuildInfo and C_GuildInfo.Invite and hooksecurefunc) then return end
+  local ok = pcall(hooksecurefunc, C_GuildInfo, "Invite", function(name) GR_Compat.OnInviteSent(name) end)
+  GR_Compat.inviteHooked = ok and true or false
+end
+GR_Compat.HookInvite()
+
 -- THE READY LIST IN A REAL BLIZZARD CHAT TAB. Our own frames can't make a link that
 -- fills Invite Member without tainting the invite, but a Blizzard chat window can:
 -- its link click is Blizzard's own code. So the player makes one chat tab by hand
@@ -1111,6 +1175,7 @@ local function RecentlyInvited(name)
 end
 
 local function Blacklisted(name)
+  if GR_Compat.IsTrialListed(name) then return true end   -- a Free Trial account: never contact (30 days)
   local bl = GuildRecruiter_Settings.blacklist
   return bl and bl[string.lower(name)] and true or false
 end
@@ -1618,6 +1683,7 @@ local function GR_OnEvent(event, ...)
     if GR_Compat.IsSecret(a1) then return end   -- unreadable system text: skip, never compare
     local raw = a1 or ""
     local m = string.lower(raw)
+    if GR_Compat.IsTrialMsg(raw) then GR_Compat.OnTrialError() end   -- the same text may arrive as system chat
     if GR_Compat.IsThrottleMsg(m) then
       backoffUntil = GetTime() + BACKOFF_SECS
       Print("|cffffcc00Server throttle detected -- pausing sends "..BACKOFF_SECS.."s.|r")
@@ -1672,6 +1738,10 @@ local function GR_OnEvent(event, ...)
       end
       -- otherwise keep waiting -- a later, clearer "yes" still triggers it
     end
+  elseif event == "UI_ERROR_MESSAGE" then
+    -- Mainline payload is (errorType, message); 1.12 sent just the message
+    local msg = (type(a2) == "string") and a2 or a1
+    if GR_Compat.IsTrialMsg(msg) then GR_Compat.OnTrialError() end
   elseif event == "ADDON_ACTION_BLOCKED" or event == "ADDON_ACTION_FORBIDDEN" then
     local line = GR_Compat.BlockedLine(event, a1, a2)   -- nil unless it names this addon
     if line then GuildRecruiter_PauseBlocked(line) end
@@ -1692,6 +1762,7 @@ f:RegisterEvent("WHO_LIST_UPDATE")
 f:RegisterEvent("CHAT_MSG_ADDON")
 f:RegisterEvent("CHAT_MSG_SYSTEM")
 f:RegisterEvent("CHAT_MSG_WHISPER")
+pcall(f.RegisterEvent, f, "UI_ERROR_MESSAGE")   -- the red "Free Trial accounts cannot join guilds" text
 f:RegisterEvent("PLAYER_REGEN_DISABLED")
 f:RegisterEvent("PLAYER_REGEN_ENABLED")
 GR_Compat.WatchBlocked(f)                    -- ADDON_ACTION_BLOCKED / _FORBIDDEN: pause + say which call
