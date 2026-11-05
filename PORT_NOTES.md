@@ -1,20 +1,23 @@
 # GuildRecruiter: WoW: Forever port notes
 
 Version `4.0.0-forever.1`, branch `forever`, based on `1023a66` (the v3.22 source
-plus REQUIREMENTS.md). Status: **ported and checked offline; one player
-screenshot from a Forever client so far** (§1.10). The port is committed locally
-as `e824243`, the key-press mode (§1.9) as `716a33b`. The secure invite button
-(§1.10) sits on top of `716a33b` and is **not committed**.
+plus REQUIREMENTS.md). Status: **ported and checked offline; a few player tests
+on a Forever client** (§1.10, §1.11). Committed: the port `e824243`, key-press
+mode (§1.9) `716a33b`, the secure button and the copy box (§1.10) `dccd448` to
+`520c586`, the API audit `0c17add`. **Not committed:** automatic whispers and
+the Ready list (§1.11), on top of `0c17add`.
 
 Port (`e824243` vs `1023a66`, `git diff --numstat`): GuildRecruiter.lua +526 / -252,
 GuildRecruiter.toc +3 / -3, README.txt +42 / -0.
 Key-press mode (`716a33b` vs `e824243`): GuildRecruiter.lua +453 / -93,
 README.txt +44 / -7, PORT_NOTES.md, and a new Bindings.xml (9 lines). The .toc is
 unchanged: the client loads Bindings.xml by itself.
-Secure invite button (working tree vs `716a33b`, `git diff --numstat`):
-GuildRecruiter.lua +342 / -95, README.txt +49 / -17, Bindings.xml +9 / -6, and
-PORT_NOTES.md. The .toc is unchanged. All files are LF with no CR bytes, and
-GuildRecruiter.lua is still pure ASCII.
+Secure button to API audit (`0c17add` vs `716a33b`): GuildRecruiter.lua +496 / -113,
+README.txt +49 / -17, Bindings.xml +9 / -6, API_AUDIT.md (new), PORT_NOTES.md.
+Automatic whispers + Ready list (working tree vs `0c17add`): GuildRecruiter.lua
++669 / -142, README.txt +104 / -70, PORT_NOTES.md. The .toc and Bindings.xml are
+unchanged. All files are LF with no CR bytes, and GuildRecruiter.lua is still
+pure ASCII.
 
 Line counts below are lines of the 1.12 source (HEAD), counted with a tokenizer, so
 words in comments and strings are not counted.
@@ -210,10 +213,8 @@ a timer-loop client.
 - Auto-rescan: each new sweep prints "sweep N ... is ready -- press Next to start it".
 - `/gr status` adds a "Next: ..." line; `/gr help` lists `next`; the load line ends
   with "Key-press mode: ...". The minimap tooltip shows the next step.
-- In `whisperinvite` mode every first whisper costs a press (the design said the
-  timer may whisper in `whisper` mode). To let the timer send those as well, add
-  `whisperinvite = true` to `GR_Compat.TimerContactModes`. The reply invite still
-  needs a press either way.
+- (Superseded by §1.11: the timer now sends the first whisper of
+  `whisperinvite` mode too, and a yes-reply goes to the Ready list without a press.)
 
 **Small internal changes that also touch the timer-loop path, same behaviour:**
 - `Contact(name, v)` now takes the A/B variant. `GuildRecruiter_DealHead` deals it
@@ -232,6 +233,12 @@ a timer-loop client.
   flag is cleared.
 
 ### 1.10 Guild invites through one secure button
+
+**Superseded for invites by §1.11** (and by commits `540234d` to `520c586`): the
+secure `/ginvite` macro was refused in game, so the button no longer sets any
+secure action; an invite step only prompts (copy box + chat link) and the player
+invites. The rest of this section (the button, the binding, the click edge,
+combat rules) is still current.
 
 **Evidence (a Forever client, player's screenshot).** Pressing Next sent a /who
 (`C_FriendList.SendWho` worked from the key-press path; 48 candidates were
@@ -384,6 +391,133 @@ GuildInviteByName, GuildInvite, the /ginvite chat fallback) on that path only.
   key (invites: not in combat)`.
 - `/gr set method` has no effect in key-press mode (the setting is kept).
 
+### 1.11 Automatic whispers, the Ready list, and honest invite counts
+
+**Facts from a real Forever client that this builds on.** `C_FriendList.SendWho`
+works from a key press. A guild invite from addon code is forbidden in every
+form tried: `C_GuildInfo.Invite`, a secure `/ginvite` macro, `/ginvite` typed
+into the chat box by the addon, and (new) the Invite Member box filled by addon
+code: `SetItemRef` called from addon code DID put the name into the box, but the
+player's Accept then raised `ADDON_ACTION_FORBIDDEN` (function `Invite()`). Only
+the player's own typing / paste into Blizzard's Guild > Invite Member popup
+(`StaticPopup` `ADD_GUILDMEMBER`) works, and while that popup is open a
+shift-click on a player link **in the chat frame** fills it
+(`Blizzard_UIPanels_Game/Mainline/ItemRefHandlers.lua:24-28`, Blizzard's own chat
+code). Whispers through `C_ChatInfo.SendChatMessage(..., "WHISPER", ...)` are
+documented as not hardware-restricted (not yet seen in game).
+
+**Rule (kept as a hard constraint):** addon code never calls `SetItemRef`, never
+touches the Invite Member popup or any other Blizzard frame, never touches the
+chat edit box, and never calls an invite function. The panel therefore only
+re-prints the player link into `DEFAULT_CHAT_FRAME` (the same `AddMessage` every
+chat line uses), and the player shift-clicks it there. (A likely mechanism for
+the refusal, not proven: the popup's edit box has a SecureText aspect,
+`editBox:SetSecureText(...)` in `Blizzard_StaticPopup_Game/GameDialog.lua:255`,
+which the reference does not explain.)
+
+**The flow in `whisperinvite` mode** (line numbers: working-tree GuildRecruiter.lua).
+The only presses are one Next per /who and the player's own invite per yes.
+
+| Step | What happens | Where |
+|---|---|---|
+| 1. Scan | Next press -> `SecurePreClick` / `/gr next` -> `NextPress` -> `SendNextWho` -> `GR_Compat.SendWho` | 2162-2183, 1273, 232 |
+| 2. Queue | `ProcessWho`: guildless, not blacklisted, class/level filter, not in cooldown, not already on the Ready list -> `contactQueue` | 1287, 1319 |
+| 3. Whisper (timer) | `GR_OnUpdate` -> `Drain`: cap check first (1705), then pacing + `SendsBlocked`; `DealHead` (contact time) -> `TimerMay` -> `ContactHead` -> `Contact` whisperinvite branch: `SendWhisper`, `whispered[name]`, history (cooldown) + guild broadcast. `TimerContactModes` now holds `whisperinvite` | 80, 1704-1729, 1667, 1194 |
+| 4. Next /who | `NextStep` holds the /who while the queue still holds timer whispers ("Whispering (N)"); a press is needed only when the queue is empty and a /who is due | 2079, 2110, 2130 |
+| 5. Reply "yes" | CHAT_MSG_WHISPER -> `ShortName` -> `GR_Compat.FindKey(whispered, sender)` -> `ShouldInvite` (notno / yesonly / any, word lists) -> `GuildRecruiter_ReadyAdd(key, "reply", v)`: saved entry, chat line with the player link, `GR_Compat.Alert()` (sound + flash), panel shown with "New: Name" in its title. No press, no invite | 1535-1553, 2428, 204 |
+| 6. Player invites | Ready panel row: name -> `ReadyClick` -> `GR_Compat.PrintLink` (chat line; player shift-clicks it there); [Copy] -> `GR_Compat.ShowCopyBox`; [Copy next] = oldest name. Player presses Accept in Invite Member | 2500, 409, 419, 2481-2490 |
+| 7. Counted | [Done] -> `GuildRecruiter_ReadyDone(name, "done")`; or CHAT_MSG_SYSTEM join / decline -> `GR_Compat.PlainName` -> `ReadyDone(name, "joined"/"declined")`, then the old join/decline tally via `FindKey(history)`; or the Lists tab "Ready to invite" view (confirm) -> `ReadyDone(name, "removed")` | 2448, 1504-1533, 2668-2693, 2829 |
+
+**Ready list.** `GuildRecruiter_Settings.ready = { [name] = { t = time(), kind, v } }`
+(seed-once in `Defaults`, line 864), so it survives /reload and logout. `kind` is
+`reply`, `invite` (invite mode), `blast` (Invite all) or `one` (a single invite).
+New settings, also seed-once: `readyAlert` (true), `readyTTL` (30 minutes),
+`readyPos` (written when the panel is dragged). No existing SavedVariable was
+renamed. The panel `GuildRecruiterReadyPanel` (2507) is a plain frame parented
+to UIParent: not secure, not in the main window, draggable, clamped, newest
+first, 8 rows plus "+N more", each row = name (a link-styled button; tooltip
+"Click to print in chat, then shift-click it there"), age, [Copy], [Done]. It
+auto-shows on every new name, hides itself when the list is empty, and shows at
+load if names are still waiting (`ReadyLoad`, called at 1490). Expired entries
+(older than `readyTTL`) are dropped by `ReadyPrune` with one chat line and
+nothing counted. The minimap tooltip (3926), `/gr status` (4011), the Next
+button (`[N ready]`) and the Lists tab run strip show the count.
+
+**Invite bookkeeping (counted only in `GuildRecruiter_ReadyDone`, 2448).** No
+invite is counted when a prompt is shown. `ReadyDone` does, by kind: `reply`:
+`stats.invited`, tally "invited", history time refreshed with the variant that
+whispered (the whisper already counted the contact, the cooldown, the broadcast
+and the A/B "contacted"); `invite`: `stats.invited`, tally, `RecordHandled`
+(history + broadcast) and A/B "contacted"; `blast`: `stats.invited`, tally,
+history, broadcast; `one`: `GuildRecruiter_InvitedOne`. The candidate entry is
+removed then too (a prompt keeps it until Done). Triggers: [Done]; the join or
+decline system message naming a listed player (a decline also proves the invite
+was sent); the player removing the name in the Lists tab's Ready view (it asks
+first). For an invite-mode prompt `stats.contacted` still counts at the prompt,
+because it is the run's step count (session cap, "N of M" progress); the run-end
+and Stop lines now say "Prompted" there. The timer-loop path (no
+`C_FriendList.SendWho`) counts at the invite call, as before.
+
+**Invite mode, Invite all and single invites (key-press mode)** keep their press
+step, but the press now only prompts: copy box + chat link + the name on the
+Ready list (`Contact` 1197-1210, `ContactHead` 1667-1694, `NextPress` "one", 2173-2177).
+
+**Review fixes in the same change.**
+- (a) A pending reply no longer starves a due /who: replies need no press at
+  all (step 5), so `NextStep` has no "reply" step. For a press contact step that
+  is still pacing (`inviteTimer > 0`) and a /who that is due, `NextStep` returns
+  whichever is ready first, the contact on a tie (2130).
+- (b) A blocked /who: `GuildRecruiter_PauseBlocked` (2049) checks whether the
+  last restricted call was our SendWho, 0 s ago (the block events are
+  synchronous). Then, before pausing, it sets `awaiting = false`, `whoTimeout =
+  0`, gives back the query (`stats.queries - 1`) and puts a class sub-query back
+  at the front of `pending` (a sweep slice is rebuilt from the unchanged `lo`),
+  so no timeout runs and no retry is burned.
+- (c) The session cap: `Drain` checks `CapReached()` before the pacing and the
+  `SendsBlocked()` hold (1705), so a capped run ends and its queue is cleared
+  even in combat, in an instance or under throttle; `NextStep` reports "session
+  cap reached -- the run is ending".
+- (d) No A/B roll from polling: `NextStep` (called by the button label every
+  0.2 s, tooltips, `/gr status`) uses the read-only `GuildRecruiter_HeadMode`
+  (1614): the dealt variant's mode, the live mode when A/B is off, or nil (not
+  dealt yet: treated as a timer whisper, Drain deals it when due). `DealHead`
+  is called only from `Drain` (the head is due) and `ContactHead`. The deal is
+  cleared on Stop (1910), Abort (1464), the cap drop and `/gr reset`.
+
+**Names with a space ("First Surname")**, at every step: the /who row name is
+`fullName` through `ShortName`; the whisper target is that string (Blizzard's
+own Forever Who list passes `info.fullName` on, WhoList.lua:107, 110); a reply
+is matched with `GR_Compat.FindKey`, which also tries "First-Surname" (whispers
+accept both forms, ChatFrameEditBox.lua:84-85); the link is
+`|Hplayer:First Surname|h[First Surname]|h`, and Blizzard's `HandlePlayerLink`
+takes the name as the first ":" field (`string.split(":", options)`,
+ItemRefHandlers.lua:1-8), so the space survives into the box; the copy box holds
+the full name; join/decline names go through `PlainName` (link or plain text,
+spaces kept) and `FindKey`. The surname separator is a space
+(`SlashCommands.lua:1163-1164`).
+
+**New commands and settings.** `/gr ready` (show/hide the panel), `/gr alert
+on|off` (`readyAlert`, default on), `/gr set readyttl <minutes>` (1-1440, default
+30). The Lists tab has a "Ready to invite" view (the dropdown popup now has 7
+slots). No pacing default changed; no slash command was renamed.
+
+**Whisper safety.** Default pacing is unchanged (invite delay 1 s, jitter off).
+Timer whispers obey `Pace`, the throttle backoff, the combat / instance hold and
+the session cap. The whisper text is the player's own message (`%p`, `%g`). A
+name is whispered at most once per re-invite cooldown: history is written when
+the whisper goes out, peers get the `INV` broadcast, `seen` covers the run, and
+names on the Ready list are skipped by the scan. Nothing evades the server
+throttle or chat spam detection.
+
+**Alert.** `GR_Compat.Alert` (204): `C_Sound.PlaySound` (else the `PlaySound`
+global, which Forever defines as `C_Sound.PlaySound`,
+`Blizzard_SharedXML/Mainline/Sound.lua:3`) with `SOUNDKIT.READY_CHECK` (8960,
+`Mainline/SoundKitConstants.lua:85`, loaded as `[Family]` on Forever), then
+`FlashClientIcon()` (`ClientDocumentation.lua:10`; Blizzard's ready check does
+the same pair, `Blizzard_FrameXML/Mainline/ReadyCheck.lua:71-72`). Both under
+`pcall` and feature-detected. `PlaySoundFile` is not in the Forever docs and is
+not used.
+
 ## 2. Still unverified
 
 There was no game client and no Lua interpreter. The facts from a real
@@ -401,11 +535,11 @@ Wiki facts come from the pages listed in §4. The wiki is fan-maintained.
 | # | Blocker (REQUIREMENTS §3) | Isolated in | What is still open |
 |---|---|---|---|
 | 1 | /who: throttle and hardware-event rules | `GR_Compat.SendWho` (gated by `GR_Compat.CheckPress`), `GR_Compat.GetNumWhoResults`, `GR_Compat.GetWhoRow`, `GR_Compat.SetWhoToUI`, `GR_Compat.WhoPanel` / `MuteWhoWindow` / `HideWhoWindow`; mode switch `GR_Compat.RequiresHardwareEvent` | The functions, arguments and fields are settled (§2.3), and a key press is known to send the /who. Still open: the server's real throttle, and what a `#hwevent` violation does (an error, a silent drop, or ADDON_ACTION_BLOCKED). A silent drop would show up as a /who timeout and retry. Also open: whether the server parses the text filter `c-"Class"` the same way (Blizzard's Forever Who list filters classes with the `SendWhoFilters` table instead). |
-| 2 | Guild invites from addon code | Key-press mode: `GR_Compat.GuildInvite` -> `GR_Compat.SetSecureInvite` (the copy box, `GR_Compat.ShowCopyBox`). Timer-loop client: `GR_Compat.ResolveInvite`, `GR_Compat.RunSlash`. Both: `GR_Compat.CanGuildInvite` | **Answered in game:** `C_GuildInfo.Invite` is forbidden for addon code, from a key press, from a secure `/ginvite` macro, and from `/ginvite` typed into the chat box by the addon. The player now invites through Blizzard's own Guild > Invite Member dialog; API_AUDIT.md §4 shows how that dialog uses the pasted text. Still open: whether `C_GuildInfo.Invite` accepts "First Surname" (with the space) as pasted. |
-| 3 | WHISPER from addon code | `GR_Compat.SendWhisper` | The signature is settled (§2.3). Still open: what the docs' `HasRestrictions = true` and `RestrictedForMacroChatMessages = true` on `C_ChatInfo.SendChatMessage` mean for an addon WHISPER. The wiki marks only SAY, YELL, CHANNEL and, on Forever, EMOTE as hardware-event. Behaviour under "chat messaging lockdown" (encounters, PvP) is also open. Key-press mode relies on this row: `whisper`-mode contacts still go out from the timer (`GR_Compat.TimerContactModes`). If WHISPER turns out to need a press too, set that table to `{}`. |
+| 2 | Guild invites from addon code | Key-press mode: `GR_Compat.GuildInvite` -> `GR_Compat.SetSecureInvite` (the copy box, `GR_Compat.ShowCopyBox`). Timer-loop client: `GR_Compat.ResolveInvite`, `GR_Compat.RunSlash`. Both: `GR_Compat.CanGuildInvite` | **Answered in game:** `C_GuildInfo.Invite` is forbidden for addon code, from a key press, from a secure `/ginvite` macro, and from `/ginvite` typed into the chat box by the addon, and when the Invite Member box was filled by addon code (`SetItemRef`: the fill worked, the player's Accept was then FORBIDDEN, `Invite()`). The player invites through Blizzard's own Guild > Invite Member dialog, from the Ready list (§1.11); API_AUDIT.md §4 shows how that dialog uses the pasted text. Still open: whether `C_GuildInfo.Invite` accepts "First Surname" (with the space) as pasted or shift-clicked. |
+| 3 | WHISPER from addon code | `GR_Compat.SendWhisper` | The signature is settled (§2.3). Still open: what the docs' `HasRestrictions = true` and `RestrictedForMacroChatMessages = true` on `C_ChatInfo.SendChatMessage` mean for an addon WHISPER. The wiki marks only SAY, YELL, CHANNEL and, on Forever, EMOTE as hardware-event. Behaviour under "chat messaging lockdown" (encounters, PvP) is also open. Key-press mode relies on this row: `whisper` and now `whisperinvite` contacts go out from the timer (`GR_Compat.TimerContactModes`, §1.11). **Not yet seen working in game.** If WHISPER turns out to need a press too (a block report naming `C_ChatInfo.SendChatMessage (whisper)`, or whispers that never arrive), set that table to `{}`: the whispers then become Next steps again. |
 | 4 | Secret /who fields | `GR_Compat.IsSecret`, `GR_Compat.GetWhoRow`, `GR_Compat.GetNumWhoResults`, and the guards in `GR_OnEvent`, `OnAddonMessage`, `GR_Compat.FilterSystemChat`, `GR_Compat.IsWhoNoise` | Settled by the docs, not yet seen in game: the /who calls carry no secret-return flag. CHAT_MSG_SYSTEM and CHAT_MSG_WHISPER are `SecretInChatMessagingLockdown`; CHAT_MSG_ADDON is not. The guards stay. |
 | 5 | Lua core, templates, backdrops | — | Settled (§2.3). |
-| 6 | Server chat strings (join/decline, throttle, /who summary) | `GR_Compat.IsThrottleMsg`, `GR_Compat.IsWhoNoise`, `ToPattern` / `JOIN_PAT` / `DECLINE_PAT` (built from `ERR_GUILD_JOIN_S` / `ERR_GUILD_DECLINE_S` with an enUS fallback) | Still open. The mirror has no GlobalStrings.lua, so none of this text is in it. Also open: whether names in those messages are plain, linked (`|Hplayer:...|h`), or carry a surname or realm. |
+| 6 | Server chat strings (join/decline, throttle, /who summary) | `GR_Compat.IsThrottleMsg`, `GR_Compat.IsWhoNoise`, `ToPattern` / `JOIN_PAT` / `DECLINE_PAT` (built from `ERR_GUILD_JOIN_S` / `ERR_GUILD_DECLINE_S` with an enUS fallback) | Still open. The mirror has no GlobalStrings.lua, so none of this text is in it. Also open: whether names in those messages are plain, linked (`|Hplayer:...|h`), or carry a surname or realm. §1.11 now relies on the join (and decline) message to count an invite for a Ready-list name: `GR_Compat.PlainName` accepts a link or plain text and keeps spaces, and `GR_Compat.FindKey` also tries the "First-Surname" form, but whether the Forever text matches `JOIN_PAT` at all, and in which name form, is unverified. If it doesn't, only [Done] counts. |
 
 In-game probe (from REQUIREMENTS §3, also in README.txt):
 
@@ -508,6 +642,37 @@ invite step. Still untested:
   (`RequiresHardwareEvent == false`) is for clients that run Lua 5.1 but lack
   `C_FriendList.SendWho`. The 1.12 build itself stays on `main`.
 
+### 2.4 Automatic whispers and the Ready list: unverified (no client)
+
+- **Whisper delivery from the timer** (`C_ChatInfo.SendChatMessage(..., "WHISPER",
+  nil, "First Surname")`): documented as not hardware-restricted, never seen in
+  game. Also open: whether the target must be "First Surname" or
+  "First-Surname" (we pass the /who `fullName`, as Blizzard's own Who list does).
+- **The reply sender form**: whether CHAT_MSG_WHISPER names a surnamed player
+  "First Surname" or "First-Surname" (both are tried, `GR_Compat.FindKey`).
+- **Sound and flash**: `C_Sound.PlaySound(SOUNDKIT.READY_CHECK)` and
+  `FlashClientIcon()` exist in the Forever source and docs; not heard or seen.
+  Both are under `pcall`, so a failure is silent.
+- **Shift-click fill from the chat link**: Blizzard's `HandlePlayerLink` fills
+  `ADD_GUILDMEMBER` (ItemRefHandlers.lua:24-28). Not tested with our printed link
+  and a "First Surname" name. It does NOT fill the Guild Finder variant
+  `ADD_GUILDMEMBER_WITH_FINDER_LINK` (opened when the guild has an active
+  finder listing, CommunitiesUtil.lua:240-251): there [Copy] is the way. Whether
+  the player's Accept after a chat-frame shift-click is allowed is also untested;
+  it is Blizzard's own chat code running in the player's click, unlike the
+  refused addon `SetItemRef`.
+- **Done-on-join**: whether the Forever join text matches `JOIN_PAT` and names
+  the player in a form `PlainName` + `FindKey` match (row 6 above). A join of
+  someone another officer invited also counts as our invite if that name is on
+  our Ready list.
+- **Late replies**: `whispered` entries are still dropped after `WHISPER_WAIT`
+  (120 s) while a run is running (unchanged), so a "yes" that comes later than
+  that during a run is not caught (a run that ends by itself has dropped them
+  all; after `/gr stop` the remaining ones still match until the next
+  `/gr start`). Not changed here (it is a timing default).
+- **Panel layout**: the instruction line, rows and buttons were sized by
+  reasoning, not seen; long "First Surname" names may be cut at 180 px.
+
 ### 2.3 Settled by the Forever UI source (2026-11-05; evidence in API_AUDIT.md)
 
 **Mismatches found and fixed in GR_Compat:**
@@ -588,8 +753,8 @@ invite step. Still untested:
 
 ## 3. What could not be ported safely
 
-1. **The automatic /who sweep and the automatic invites need hardware events (blockers 1 and 2). Addressed by key-press mode (§1.9) and the secure invite button (§1.10).** The run now waits for a Next press for every /who and every invite: the F4 sweep, invite mode, reply invites, and Invite all / Send. Block reports pause the run. What it costs the player: one press per /who and per invite instead of an unattended run, and no invites in combat. In `whisper` mode only the /who needs a press. In `whisperinvite` mode the first whisper needs one too (see the end of §1.9). The /who press is confirmed in game; the secure invite is not (§2.2).
-2. **The "chat" invite method** (`/ginvite` through `ChatEdit_SendText`) runs a slash command from addon code. It is kept only for timer-loop clients. In key-press mode it is never used: `/ginvite` runs from the secure button's macro instead.
+1. **The automatic /who sweep needs a hardware event, and automatic invites are impossible (blockers 1 and 2).** The /who waits for one Next press each (§1.9, confirmed in game). Guild invites cannot be sent by addon code at all on Forever (every form refused in game, §1.10, §1.11): the addon prompts, keeps the Ready list, and the player sends each invite in Blizzard's Guild > Invite Member box, then presses Done. What it costs the player in `whisperinvite` mode: one press per /who, and per "yes" reply: open Invite Member, shift-click the name in chat (or Copy + paste), Accept, Done. Whispers and reply handling run by themselves (§1.11; whisper delivery not yet seen in game). In invite mode each prompt still takes a press. Block reports pause the run.
+2. **The "chat" invite method** (`/ginvite` through `ChatEdit_SendText`) runs a slash command from addon code. It is kept only for timer-loop clients. In key-press mode it is never used.
 3. **The `ChatFrame_OnEvent` fallback** (used only if the message-filter API is missing) replaces a Blizzard global, which taints the chat frames on Mainline.
 
 ## 4. How this was checked (no client, no interpreter)
@@ -704,6 +869,52 @@ invite step. Still untested:
   runOnUp="true"` and no body. The name matches `GR_Compat.NEXT_BINDING`, which
   is used for the `GetBindingKey` lookups and the `_G` label.
 - `file`: GuildRecruiter.lua ASCII text, all edited files LF, 0 CR bytes.
+
+### 4.3 Automatic whispers and Ready list checks (same tools)
+
+- **Parser, `0c17add` to the working tree:** syntax OK to syntax OK (274 to 308
+  functions). Max upvalues 31 to 31 (the slash handler); Start 30,
+  BuildSettingsPanel 28, GR_OnUpdate 27, GR_OnEvent 20, ProcessWho 19, all
+  unchanged (5.1 limit 60). Main-chunk locals 171 to 171 (limit 200): the new
+  code is global `GuildRecruiter_*` functions and `GR_Compat` fields only.
+  Generic-for over a non-call: 0.
+- **Globals:** new reads `C_Sound`, `PlaySound`, `SOUNDKIT`, `FlashClientIcon`
+  (all in `GR_Compat.Alert`, feature-detected), `next` (Lua), the frame name
+  `GuildRecruiterReadyPanel` (made by `CreateFrame`), and the new
+  `GuildRecruiter_Ready*`, `GuildRecruiter_HeadMode` and
+  `GuildRecruiter_TimerMode` functions, each of which is also written in the
+  file. No global was removed.
+- **Call graph, specialised to key-press mode** (the timer-loop-only blocks cut,
+  each cut matching exactly once: the timer /who in GR_OnUpdate, the
+  `ResolveInvite` send in `GR_Compat.GuildInvite`, the label in `InviteApiName`,
+  the direct invite in `InviteOne`, and Drain's two `not hw` contact branches):
+  - `GR_Compat.SendWho`: only from the secure Next button's PreClick and the
+    slash handler (`/gr next`), both through `GuildRecruiter_NextPress` ->
+    `SendNextWho`. No OnUpdate, OnEvent or chat-filter path.
+  - `ResolveInvite`, `InviteByChat`, `RunSlash`: no path from any root.
+  - `GuildRecruiter_DealHead` (the A/B roll): only from the run timer's
+    `Drain` (when the head is due) and from `ContactHead` (PreClick, `/gr next`,
+    Drain). The Next button's label OnUpdate, the tooltips and `/gr status`
+    reach only the read-only `GuildRecruiter_HeadMode`.
+  - `GR_Compat.ShowCopyBox` (it takes keyboard focus): from the Ready panel's
+    [Copy] / [Copy next] OnClick and from a press's invite prompt
+    (`SetSecureInvite`). No OnEvent path, so a reply never steals focus.
+  - `GuildRecruiter_ReadyAdd`: from OnEvent (CHAT_MSG_WHISPER, the yes-reply),
+    from the press (prompts) and from the timer only through `Contact`'s invite
+    branch, which the timer never takes (`TimerMay` is true only for the whisper
+    modes, false for Invite all).
+  - Negative test: injecting `SendNextWho(); GuildRecruiter_DealHead()` into the
+    CHAT_MSG_WHISPER branch of a scratch copy made the script report both new
+    OnEvent paths.
+- **grep (code lines, comments stripped):** `C_GuildInfo.Invite`,
+  `GuildInviteByName` and `GuildInvite` appear only in `GR_Compat.ResolveInvite`;
+  `ChatEdit_SendText` / `ChatFrameEditBox` / `.editBox` only in `GR_Compat.RunSlash`
+  (both timer-loop only, unreachable in key-press mode per the call graph).
+  `SetItemRef`, `StaticPopup_Visible`, `ChatFrame_OpenChat`, `OpenChat`,
+  `InsertLink`, `SendTell` and any `StaticPopupN` / `ADD_GUILDMEMBER` frame: no
+  code hits (comments only). The only `StaticPopup_Show` is the addon's own
+  `GUILDRECRUITER_CONFIRM` dialog, as before.
+- `file`: GuildRecruiter.lua and README.txt ASCII text, LF, 0 CR bytes.
 
 ### Forever UI source read for §1.10 (Gethe/wow-ui-source, branch `forever`, 1.60.1 build 70790, read 2026-11-05)
 

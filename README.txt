@@ -5,12 +5,12 @@ Guild Rawcruiter  --  vanilla 1.12 / Turtle WoW guild recruitment helper
 WoW: FOREVER BUILD  (branch "forever", version 4.0.0-forever.1)
 -----------------------------------------------------------------
 This is a BETA port to the WoW: Forever client (## Interface: 16001, modified
-Lua 5.1, Mainline-style API). It has NOT been tested in game -- it was ported
-and checked offline only. The 1.12 / Turtle build stays on the "main" branch;
+Lua 5.1, Mainline-style API). Only parts of it have been seen working in game
+(see "SEEN IN GAME" below). The 1.12 / Turtle build stays on the "main" branch;
 the text below this section describes that build's features, which the port
 keeps (same settings, defaults, slash commands and pacing values), except that
-each /who and each invite now waits for a key press -- see "ONE KEY PRESS PER
-/WHO OR INVITE" below.
+each /who waits for a key press and the addon never sends a guild invite
+itself -- see "HOW A RUN WORKS ON FOREVER" below.
 
 What changed: the Lua 5.0 code was converted to Lua 5.1 (no table.getn,
 string.gfind, getglobal, `this` or arg1 globals), and every client call whose
@@ -20,7 +20,8 @@ checks which API the client actually has (feature detection, never a version
 check) and uses the modern one when present, else the old 1.12 global:
   /who            C_FriendList.SendWho / GetNumWhoResults / GetWhoInfo /
                   SetWhoToUi          (else SendWho, GetWhoInfo, SetWhoToUI)
-  guild invite    Forever: /ginvite run by the secure Next button (see below)
+  guild invite    Forever: never sent by the addon -- YOU send it from
+                  Blizzard's Guild > Invite Member box (see below)
                   older clients: C_GuildInfo.Invite (else GuildInviteByName,
                                  GuildInvite, then the /ginvite chat command)
   whisper         C_ChatInfo.SendChatMessage      (else SendChatMessage)
@@ -29,74 +30,102 @@ check) and uses the modern one when present, else the old 1.12 global:
 Values the client marks secret (issecretvalue) are skipped, never compared.
 On load the addon prints which invite, /who and whisper calls it picked.
 
-ONE KEY PRESS PER /WHO OR INVITE (key-press mode)
-The warcraft.wiki.gg page for C_FriendList.SendWho says it needs a hardware
-event (a key press or mouse click), and the other Forever recruiters all work
-one /who or one invite per press. So on a client that has
-C_FriendList.SendWho, the addon never sends a /who or an invite from its timer.
-It waits for you to press "Next":
+HOW A RUN WORKS ON FOREVER (key-press mode)
+On a client that has C_FriendList.SendWho (Forever), the /who needs a key
+press or mouse click, and a guild invite from addon code is refused in every
+form (a direct call, a secure /ginvite macro, /ginvite typed into the chat box
+by the addon). So the addon does what it may and leaves the rest to you:
+
   /gr start       ARMS the run (or right-click the minimap button). Nothing is
                   sent yet; chat tells you how to press Next.
-  Next            Each press sends ONE thing, in this order:
-                    1. an invite to someone who replied yes (whisper-then-invite)
-                    2. the next queued contact: an invite, or the first whisper
-                       of whisper-then-invite mode
-                    3. otherwise the next /who of the sweep
-                  Ways to press it:
-                    - the "Next" button that appears under the minimap button
-                      while a run is armed (or a single invite is set)
+  Next            One press = one /who. Ways to press it:
+                    - the "Next" button under the minimap button (shown while
+                      a run is armed)
                     - a key: Key Bindings > Guild Rawcruiter >
                       "Next: one /who, whisper or guild invite". No default key.
-                      This entry is new: if you bound a key to the old Next
-                      entry, bind it again here.
                     - a macro with: /click GuildRecruiterNextButton
-                    - typing /gr next -- but only for a /who or a whisper
-                      (see GUILD INVITES below)
-The button shows what the next press will do and when it is allowed, e.g.
-"Next: send /who", "/who ready in 2s", "Invite Bob", "Waiting for /who".
-A number in [brackets] is how many replies are ready to invite.
-Your delay settings (invite delay, /who delay, random delays) still apply, as
-the shortest gap between presses: press too early and chat says "wait Ns".
-The timer still does the waiting: /who timeouts and retries, reading the
-results, judging whisper replies, auto-backoff, the rest between auto-rescan
-sweeps (each new sweep waits for a press), and ending the run.
-Whisper-only contacts are not restricted, so in "whisper" mode the whispers
-still go out by themselves at the invite delay; you only press for the /who.
-Lists tab "Invite all" / "Send": confirm once to arm, then each click on the
-Next button by the minimap (or its key) sends one invite and chat says
-"N left, click again". The Lists tab has no Next button of its own any more.
-Lists tab, Candidates view: left-click a name, then click Next, to invite
-that one player (/gr invite <name> does the same; /gr stop drops it).
+                    - typing /gr next
+  Whispers        In "whisper" and "whisperinvite" (whisper, then invite) mode
+                  the whispers go out BY THEMSELVES from the timer, one per
+                  invite delay, with the same random delays, throttle backoff,
+                  combat/instance pause, session cap, blacklist, class/level
+                  filter and re-invite cooldown as always. Nobody is whispered
+                  twice within the cooldown. While whispers are still queued
+                  the Next button reads "Whispering (N)"; the next /who is due
+                  once the queue is empty ("Next: send /who").
+  Replies         In whisperinvite mode a reply that passes your Reply rule
+                  (notno / yesonly / any and the word lists) goes straight to
+                  the READY LIST -- no press. You hear a sound (the ready-check
+                  sound) and the game's taskbar icon flashes (/gr alert off to
+                  silence both), a chat line names the player as a link, and
+                  the Ready panel pops up with the new name in its title.
+  YOU invite      For each name on the Ready list:
+                    1. open Guild > Invite Member (Blizzard's own box);
+                    2. click the name in the Ready panel: it is printed in chat
+                       as a player link -- SHIFT-click it THERE and Blizzard
+                       fills the box. Or press [Copy] in the panel: the name
+                       is selected in a small box, Ctrl+C, Esc, then Ctrl+V
+                       into Invite Member. [Copy next] does the same for the
+                       name that has waited longest;
+                    3. press Accept in Invite Member;
+                    4. press [Done] in the Ready panel.
+                  If your guild has an active Guild Finder listing, Invite
+                  Member opens a different Blizzard box
+                  (ADD_GUILDMEMBER_WITH_FINDER_LINK) that Blizzard's shift-click
+                  code does not fill -- use [Copy] then. With no box open, a
+                  shift-click on a chat name runs Blizzard's own /who for it.
+                  The panel lists everyone waiting, newest first, with how long
+                  ago they replied. It is our own window (drag it anywhere; the
+                  position is saved), it hides itself when the list is empty,
+                  and /gr ready shows or hides it. The list is saved, so it
+                  survives /reload and logout. A name that waits longer than
+                  30 minutes (/gr set readyttl <minutes>) drops off.
+  Invite mode     ("Invite only", Invite all, Send in invite mode, a single
+                  invite from the Lists tab): each Next press puts the next
+                  name on the Ready list and shows its copy box and chat link;
+                  you invite it as above.
 
-GUILD INVITES: A SECURE BUTTON, NOT IN COMBAT
-A Forever client showed that C_GuildInfo.Invite is protected: addon code that
-calls it gets ADDON_ACTION_FORBIDDEN even inside a key press. So the addon
-never calls it. The Next button is a secure button (Blizzard's
-SecureActionButtonTemplate): when the next step is an invite, the addon sets
-the button's macro to "/ginvite Name" just before your click is handled, and
-the game runs that macro itself -- exactly as if you had typed /ginvite.
-What that means for you:
-  - Invites go out only from a click on the Next button, its key, or a macro
-    with /click GuildRecruiterNextButton. Typing /gr next or /gr invite can't
-    send one (chat tells you what to click instead).
-  - Not in combat: the game doesn't let addons change a secure button in
-    combat. An invite press in combat says "can't set the invite in combat";
-    press again afterwards. The button then reads "Invite Bob (after combat)".
-    (With "Pause in combat" on, the default, invites are held anyway and the
-    press does the /who instead.)
-  - In combat the button can't appear or disappear either; it does that when
-    combat ends.
-  - The "Invite method" setting (/gr set method) is not used on Forever.
-  - The secure action runs when you RELEASE the mouse button or the key.
-If the client still blocks a call (ADDON_ACTION_BLOCKED / FORBIDDEN naming
-this addon), the run pauses and one chat line names the blocked call.
-On a client without C_FriendList.SendWho the old automatic timer loop runs
-unchanged and Next is not needed.
-Seen in game so far (one player's screenshot): a Next key press sent a /who
-and queued 48 candidates; the first invite (then a direct C_GuildInfo.Invite)
-was refused with ADDON_ACTION_FORBIDDEN. The secure /ginvite button that
-replaces it HAS NOT BEEN TESTED IN GAME. Details and open questions are in
-PORT_NOTES.md.
+Counting: an invite is counted (Stats "invited", the re-invite history, A/B
+credit) only when you press [Done], when the guild's "X has joined the guild"
+(or "declines your guild invitation") message names someone on the Ready list,
+or when you remove a name from the Lists tab's "Ready to invite" view (which
+asks first and counts it like Done). Showing a prompt counts nothing. A name
+that expires is not counted. In whisperinvite mode the whisper itself counts as
+the contact, as before.
+
+The addon never touches a Blizzard window or the chat edit box, and never calls
+an invite function. In particular it never fills the Invite Member box itself:
+on a real Forever client, a name filled in by addon code made Blizzard refuse
+the player's Accept (ADDON_ACTION_FORBIDDEN, Invite()). That is why the panel
+prints the name in chat for YOU to shift-click there.
+
+The button shows what the next press will do and when, e.g. "Next: send /who",
+"/who ready in 2s", "Whispering (12)", "Waiting for /who", "Invite Bob"
+(invite mode). "[3 ready]" means three names wait on the Ready list. Your
+delay settings still apply as the shortest gap between presses: press too
+early and chat says "wait Ns". The timer still does the waiting: /who timeouts
+and retries, reading the results, sending whispers, judging replies,
+auto-backoff, the rest between auto-rescan sweeps (each new sweep waits for a
+press), and ending the run.
+If the client blocks a call (ADDON_ACTION_BLOCKED / FORBIDDEN naming this
+addon), the run pauses and one chat line names the call; a refused /who is not
+counted and is not waited for. On a client without C_FriendList.SendWho the old
+automatic timer loop runs unchanged and Next is not needed.
+
+New commands (Forever):  /gr ready  (show/hide the Ready panel)
+                         /gr alert on|off  (reply sound + taskbar flash, default on)
+                         /gr set readyttl <minutes>  (default 30)
+The Lists tab has a "Ready to invite" view; /gr status and the minimap tooltip
+show how many names are waiting.
+
+SEEN IN GAME (one player's tests): a Next key press sent a /who and queued 48
+candidates. Every invite from addon code was refused (direct
+C_GuildInfo.Invite, a secure /ginvite macro, /ginvite typed into the chat box,
+and the Invite Member box filled by addon code). NOT YET SEEN IN GAME: whispers
+sent by the timer, the reply sound and taskbar flash, the shift-click on the
+chat link filling Invite Member, and whether the guild's join message names a
+"First Surname" player so that it matches the Ready list. Details and open
+questions are in PORT_NOTES.md.
 
 Before trusting it, run this in game and send the output along with any error:
   /dump select(4, GetBuildInfo())
@@ -246,10 +275,15 @@ ANTI-PATTERN / SAFETY OPTIONS
 ALL COMMANDS  (slash:  /gr)
 ---------------------------
   start | stop | pause | resume | status | config
-  next                  (Forever build) Send the next /who or whisper -- one
-                        per press. Invites need the Next button, its key
+  next                  (Forever build) Send the next /who -- one per press.
+                        Invite-mode prompts need the Next button, its key
                         (Key Bindings > Guild Rawcruiter) or a macro with
                         /click GuildRecruiterNextButton, out of combat.
+  ready                 (Forever build) Show/hide the Ready panel: players who
+                        said yes, waiting for YOUR invite.
+  alert on|off          (Forever build) Sound + taskbar flash when a reply
+                        lands on the Ready list (default on).
+  set readyttl <min>    (Forever build) Minutes a Ready entry waits (default 30).
   reset                 Clear THIS session's scan list (keeps history).
   forget                Wipe the persistent invite history.
   hide                  Toggle auto-hiding the Who window during scans.

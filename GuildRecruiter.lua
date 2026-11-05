@@ -48,13 +48,16 @@ GR_Compat.IsSecret = issecret
 -- mouse click, never from OnUpdate, C_Timer or an event. C_GuildInfo.Invite is
 -- stricter: on a Forever client it raised ADDON_ACTION_FORBIDDEN from a key
 -- press, so it is protected (Blizzard-only) and addon code never calls it here.
--- Invites go through the SECURE Next button instead (GR_Compat.SetSecureInvite):
--- its PreClick puts "/ginvite Name" in the button's macrotext and the client's
--- own secure click handler runs that macro.
+-- A secure /ginvite macro, /ginvite typed into the chat box by the addon, and
+-- the Invite Member box filled by addon code (SetItemRef) were all refused on a
+-- Forever client too. So the addon only PROMPTS (GR_Compat.SetSecureInvite:
+-- copy box + a chat player link) and keeps the Ready list; the player invites
+-- in Blizzard's Guild > Invite Member box.
 -- ONE switch, set by feature detection at load: a client with
 -- C_FriendList.SendWho is treated as needing a press for every /who and every
--- invite (the run waits for the Next key / button); a client with only the old
--- globals keeps the automatic timer loop and its old invite calls.
+-- invite prompt (whispers still go out from the timer, TimerContactModes); a
+-- client with only the old globals keeps the automatic timer loop and its old
+-- invite calls.
 GR_Compat.RequiresHardwareEvent = (C_FriendList and C_FriendList.SendWho) and true or false
 
 -- the Bindings.xml CLICK binding on the secure Next button (also its key lookup)
@@ -67,9 +70,14 @@ function GR_Compat.InCombat()
 end
 
 -- contact modes the run timer may still send by itself in hardware-event mode:
--- a WHISPER is not hardware-restricted (wiki), so whisper-only contacts keep
--- going out on the invite delay. Everything else waits for a press.
-GR_Compat.TimerContactModes = { whisper = true }
+-- a WHISPER is not hardware-restricted (wiki; Forever docs mark only
+-- HasRestrictions on C_ChatInfo.SendChatMessage), so whisper contacts keep
+-- going out on the invite delay, with the same pacing, jitter, backoff, combat /
+-- instance hold and session cap as before. That includes the first whisper of
+-- whisper-then-invite: the invite itself is never sent by the addon (it lands on
+-- the Ready list for the player). Everything else waits for a press.
+-- If whispers turn out to need a press too, set this table to {}.
+GR_Compat.TimerContactModes = { whisper = true, whisperinvite = true }
 
 -- GR_Compat.Press(fn, ...) runs fn for a key press or click, in the SAME call
 -- stack (pcall is synchronous: no timer, no OnUpdate hop, no coroutine), and
@@ -139,6 +147,65 @@ function GR_Compat.ShortName(name)
   if type(name) ~= "string" or issecret(name) then return nil end
   if type(Ambiguate) == "function" then return Ambiguate(name, "none") end
   return name
+end
+
+-- the key under which tbl holds this player, or nil. Forever names are "First
+-- Surname" (the surname separator is a space: SlashCommands.lua:1163-1164), but
+-- whispers also accept "First-Surname" where regional unique names are on
+-- (ChatFrameEditBox.lua:84-85) and links can carry a link separator instead
+-- (C_NameUtil.ReplaceSurnameSeparatorWithLinkSeparator, ItemRefHandlers.lua:38).
+-- Which form a whisper sender or a system message uses is unverified, so both
+-- are tried: the name as given, then with its first space <-> hyphen swapped.
+function GR_Compat.FindKey(tbl, name)
+  if type(tbl) ~= "table" or type(name) ~= "string" or issecret(name) then return nil end
+  if tbl[name] ~= nil then return name end
+  local alt
+  if string.find(name, " ", 1, true) then alt = string.gsub(name, " ", "-", 1)
+  else alt = string.gsub(name, "-", " ", 1) end
+  if alt ~= name and tbl[alt] ~= nil then return alt end
+  return nil
+end
+
+-- a player name out of system-message text: a player link (|Hplayer:Name:...|h
+-- [Name]|h) gives its first field; otherwise colour codes and [brackets] are
+-- stripped. Spaces inside the name are kept. nil for empty or secret text.
+function GR_Compat.PlainName(s)
+  if type(s) ~= "string" or issecret(s) then return nil end
+  local n = string.match(s, "|Hplayer:([^:|]+)")
+  if not n then
+    n = string.gsub(s, "|c%x%x%x%x%x%x%x%x", "")
+    n = string.gsub(n, "|r", "")
+    n = string.gsub(n, "^%[(.*)%]$", "%1")
+  end
+  n = string.gsub(n, "^%s+", "")
+  n = string.gsub(n, "%s+$", "")
+  if n == "" then return nil end
+  return GR_Compat.ShortName(n)
+end
+
+-- a chat player link for a name ("First Surname" keeps its space: Blizzard's
+-- HandlePlayerLink takes the name as the link's first ":" field,
+-- Blizzard_UIPanels_Game/Mainline/ItemRefHandlers.lua:1-8). The addon only
+-- PRINTS it into the chat frame; the player's shift-click on it there is handled
+-- by Blizzard's own chat code, which fills an open Guild > Invite Member box
+-- (ItemRefHandlers.lua:24-28). The addon never calls SetItemRef itself.
+function GR_Compat.PlayerLink(name)
+  if type(name) ~= "string" or string.find(name, "[|:%c]") then return tostring(name) end
+  return "|cffffd100|Hplayer:"..name.."|h["..name.."]|h|r"
+end
+
+-- the reply alert: a stock sound and the taskbar flash, both feature-detected and
+-- under pcall. Forever: PlaySound = C_Sound.PlaySound(soundKitID, ...)
+-- (Blizzard_SharedXML/Mainline/Sound.lua:3; SoundDocumentation.lua:52-72),
+-- SOUNDKIT.READY_CHECK = 8960 (Mainline/SoundKitConstants.lua:85, loaded as
+-- [Family] on Forever), the sound Blizzard plays for a ready check together with
+-- FlashClientIcon() (Blizzard_FrameXML/Mainline/ReadyCheck.lua:71-72;
+-- ClientDocumentation.lua:10). There is no PlaySoundFile in the Forever docs.
+function GR_Compat.Alert()
+  local kit = (SOUNDKIT and SOUNDKIT.READY_CHECK) or 8960
+  local play = (C_Sound and C_Sound.PlaySound) or PlaySound
+  if type(play) == "function" then pcall(play, kit) end
+  if type(FlashClientIcon) == "function" then pcall(FlashClientIcon) end
 end
 
 -- the player's OWN name in the form /who and chat use, for the "is this me?"
@@ -328,13 +395,21 @@ function GR_Compat.SetSecureInvite(name)
   -- the name goes in the addon's OWN copy box instead: Ctrl+C, Esc, then paste it
   -- into the Blizzard Guild > Invite Member box yourself. The addon never touches
   -- a Blizzard frame, so the invite stays a Blizzard-UI action.
+  -- This is only the PROMPT: the caller puts the name on the Ready list, and the
+  -- invite is counted when the player presses Done there (or the join/decline
+  -- message names them), never here.
   GR_Compat.ShowCopyBox(name)
+  GR_Compat.PrintLink(name)
+end
+
+-- print the invite prompt line with the name as a player link, in the chat frame
+-- (Blizzard's own link handler fills the open Invite Member box when the player
+-- shift-clicks it there: Blizzard_UIPanels_Game/Mainline/ItemRefHandlers.lua:24-28,
+-- StaticPopup_Visible("ADD_GUILDMEMBER")).
+function GR_Compat.PrintLink(name)
   if DEFAULT_CHAT_FRAME then
-    -- Blizzard's own link handler fills the open Invite Member box when a player link
-    -- is shift-clicked (Blizzard_UIPanels_Game/Mainline/ItemRefHandlers.lua:24-28,
-    -- StaticPopup_Visible("ADD_GUILDMEMBER")), so the name is printed as a link too.
-    DEFAULT_CHAT_FRAME:AddMessage("|cffff8000Rawcruiter:|r invite |Hplayer:"..name.."|h["..name.."]|h"
-      .." -- with Guild > Invite Member open, SHIFT-CLICK the name; or Ctrl+C in the copy box, Esc, paste")
+    DEFAULT_CHAT_FRAME:AddMessage("|cffff8000Rawcruiter:|r invite "..GR_Compat.PlayerLink(name)
+      .." -- with Guild > Invite Member open, SHIFT-CLICK the name here in chat (or Copy + paste), then press Done in the Ready panel")
   end
 end
 
@@ -373,7 +448,7 @@ function GR_Compat.ShowCopyBox(name)
     eb:SetScript("OnEnterPressed", function(self) self:ClearFocus(); f:Hide() end)
     f.edit = eb
   end
-  f.label:SetText("Invite: Ctrl+C, Esc, then Ctrl+V in Guild > Invite Member")
+  f.label:SetText("Ctrl+C, Esc, Ctrl+V in Guild > Invite Member, Accept, then Done")
   f.edit:SetText(name)
   f:Show()
   f.edit:SetFocus()
@@ -439,6 +514,8 @@ end
 -- C_ChatInfo.SendChatMessage (same argument order). Per the wiki WHISPER is not
 -- hardware-event restricted.
 function GR_Compat.SendWhisper(text, target)
+  -- recorded (not gated: whispers may come from the timer) so a block report can name it
+  GR_Compat.lastCall, GR_Compat.lastCallAt = "C_ChatInfo.SendChatMessage (whisper)", GetTime()
   if C_ChatInfo and C_ChatInfo.SendChatMessage then
     C_ChatInfo.SendChatMessage(text, "WHISPER", nil, target)
   elseif type(SendChatMessage) == "function" then
@@ -455,7 +532,7 @@ function GR_Compat.ApiSummary()
   local wsp = (C_ChatInfo and C_ChatInfo.SendChatMessage and "C_ChatInfo.SendChatMessage")
            or (type(SendChatMessage) == "function" and "SendChatMessage") or "none"
   return "Invite API: "..GR_Compat.InviteApiName().." (who: "..who..", whisper: "..wsp..")"
-      ..(GR_Compat.RequiresHardwareEvent and ". Key-press mode: each /who and invite waits for the Next button or its key (invites: not in combat)" or "")
+      ..(GR_Compat.RequiresHardwareEvent and ". Key-press mode: each /who waits for the Next button or its key; whispers go out by themselves; you send each guild invite yourself from the Ready list (/gr ready)" or "")
 end
 
 -- guild sync. Mainline moved both calls to C_ChatInfo (8.0.1) and delivers
@@ -784,6 +861,9 @@ local function Defaults()
   if s.autoScan == nil then s.autoScan = false end         -- loop: after a scan sweep finishes, rest then sweep again
   if not s.autoScanDelay then s.autoScanDelay = 60 end     -- seconds to rest between auto-rescan cycles
   if s.debug == nil then s.debug = false end               -- print per-/who diagnostics during a scan
+  if not s.ready then s.ready = {} end                     -- [name] = {t, kind, v}: waiting for the player's own guild invite (key-press mode; persists)
+  if s.readyAlert == nil then s.readyAlert = true end      -- sound + taskbar flash when a reply lands on the Ready list
+  if not s.readyTTL then s.readyTTL = 30 end               -- minutes a Ready entry waits before it expires (no invite recorded)
   if not s.candidates then s.candidates = {} end          -- [name] = {t, level, class}; persists across logout
   if not s.dataset then s.dataset = {} end                -- [name] = {race, class, level, t}; every player seen in /who, for name-corpus building (persists across logout)
   -- abVariants are the CHALLENGERS only (B/C/D). Variant A is always the live
@@ -1100,6 +1180,8 @@ end
 
 -- perform the configured contact action for one name. v = the A/B variant dealt
 -- to it (challenger table, or nil = control A); see GuildRecruiter_DealHead.
+-- Returns true when the contact was only an invite PROMPT (key-press mode): the
+-- name went to the Ready list and nothing is counted as invited until Done.
 local function Contact(name, v)
   local cfg = GuildRecruiter_CfgOf(v)
   -- during an A/B test a nil pick is the control, credited as "A"; otherwise
@@ -1113,14 +1195,24 @@ local function Contact(name, v)
     GR_Compat.SendWhisper(WhisperBody(name, cfg.whisperMsg), name)
     stats.whispered = stats.whispered + 1; TallyBump("whispered")
     whispered[name] = { t = GetTime(), v = vname }
-    RecordHandled(name, vname)
+    RecordHandled(name, vname)   -- the whisper is the contact: history = re-contact cooldown
   else
     DoGuildInvite(name, cfg.inviteMethod)
+    if GR_Compat.RequiresHardwareEvent then
+      -- key-press mode: that was only the prompt (copy box + chat link). Park the
+      -- name on the Ready list; history, stats.invited, the tally and the A/B
+      -- "contacted" count are recorded by GuildRecruiter_ReadyDone. contacted
+      -- here is the run's step count (session cap, progress) only.
+      GuildRecruiter_ReadyAdd(name, "invite", vname, true)
+      stats.contacted = stats.contacted + 1
+      return true
+    end
     stats.invited = stats.invited + 1; TallyBump("invited")
     RecordHandled(name, vname)
   end
   stats.contacted = stats.contacted + 1
   GuildRecruiter_VarBump(vname, "contacted")
+  return false
 end
 
 -- ---------------------------------------------------------------------------
@@ -1224,7 +1316,7 @@ local function ProcessWho()
         seen[name] = true
       elseif not ClassAllowed(class) then
         seen[name] = true
-      elseif RecentlyInvited(name) then
+      elseif RecentlyInvited(name) or GuildRecruiter_ReadyHas(name) then   -- cooldown, or already waiting on the Ready list
         stats.cooldown = stats.cooldown + 1; seen[name] = true
       else
         seen[name] = true
@@ -1369,6 +1461,7 @@ end
 local function Abort(reason)
   running, scanning, awaiting, paused = false, false, false, false
   GuildRecruiter_rescanWait = 0
+  GuildRecruiter_dealt = nil    -- no stale A/B deal carried into the next run
   SuppressWho(false)
   GR_Compat.SetWhoToUI(false)   -- = RestoreWho (defined later; called directly to avoid a forward ref)
   Print("|cffff4040Stopped on error:|r "..tostring(reason))
@@ -1394,6 +1487,7 @@ local function GR_OnEvent(event, ...)
     InitMinimap()
     GuildRecruiter_SyncNext()   -- key-press mode: build the secure Next button (hidden) out of combat
     Print("v"..VERSION.." loaded. "..GR_Compat.ApiSummary()..". /gr for commands, /gr config for settings.")
+    GuildRecruiter_ReadyLoad()  -- names still waiting from before the reload: show the Ready panel
   elseif event == "WHO_LIST_UPDATE" and running then
     ProcessWho()
     if GuildRecruiter_Settings.hideWho then hideSoon = true end
@@ -1408,11 +1502,18 @@ local function GR_OnEvent(event, ...)
       Print("|cffffcc00Server throttle detected -- pausing sends "..BACKOFF_SECS.."s.|r")
     end
     -- analytics: attribute a join to us only if we contacted them; declines of
-    -- our invitation are always ours
+    -- our invitation are always ours. The name may arrive as a player link or as
+    -- "First Surname" / "First-Surname" (PlainName + FindKey, both unverified).
+    -- A join or decline of someone on the Ready list proves the player's invite
+    -- reached them, so that invite is counted first (GuildRecruiter_ReadyDone,
+    -- which also writes the history the join attribution below reads).
     local hist = GuildRecruiter_Settings.history
     if JOIN_PAT then
       local _, _, jn = string.find(raw, JOIN_PAT)
-      local e = jn and hist and hist[jn]
+      jn = jn and GR_Compat.PlainName(jn)
+      if jn then GuildRecruiter_ReadyDone(jn, "joined") end
+      local jk = jn and GR_Compat.FindKey(hist, jn)
+      local e = jk and hist[jk]
       if e then
         TallyBump("joined")
         local p = (type(e) == "table") and e.p or nil
@@ -1421,9 +1522,12 @@ local function GR_OnEvent(event, ...)
     end
     if DECLINE_PAT then
       local _, _, dn = string.find(raw, DECLINE_PAT)
+      dn = dn and GR_Compat.PlainName(dn)
       if dn then
+        GuildRecruiter_ReadyDone(dn, "declined")
         TallyBump("declined")
-        local e = hist and hist[dn]
+        local dk = GR_Compat.FindKey(hist, dn)
+        local e = dk and hist[dk]
         local p = (type(e) == "table") and e.p or nil
         if e and p ~= "(remote)" then GuildRecruiter_VarBump(p, "declined") end
       end
@@ -1432,15 +1536,17 @@ local function GR_OnEvent(event, ...)
     -- payload (text, sender, ...); a secret text or sender is skipped, never compared
     if GR_Compat.IsSecret(a1) or GR_Compat.IsSecret(a2) then return end
     local sender = GR_Compat.ShortName(a2)   -- Mainline sends "Name-Realm"
-    local w = sender and whispered[sender]
+    local key = sender and GR_Compat.FindKey(whispered, sender)   -- "First Surname" or "First-Surname"
+    local w = key and whispered[key]
     if w then
       if ShouldInvite(a1, w.v) then   -- judge with the variant that whispered them
-        whispered[sender] = nil
-        tinsert(replyQueue, sender)   -- reply passes the policy: invite (paced)
-        -- key-press mode: never invite from this handler; the ready-to-invite
-        -- list waits for the next Next press (its count shows on the button)
+        whispered[key] = nil
         if GR_Compat.RequiresHardwareEvent then
-          Print(sender.." replied -- ready to invite ("..#replyQueue.." waiting). Press Next.")
+          -- key-press mode: straight onto the Ready list, with the alert. No press
+          -- and no invite: the player invites from Blizzard's Invite Member box.
+          GuildRecruiter_ReadyAdd(key, "reply", w.v)
+        else
+          tinsert(replyQueue, key)    -- timer-loop client: invite (paced) from Drain
         end
       end
       -- otherwise keep waiting -- a later, clearer "yes" still triggers it
@@ -1485,10 +1591,11 @@ local function HasOutstandingWhispers()
 end
 
 -- Deal the A/B variant for the head of the contact queue ONCE and remember it,
--- so the Next button can show what the next press will do (invite or whisper)
--- and the press then sends exactly that. Returns name, variant (nil = control
--- A). Invite-all ("blast") ignores the variants, so it deals nothing. On the
--- 1.12 timer path this runs at contact time, as Contact's PickVariant did.
+-- so the press (or the timer) then sends exactly that. Returns name, variant
+-- (nil = control A). Invite-all ("blast") ignores the variants, so it deals
+-- nothing. It ROLLS (PickVariant), so only contact code calls it: Drain when the
+-- head is due, and ContactHead. Never the Next button, tooltips or /gr status,
+-- which use the read-only GuildRecruiter_HeadMode.
 function GuildRecruiter_DealHead()
   local name = contactQueue[1]
   if not name or GuildRecruiter_runKind == "blast" then return name, nil end
@@ -1500,11 +1607,29 @@ function GuildRecruiter_DealHead()
   return name, d.v
 end
 
--- key-press mode: may the run timer contact this one by itself? Only a plain
--- whisper (GR_Compat.TimerContactModes); invites wait for a press.
+-- READ-ONLY: the head of the contact queue and its contact mode, without
+-- dealing: "blast" for Invite all, the dealt variant's mode, the live mode when
+-- A/B is off (nothing to roll), or nil = A/B on and not dealt yet (Drain deals
+-- it when it is due).
+function GuildRecruiter_HeadMode()
+  local name = contactQueue[1]
+  if not name then return nil, nil end
+  if GuildRecruiter_runKind == "blast" then return name, "blast" end
+  local d = GuildRecruiter_dealt
+  if d and d.name == name then return name, GuildRecruiter_CfgOf(d.v).mode end
+  if not GuildRecruiter_ABActive() then return name, GuildRecruiter_CfgOf(nil).mode end
+  return name, nil
+end
+
+-- key-press mode: may the run timer send a contact of this mode by itself?
+-- (GR_Compat.TimerContactModes: the whisper modes.) Invite prompts wait for a press.
+function GuildRecruiter_TimerMode(mode)
+  if not mode or mode == "blast" then return false end
+  return GR_Compat.TimerContactModes[mode] and true or false
+end
 function GuildRecruiter_TimerMay(v)
   if GuildRecruiter_runKind == "blast" then return false end
-  return GR_Compat.TimerContactModes[GuildRecruiter_CfgOf(v).mode] and true or false
+  return GuildRecruiter_TimerMode(GuildRecruiter_CfgOf(v).mode)
 end
 
 -- " -- N left, click again" after a contact made by a press, else ""
@@ -1518,11 +1643,10 @@ function GuildRecruiter_LeftNote()
   return (left > 0) and (" -- "..left.." queued") or ""
 end
 
--- RESTRICTED (guild invite): the first player on the ready-to-invite list
--- (replied yes to a whisperinvite whisper). Callers: GuildRecruiter_Drain (1.12
--- timer only) and GuildRecruiter_NextPress (key-press mode: only from the
--- secure button's PreClick, where DoGuildInvite sets the /ginvite macro and
--- this records the invite).
+-- RESTRICTED (guild invite), TIMER-LOOP CLIENTS ONLY: the first player on
+-- replyQueue (replied yes to a whisperinvite whisper). Caller: GuildRecruiter_Drain,
+-- only when not GR_Compat.RequiresHardwareEvent. In key-press mode a yes-reply
+-- never enters replyQueue: it goes to the Ready list (GuildRecruiter_ReadyAdd).
 function GuildRecruiter_InviteReply()
   local name = tremove(replyQueue, 1)
   DoGuildInvite(name)
@@ -1538,55 +1662,71 @@ end
 -- RESTRICTED when the head's contact is an invite: contact the head of the
 -- queue with the variant DealHead dealt it. Callers: GuildRecruiter_Drain (1.12
 -- timer; key-press mode only for TimerMay whispers) and GuildRecruiter_NextPress
--- (key-press mode: an invite only from the secure button's PreClick).
+-- (key-press mode: an invite PROMPT only from the secure button's PreClick; the
+-- name goes to the Ready list and is counted as invited only on Done/join).
 function GuildRecruiter_ContactHead()
   local name, v = GuildRecruiter_DealHead()
   tremove(contactQueue, 1)
   GuildRecruiter_dealt = nil
+  local prompted = false
   if GuildRecruiter_runKind == "blast" then    -- invite-all: straight guild invite, fast
     DoGuildInvite(name)
-    if not GuildRecruiter_Settings.history then GuildRecruiter_Settings.history = {} end
-    GuildRecruiter_Settings.history[name] = { t = time(), p = GuildRecruiter_Settings.activeProfile }
-    Broadcast("INV "..name)                    -- share with peers (guild-wide dedup), like RecordHandled
-    stats.invited = stats.invited + 1; stats.contacted = stats.contacted + 1
-    TallyBump("invited")
-    Print("Invited "..name.." ("..stats.invited..")"..GuildRecruiter_LeftNote())
+    stats.contacted = stats.contacted + 1
+    if GR_Compat.RequiresHardwareEvent then
+      prompted = true                          -- only the prompt: Done records it
+      GuildRecruiter_ReadyAdd(name, "blast", nil, true)
+      Print("Invite prompt for "..name.." (on the Ready list)"..GuildRecruiter_LeftNote())
+    else
+      if not GuildRecruiter_Settings.history then GuildRecruiter_Settings.history = {} end
+      GuildRecruiter_Settings.history[name] = { t = time(), p = GuildRecruiter_Settings.activeProfile }
+      Broadcast("INV "..name)                  -- share with peers (guild-wide dedup), like RecordHandled
+      stats.invited = stats.invited + 1
+      TallyBump("invited")
+      Print("Invited "..name.." ("..stats.invited..")"..GuildRecruiter_LeftNote())
+    end
   else
-    Contact(name, v)
-    Print("Contacted "..name.." ("..stats.contacted..")"..GuildRecruiter_LeftNote())
+    prompted = Contact(name, v)
+    if prompted then Print("Invite prompt for "..name.." (on the Ready list)"..GuildRecruiter_LeftNote())
+    else Print("Contacted "..name.." ("..stats.contacted..")"..GuildRecruiter_LeftNote()) end
   end
-  if GuildRecruiter_Settings.candidates then GuildRecruiter_Settings.candidates[name] = nil end  -- collected -> contacted
+  -- collected -> contacted; a prompt keeps its candidate entry until Done
+  if not prompted and GuildRecruiter_Settings.candidates then GuildRecruiter_Settings.candidates[name] = nil end
   inviteTimer = (GuildRecruiter_runKind == "blast") and INVITE_MIN or Pace(GuildRecruiter_Settings.inviteDelay)
 end
 
 -- GLOBAL on purpose: extracting the contacting/draining block here keeps
 -- GR_OnUpdate's upvalue count low.
 -- Key-press mode (GR_Compat.RequiresHardwareEvent): this timer NEVER invites.
--- It only paces, sends TimerMay whispers, applies the session cap and ends the
--- run; reply invites and invite contacts wait for GuildRecruiter_NextPress.
+-- It paces and sends the TimerMay whispers (whisper and whisper-then-invite),
+-- applies the session cap and ends the run; invite prompts wait for
+-- GuildRecruiter_NextPress, and yes-replies go to the Ready list from the
+-- CHAT_MSG_WHISPER handler (no queue, no press).
 function GuildRecruiter_Drain(e)
-  -- contacting / inviting (paced; replies take priority)
-  if #replyQueue > 0 or #contactQueue > 0 then
+  if #contactQueue > 0 and CapReached() then
+    -- session cap hit with names still queued: end the run instead of hanging
+    -- "Running" forever. Checked BEFORE the pacing and the combat / instance /
+    -- throttle hold, so a held send can't keep a capped run (and its Next
+    -- button, which also stops at the cap) frozen.
+    Print("Session cap ("..GuildRecruiter_Settings.sessionCap..") reached -- dropping "..#contactQueue.." queued name(s).")
+    contactQueue = {}
+    GuildRecruiter_dealt = nil
+    scanning = false
+    GuildRecruiter_rescanWait = 0
+  elseif #replyQueue > 0 or #contactQueue > 0 then
+    -- contacting / inviting (paced; replies take priority)
     inviteTimer = inviteTimer - e
     if inviteTimer <= 0 and not SendsBlocked() then
       local hw = GR_Compat.RequiresHardwareEvent
       if #replyQueue > 0 and not hw then
         GuildRecruiter_InviteReply()
       elseif #contactQueue == 0 then
-        -- key-press mode: only ready-to-invite replies left; they wait for Next
-      elseif CapReached() then
-        -- session cap hit with names still queued: end the run instead of hanging
-        -- "Running" forever (the queue kept this branch alive but nothing drained)
-        Print("Session cap ("..GuildRecruiter_Settings.sessionCap..") reached -- dropping "..#contactQueue.." queued name(s).")
-        contactQueue = {}
-        scanning = false
-        GuildRecruiter_rescanWait = 0
+        -- (key-press mode never fills replyQueue; nothing to do)
       elseif not hw then
         GuildRecruiter_ContactHead()
       else
-        local _, v = GuildRecruiter_DealHead()
-        if GuildRecruiter_TimerMay(v) then GuildRecruiter_ContactHead() end   -- a plain whisper
-        -- else: an invite (or whisper-then-invite) contact; it waits for Next
+        local _, v = GuildRecruiter_DealHead()   -- the head is due: deal it now (contact time)
+        if GuildRecruiter_TimerMay(v) then GuildRecruiter_ContactHead() end   -- a whisper
+        -- else: an invite prompt; it waits for Next
       end
     end
   elseif not scanning then
@@ -1603,7 +1743,9 @@ function GuildRecruiter_Drain(e)
       GR_Compat.SetWhoToUI(false)   -- restore manual /who to chat (RestoreWho is defined later in the file)
       Broadcast("BYE")
       if kind == "blast" or kind == "send" then
-        Print("Done. "..(kind == "blast" and "Invited " or "Contacted ")..stats.contacted.." of "..(GuildRecruiter_runTotal or stats.contacted)..". "..CountTable(GuildRecruiter_Settings.candidates).." candidate(s) remain.")
+        -- key-press mode: an invite step is only a prompt (counted on Done), so say "prompted"
+        local verb = (kind == "blast") and (GR_Compat.RequiresHardwareEvent and "Prompted " or "Invited ") or "Contacted "
+        Print("Done. "..verb..stats.contacted.." of "..(GuildRecruiter_runTotal or stats.contacted)..". "..CountTable(GuildRecruiter_Settings.candidates).." candidate(s) remain.")
       elseif GuildRecruiter_Settings.collectOnly and stats.contacted == 0 then
         Print("Done collecting. List now has "..CountTable(GuildRecruiter_Settings.candidates).." candidate(s). Send them from the Lists tab.")
       else
@@ -1765,11 +1907,12 @@ local function Stop()
   running, scanning, awaiting, paused = false, false, false, false
   GuildRecruiter_rescanWait = 0
   GuildRecruiter_runKind = nil
+  GuildRecruiter_dealt = nil    -- no stale A/B deal carried into the next run
   SuppressWho(false)
   RestoreWho()
   Broadcast("BYE")
   if wasSend then
-    Print("Stopped. Invited "..stats.contacted.." this run; "..CountTable(GuildRecruiter_Settings.candidates).." candidate(s) remain on the list.")
+    Print("Stopped. "..(GR_Compat.RequiresHardwareEvent and "Prompted / whispered " or "Invited ")..stats.contacted.." this run; "..CountTable(GuildRecruiter_Settings.candidates).." candidate(s) remain on the list.")
   else
     Print("Stopped. Contacted "..stats.contacted.." this run; "..#contactQueue.." still queued.")
   end
@@ -1786,8 +1929,10 @@ function GuildRecruiter_SendToCandidates(blast)
   Defaults()
   local s = GuildRecruiter_Settings
   local names = {}
-  for n in pairs(s.candidates) do tinsert(names, n) end
-  if #names == 0 then Print("No collected candidates. Turn on Collect (Settings) and scan first.") return end
+  for n in pairs(s.candidates) do
+    if not GuildRecruiter_ReadyHas(n) then tinsert(names, n) end   -- already waiting on the Ready list: skip
+  end
+  if #names == 0 then Print("No collected candidates"..(next(s.candidates) and " that aren't already on the Ready list (/gr ready)" or "")..". Turn on Collect (Settings) and scan first.") return end
   running, scanning, awaiting, paused = true, false, false, false
   GuildRecruiter_rescanWait = 0                          -- auto-rescan is scan-runs-only
   GuildRecruiter_runKind = blast and "blast" or "send"   -- fast invite-all vs paced send
@@ -1862,13 +2007,19 @@ function GuildRecruiter_TogglePause() if paused then Resume() else Pause() end e
 -- Key-press mode (GR_Compat.RequiresHardwareEvent): the Next action
 -- ---------------------------------------------------------------------------
 -- The client marks C_FriendList.SendWho #hwevent (a key press or click must
--- start it) and treats C_GuildInfo.Invite as protected (ADDON_ACTION_FORBIDDEN
--- from addon code, even inside a key press). One press makes at most ONE
--- restricted call, chosen in this order:
---   1. the ready-to-invite list (whisper replies that passed the reply rule)
---   2. the head of the contact queue, unless its contact is a plain whisper
---      (those still go out on the timer: GuildRecruiter_TimerMay)
---   3. the next /who of the sweep
+-- start it) and forbids C_GuildInfo.Invite to addon code in every form tried
+-- (a direct call, a secure /ginvite macro, text typed into the chat box). So
+-- the addon never invites: an "invite" step only PROMPTS (copy box + a chat
+-- player link) and parks the name on the Ready list, and the player invites in
+-- Blizzard's Guild > Invite Member box. Whispers go out from the timer.
+-- One press does at most one step:
+--   1. the head of the contact queue when its contact is an invite prompt
+--      (invite mode, Invite all, a single invite), if its gap has run out
+--   2. otherwise the next /who of the sweep -- but only once the queue holds no
+--      whispers: those go out by themselves (GuildRecruiter_TimerMay), and the
+--      next /who waits until they are all sent
+--   3. otherwise the step that is ready soonest (a press too early says "wait Ns")
+-- Whisper replies need no press at all: a yes goes straight to the Ready list.
 -- With no run armed, a single invite set from the Lists tab or /gr invite
 -- (GuildRecruiter_oneName) is the only step.
 -- The pacing settings are minimum gaps: a press that comes too early only says
@@ -1878,13 +2029,11 @@ function GuildRecruiter_TogglePause() if paused then Resume() else Pause() end e
 --   * the SECURE button GuildRecruiterNextButton (SecureActionButtonTemplate):
 --     a mouse click on it, the Bindings.xml CLICK binding on it, or a macro
 --     with /click GuildRecruiterNextButton. Its PreClick
---     (GuildRecruiter_SecurePreClick) runs the step. An invite step sets the
---     button's action to the macro "/ginvite <name>" and records the invite;
---     the template's secure OnClick then runs that macro, so the invite is the
---     client's own /ginvite. A /who or whisper step runs inside PreClick.
---   * typed /gr next (GuildRecruiter_Next): a typed command can't click a
---     secure button, so it does /who and whisper steps and only explains an
---     invite step.
+--     (GuildRecruiter_SecurePreClick) runs the step. It no longer sets any
+--     secure action (the /ginvite macro was refused in game); it is kept as the
+--     one press target, and its secure-click gate still guards invite prompts.
+--   * typed /gr next (GuildRecruiter_Next): does /who and whisper steps and only
+--     explains an invite-prompt step.
 -- Either way the step runs in the same call stack (GR_Compat.Press -> pcall,
 -- which is synchronous).
 --
@@ -1898,7 +2047,21 @@ function GuildRecruiter_TogglePause() if paused then Resume() else Pause() end e
 
 -- the client reported a blocked call naming this addon (GR_Compat.BlockedLine)
 function GuildRecruiter_PauseBlocked(line)
+  -- the block came from our own /who (the event is synchronous, so it lands
+  -- inside the press that sent it: lastCall is the /who, 0s ago)
+  local whoBlocked = GR_Compat.lastCall and string.find(GR_Compat.lastCall, "SendWho", 1, true)
+                     and (GetTime() - (GR_Compat.lastCallAt or 0)) < 1
   if running and not paused then
+    if whoBlocked and awaiting then
+      -- a refused /who never reached the server, so no reply is coming: stop
+      -- waiting (no timeout, no retry burned) and give the query back. A sweep
+      -- slice is rebuilt from `lo` (unchanged); a class sub-query was taken off
+      -- `pending` by NextQuery, so it goes back to the front.
+      awaiting = false
+      whoTimeout = 0
+      if stats.queries > 0 then stats.queries = stats.queries - 1 end
+      if current and not current.sweep then tinsert(pending, 1, current) end
+    end
     Pause(true)
     line = line.." -- run paused (/gr resume to try again, /gr stop to end)."
   end
@@ -1906,56 +2069,73 @@ function GuildRecruiter_PauseBlocked(line)
 end
 
 -- What the next press would do, without doing it (the press, the buttons and
--- /gr status all ask this, so they always agree):
---   action  "reply" | "contact" | "who" | "one", or nil when a press can do nothing now
+-- /gr status all ask this, so they always agree). READ-ONLY: it never deals the
+-- A/B variant (GuildRecruiter_HeadMode peeks; DealHead runs only at contact time).
+--   action  "contact" | "who" | "one", or nil when a press can do nothing now
 --   wait    seconds until that press may fire (0 = now)
 --   info    what it would do / why not, for chat
 --   short   the same for the button
---   invite  true when the step is a guild invite (secure button only, not in combat)
+--   invite  true when the step is an invite prompt (secure button only, not in combat)
 function GuildRecruiter_NextStep()
   if not running then
     local one = GuildRecruiter_oneName   -- a single invite set from the Lists tab / /gr invite
-    if one then return "one", 0, "invite "..one, "Invite "..one, true end
+    if one then return "one", 0, "invite prompt for "..one, "Invite "..one, true end
     return nil, 0, "not armed -- /gr start first", "Not armed"
   end
   if paused then return nil, 0, "paused -- /gr resume first", "Paused" end
-  -- contacts held (combat / instance / throttle) don't stop the /who: as in
-  -- 1.12, only the server-throttle backoff holds the sweep
   local blocked = SendsBlocked()
   local held = nil
   local cwait = (inviteTimer > 0) and inviteTimer or 0
-  if #replyQueue > 0 then
-    if not blocked then return "reply", cwait, "invite "..replyQueue[1].." (replied)", "Invite "..replyQueue[1], true end
-    held = "invites held: "..blocked
-  elseif #contactQueue > 0 then
-    if CapReached() then return nil, 0, "session cap reached", "Cap reached" end
-    local name, v = GuildRecruiter_DealHead()
-    if not GuildRecruiter_TimerMay(v) then
-      if not blocked then
-        -- same split as Contact: only whisper / whisperinvite whisper, anything else invites
-        local m = GuildRecruiter_CfgOf(v).mode
-        local verb = (GuildRecruiter_runKind ~= "blast" and (m == "whisper" or m == "whisperinvite")) and "Whisper" or "Invite"
-        return "contact", cwait, string.lower(verb).." "..name, verb.." "..name, verb == "Invite"
+  local c = nil   -- a press contact step that is not ready yet: { wait, info, short, invite }
+  if #contactQueue > 0 then
+    -- the cap ends the run (Drain drops the queue even while sends are held)
+    if CapReached() then return nil, 0, "session cap reached -- the run is ending", "Cap reached" end
+    local name, mode = GuildRecruiter_HeadMode()
+    if mode and not GuildRecruiter_TimerMode(mode) then
+      -- an invite prompt (or a whisper the timer may not send): it needs a press.
+      -- Held prompts don't hold the /who: as in 1.12, only the throttle backoff
+      -- holds the sweep.
+      if blocked then
+        held = "invite prompts held: "..blocked
+        if not scanning then return nil, 0, held, "Held: "..blocked end
+      else
+        local verb = (mode == "whisper" or mode == "whisperinvite") and "Whisper" or "Invite"
+        if cwait <= 0 then return "contact", 0, string.lower(verb).." "..name, verb.." "..name, verb == "Invite" end
+        c = { cwait, string.lower(verb).." "..name, verb.." "..name, verb == "Invite" }
       end
-      held = "contacts held: "..blocked
+    else
+      -- whispers (or an A/B head that Drain deals when it is due) go out by
+      -- themselves at the invite delay; the next /who waits until they are sent
+      if blocked then return nil, 0, #contactQueue.." whisper(s) held: "..blocked, "Held: "..blocked end
+      return nil, 0, #contactQueue.." whisper(s) going out by themselves; the next /who after that", "Whispering ("..#contactQueue..")"
     end
   end
-  if held and not scanning then return nil, 0, held, "Held: "..blocked end
   if scanning then
+    local act, wait, info, short = "who", 0, "next /who", "/who"
     local rest = GuildRecruiter_rescanWait or 0
-    if rest > 0 then return "who", rest, "auto-rescan rest", "Rescan" end
-    if awaiting then return "who", (whoTimeout > 0) and whoTimeout or 0, "waiting for the /who reply", "Waiting for /who" end
-    if not NextQuery(true) then return nil, 0, held or "sweep finished", held and ("Held: "..blocked) or "Sweep done" end
-    local wait = backoffUntil - GetTime()
-    if wait < 0 then wait = 0 end
-    if whoTimer > 0 then wait = wait + whoTimer end
-    return "who", wait, "next /who", "/who"
+    if rest > 0 then
+      wait, info, short = rest, "auto-rescan rest", "Rescan"
+    elseif awaiting then
+      -- never "ready" while a reply is awaited (the timeout clears awaiting)
+      wait, info, short = (whoTimeout > 0) and whoTimeout or 1, "waiting for the /who reply", "Waiting for /who"
+    elseif not NextQuery(true) then
+      act, info, short = nil, held or "sweep finished", held and ("Held: "..blocked) or "Sweep done"
+    else
+      wait = backoffUntil - GetTime()
+      if wait < 0 then wait = 0 end
+      if whoTimer > 0 then wait = wait + whoTimer end
+    end
+    -- a waiting invite prompt never starves a due /who (and the reverse): the
+    -- step that is ready first wins, the prompt on a tie
+    if c and (not act or c[1] <= wait) then return "contact", c[1], c[2], c[3], c[4] end
+    return act, wait, info, short
   end
-  if #contactQueue > 0 then return nil, 0, #contactQueue.." whisper(s) going out by themselves", "Whispering" end
+  if c then return "contact", c[1], c[2], c[3], c[4] end
   return nil, 0, "waiting for whisper replies", "Waiting"
 end
 
--- the Next button's text, e.g. "/who ready in 2s [3]" ([n] = ready to invite)
+-- the Next button's text, e.g. "/who ready in 2s [3 ready]" ([n ready] = names
+-- on the Ready list, waiting for your invite)
 function GuildRecruiter_NextLabel()
   local act, wait, _, short, inv = GuildRecruiter_NextStep()
   local secs = math.ceil(wait or 0)
@@ -1971,33 +2151,32 @@ function GuildRecruiter_NextLabel()
     text = (short or "Next").." ready in "..secs.."s"
   end
   if inv and GR_Compat.InCombat() then text = text.." (after combat)" end
-  if #replyQueue > 0 then text = text.." ["..#replyQueue.."]" end
+  local nr = GuildRecruiter_ReadyCount()
+  if nr > 0 then text = text.." ["..nr.." ready]" end
   return text
 end
 
 -- runs INSIDE the hardware event (via GR_Compat.Press): at most one restricted
--- call. GR_Compat.secureClick is the secure button while its PreClick runs, and
--- nil for a typed /gr next, which therefore can't do an invite step.
+-- call (the /who). GR_Compat.secureClick is the secure button while its PreClick
+-- runs, and nil for a typed /gr next, which therefore can't do an invite step.
 function GuildRecruiter_NextPress()
   local act, wait, info, _, inv = GuildRecruiter_NextStep()
   if not act then Print("Next: "..info..".") return end
   if wait > 0 then Print("Next: wait "..math.ceil(wait).."s ("..info..").") return end
   if inv then
     if not GR_Compat.secureClick then
-      Print("Next: "..info.." -- a typed command can't send a guild invite on this client. Click the Next button (under the minimap button), press its key, or use a macro with /click GuildRecruiterNextButton.")
+      Print("Next: "..info.." -- a typed command doesn't do invite steps. Click the Next button (under the minimap button), press its key, or use a macro with /click GuildRecruiterNextButton.")
       return
     end
-    if GR_Compat.InCombat() then Print("Next: can't set the invite in combat -- press again when combat ends.") return end
+    if GR_Compat.InCombat() then Print("Next: no invite prompts in combat -- press again when combat ends.") return end
   end
   if act == "one" then
     local name = GuildRecruiter_oneName
     GuildRecruiter_oneName = nil
-    DoGuildInvite(name)                     -- sets /ginvite on the secure button
-    GuildRecruiter_InvitedOne(name)
-  elseif act == "reply" then
-    GuildRecruiter_InviteReply()            -- invite: /ginvite on the secure button
+    DoGuildInvite(name)                     -- the prompt only: copy box + chat link
+    GuildRecruiter_ReadyAdd(name, "one", nil, true)   -- counted on Done (GuildRecruiter_InvitedOne)
   elseif act == "contact" then
-    GuildRecruiter_ContactHead()            -- invite (/ginvite on the secure button), or a whisper
+    GuildRecruiter_ContactHead()            -- an invite prompt (to the Ready list), or a whisper
   else
     SendNextWho()                           -- C_FriendList.SendWho
     whoTimer = Pace(GuildRecruiter_Settings.whoDelay)
@@ -2050,8 +2229,16 @@ end
 function GuildRecruiter_Arm(text)
   if not GR_Compat.RequiresHardwareEvent then return false end
   GuildRecruiter_oneName = nil              -- a single invite set earlier gives way to the run
-  Print(text.." Each /who and invite waits for you: "..GuildRecruiter_PressHint()
-    ..". Invites need that button or key (not /gr next, not in combat). /gr stop to cancel.")
+  local m = GuildRecruiter_Settings.mode
+  if GuildRecruiter_runKind ~= "blast" and (m == "whisper" or m == "whisperinvite") then
+    Print(text.." Each /who waits for you: "..GuildRecruiter_PressHint()
+      ..". Whispers then go out by themselves"
+      ..(m == "whisperinvite" and "; a yes-reply lands on the Ready list (/gr ready), where you invite them yourself" or "")
+      ..". /gr stop to cancel.")
+  else
+    Print(text.." Each /who and each invite prompt waits for you: "..GuildRecruiter_PressHint()
+      ..". A prompt puts the name on the Ready list (/gr ready); you send the invite in Guild > Invite Member and press Done. /gr stop to cancel.")
+  end
   GuildRecruiter_ShowNext()
   return true
 end
@@ -2061,8 +2248,9 @@ function GuildRecruiter_NextTip(btn)
   GameTooltip:SetOwner(btn, "ANCHOR_BOTTOMLEFT")
   GameTooltip:AddLine("Guild Rawcruiter: Next")
   GameTooltip:AddLine("Next: "..info, 1, 1, 1, 1)
-  if #replyQueue > 0 then GameTooltip:AddLine(#replyQueue.." replied -- ready to invite", 0.3, 1, 0.3) end
-  GameTooltip:AddLine("One /who, whisper or invite per click. Invites run /ginvite through this secure button, so they can't be set in combat.", 0.7, 0.7, 0.7, 1)
+  local nr = GuildRecruiter_ReadyCount()
+  if nr > 0 then GameTooltip:AddLine(nr.." on the Ready list -- waiting for your invite (/gr ready)", 0.3, 1, 0.3) end
+  GameTooltip:AddLine("One /who or invite prompt per click; whispers go out by themselves. The addon never sends a guild invite: you do, in Guild > Invite Member.", 0.7, 0.7, 0.7, 1)
   local k = GR_Compat.BindingKey(GR_Compat.NEXT_BINDING)
   GameTooltip:AddLine(k and ("Key: "..k) or "No key bound: Key Bindings > Guild Rawcruiter", 0.6, 0.8, 1, 1)
   GameTooltip:AddLine("In a macro: /click GuildRecruiterNextButton", 0.6, 0.8, 1, 1)
@@ -2168,18 +2356,320 @@ function GuildRecruiter_CancelOne()
 end
 
 -- ---------------------------------------------------------------------------
+-- Ready list (key-press mode): names waiting for the PLAYER's own guild invite
+-- ---------------------------------------------------------------------------
+-- The addon never invites (C_GuildInfo.Invite is forbidden to addon code on
+-- Forever). Whisper replies that pass the reply rule land here by themselves,
+-- from the CHAT_MSG_WHISPER handler (no press), with a sound; every invite
+-- prompt a press shows (invite mode, Invite all, a single invite) lands here
+-- too. The player invites in Blizzard's Guild > Invite Member box and presses
+-- Done. The invite is COUNTED (stats.invited, the tally, history / re-invite
+-- cooldown, A/B attribution) only in GuildRecruiter_ReadyDone: Done, the
+-- guild's join or decline message naming the player, or a removal from the
+-- Lists tab's Ready view. An entry that waits longer than readyTTL minutes
+-- expires and nothing is counted.
+-- Saved as GuildRecruiter_Settings.ready = { [name] = { t = time(), kind, v } }:
+--   kind  "reply" (said yes to a whisper; the whisper itself is already counted),
+--         "invite" (invite mode), "blast" (Invite all), "one" (a single invite)
+--   v     the A/B variant / profile name to credit (nil = the active profile)
+-- Everything below is global or a GR_Compat field: no new main-chunk locals.
+GR_Compat.READY_ROWS = 8
+
+function GuildRecruiter_ReadyHas(name)
+  local r = GuildRecruiter_Settings.ready
+  return (r and GR_Compat.FindKey(r, name)) and true or false
+end
+
+function GuildRecruiter_ReadyCount()
+  return CountTable(GuildRecruiter_Settings.ready or {})
+end
+
+-- the names, newest first
+function GuildRecruiter_ReadyNames()
+  local r = GuildRecruiter_Settings.ready or {}
+  local names = {}
+  for n in pairs(r) do tinsert(names, n) end
+  table.sort(names, function(a, b)
+    local ea, eb = r[a], r[b]
+    local ta = (type(ea) == "table" and ea.t) or 0
+    local tb = (type(eb) == "table" and eb.t) or 0
+    if ta ~= tb then return ta > tb end
+    return a < b
+  end)
+  return names
+end
+
+-- "45s", "12m", "2h" since t (a time() value)
+function GuildRecruiter_ReadyAge(t)
+  local s = time() - (t or time())
+  if s < 0 then s = 0 end
+  if s < 60 then return s.."s" end
+  if s < 3600 then return math.floor(s / 60).."m" end
+  return math.floor(s / 3600).."h"
+end
+
+-- drop entries older than readyTTL minutes (and any malformed one). Nothing is
+-- counted for them: the player never pressed Done and no join was seen.
+function GuildRecruiter_ReadyPrune()
+  local s = GuildRecruiter_Settings
+  local r = s.ready
+  if not r then return 0 end
+  local ttl = (s.readyTTL or 30) * 60
+  local now, gone = time(), 0
+  for n, e in pairs(r) do
+    if type(e) ~= "table" or now - (e.t or 0) > ttl then r[n] = nil; gone = gone + 1 end
+  end
+  if gone > 0 then Print(gone.." name(s) left the Ready list after "..(s.readyTTL or 30).." min without an invite (nothing recorded).") end
+  return gone
+end
+
+-- add a name (kind, v: see above). quiet = no sound (a press just showed the
+-- prompt). A name already waiting keeps its first time and kind.
+function GuildRecruiter_ReadyAdd(name, kind, v, quiet)
+  local s = GuildRecruiter_Settings
+  if type(name) ~= "string" or name == "" then return end
+  if not s.ready then s.ready = {} end
+  GuildRecruiter_ReadyPrune()
+  if GR_Compat.FindKey(s.ready, name) then return end
+  s.ready[name] = { t = time(), kind = kind, v = v }
+  if kind == "reply" then
+    -- the player link in this chat line is the shift-click target for an open
+    -- Guild > Invite Member box (handled by Blizzard's own chat link code)
+    Print(GR_Compat.PlayerLink(name).." replied -- ready to invite ("..GuildRecruiter_ReadyCount().." waiting). Open Guild > Invite Member and SHIFT-click the name, or use Copy in the Ready panel; then press Done.")
+    if s.readyAlert and not quiet then GR_Compat.Alert() end
+  end
+  GuildRecruiter_ReadyShow(true, name)
+  GuildRecruiter_ListRefresh()
+end
+
+-- the ONLY place key-press mode counts a guild invite. how: "done" (Done),
+-- "joined" / "declined" (the guild's system message names them, so the invite
+-- reached them), "removed" (Lists tab). Returns true if the name was listed.
+function GuildRecruiter_ReadyDone(name, how)
+  local s = GuildRecruiter_Settings
+  local key = s.ready and GR_Compat.FindKey(s.ready, name)
+  local e = key and s.ready[key]
+  if not e then return false end
+  s.ready[key] = nil
+  if not s.history then s.history = {} end
+  if e.kind == "one" then
+    GuildRecruiter_InvitedOne(key)               -- history, candidate list, tally, chat line
+  else
+    stats.invited = stats.invited + 1
+    TallyBump("invited")
+    if e.kind == "invite" then
+      RecordHandled(key, e.v)                    -- history (cooldown) + guild-wide dedup
+      GuildRecruiter_VarBump(e.v, "contacted")   -- A/B: the prompt was not a contact, the invite is
+    elseif e.kind == "blast" then
+      s.history[key] = { t = time(), p = s.activeProfile }
+      Broadcast("INV "..key)
+    else
+      -- "reply": the whisper already set the cooldown, broadcast and A/B
+      -- "contacted"; refresh the time and keep the variant that whispered them
+      local pe = s.history[key]
+      s.history[key] = { t = time(), p = e.v or ((type(pe) == "table") and pe.p) or s.activeProfile }
+    end
+    if s.candidates then s.candidates[key] = nil end
+    Print("Invite recorded: "..key..((how and how ~= "done") and (" ("..how..")") or "").." -- "..GuildRecruiter_ReadyCount().." still waiting.")
+  end
+  GuildRecruiter_ReadyRefresh()
+  GuildRecruiter_ListRefresh()
+  return true
+end
+
+-- [Copy]: the existing copy box, holding just the name
+function GuildRecruiter_ReadyCopy(name)
+  if name then GR_Compat.ShowCopyBox(name) end
+end
+
+-- [Copy next]: the name that has waited longest
+function GuildRecruiter_ReadyCopyNext()
+  local names = GuildRecruiter_ReadyNames()
+  local oldest = names[#names]
+  if oldest then GuildRecruiter_ReadyCopy(oldest) else Print("Nobody is waiting for an invite.") end
+end
+
+-- a click on a name in the panel (any button, any modifier): print the name's
+-- player link in the chat frame. The player shift-clicks it THERE, and
+-- Blizzard's own chat link code fills the open Guild > Invite Member box
+-- (Blizzard_UIPanels_Game/Mainline/ItemRefHandlers.lua:24-28).
+-- RULE: addon code never calls SetItemRef and never touches the popup. Tested
+-- on a real Forever client: SetItemRef called from addon code did fill the box,
+-- but the player's Accept then raised ADDON_ACTION_FORBIDDEN (function
+-- Invite()): the addon-run fill taints the popup and breaks the invite.
+function GuildRecruiter_ReadyClick(name)
+  if type(name) ~= "string" then return end
+  GR_Compat.PrintLink(name)
+end
+
+-- build the panel once: addon-owned, plain (non-secure), parented to UIParent,
+-- not part of the main window; draggable, position saved in readyPos
+function GuildRecruiter_ReadyPanel()
+  local p = GuildRecruiterReadyPanel
+  if p then return p end
+  p = GR_Compat.BackdropFrame("Frame", "GuildRecruiterReadyPanel", UIParent)
+  p:SetWidth(360); p:SetHeight(120)
+  p:SetFrameStrata("HIGH")
+  p:SetClampedToScreen(true)
+  GR_Compat.SetBackdrop(p, { bgFile = "Interface\\DialogFrame\\UI-DialogBox-Background",
+    edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border", tile = true, tileSize = 16, edgeSize = 14,
+    insets = { left = 4, right = 4, top = 4, bottom = 4 } })
+  p:SetMovable(true); p:EnableMouse(true); p:RegisterForDrag("LeftButton")
+  p:SetScript("OnDragStart", function(self) self:StartMoving() end)
+  p:SetScript("OnDragStop", function(self)
+    self:StopMovingOrSizing()
+    local point, _, relPoint, x, y = self:GetPoint(1)
+    if point then GuildRecruiter_Settings.readyPos = { point, relPoint, x, y } end
+  end)
+  local pos = GuildRecruiter_Settings.readyPos
+  if type(pos) == "table" and type(pos[1]) == "string" then
+    p:SetPoint(pos[1], UIParent, pos[2] or pos[1], tonumber(pos[3]) or 0, tonumber(pos[4]) or 0)
+  else
+    p:SetPoint("TOPRIGHT", UIParent, "TOPRIGHT", -200, -200)
+  end
+  p.title = p:CreateFontString(nil, "ARTWORK", "GameFontNormal")
+  p.title:SetPoint("TOPLEFT", 12, -10); p.title:SetPoint("RIGHT", p, "RIGHT", -30, 0); p.title:SetJustifyH("LEFT")
+  local close = CreateFrame("Button", nil, p, "UIPanelCloseButton")
+  close:SetPoint("TOPRIGHT", -2, -2)
+  close:SetScript("OnClick", function() p:Hide() end)   -- our own frame only
+  p.help = p:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
+  p.help:SetPoint("TOPLEFT", 12, -30); p.help:SetWidth(336); p.help:SetJustifyH("LEFT")
+  p.help:SetText("Open Guild > Invite Member, click a name here, shift-click it in chat (or Copy + paste), then press Done.")
+  p.nextBtn = CreateFrame("Button", nil, p, "UIPanelButtonTemplate")
+  p.nextBtn:SetPoint("TOPLEFT", 10, -62); p.nextBtn:SetWidth(110); p.nextBtn:SetHeight(20); p.nextBtn:SetText("Copy next")
+  p.nextBtn:SetScript("OnClick", function() GuildRecruiter_ReadyCopyNext() end)
+  p.nextFS = p:CreateFontString(nil, "ARTWORK", "GameFontDisableSmall")
+  p.nextFS:SetPoint("LEFT", p.nextBtn, "RIGHT", 8, 0); p.nextFS:SetWidth(220); p.nextFS:SetJustifyH("LEFT")
+  p.rows = {}
+  for i = 1, GR_Compat.READY_ROWS do
+    local row = CreateFrame("Frame", nil, p)
+    row:SetHeight(20)
+    row:SetPoint("TOPLEFT", p, "TOPLEFT", 10, -88 - (i - 1) * 22)
+    row:SetPoint("RIGHT", p, "RIGHT", -10, 0)
+    local nb = CreateFrame("Button", nil, row)
+    nb:SetPoint("LEFT", row, "LEFT", 0, 0); nb:SetWidth(180); nb:SetHeight(18)
+    nb:RegisterForClicks("LeftButtonUp")
+    nb.text = nb:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
+    nb.text:SetAllPoints(nb); nb.text:SetJustifyH("LEFT")
+    nb:SetScript("OnClick", function() GuildRecruiter_ReadyClick(row.pname) end)
+    nb:SetScript("OnEnter", function(self)
+      GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+      GameTooltip:AddLine("Click to print in chat, then shift-click it there", 1, 1, 1, 1)
+      GameTooltip:Show()
+    end)
+    nb:SetScript("OnLeave", function() GameTooltip:Hide() end)
+    row.nameBtn = nb
+    row.age = row:CreateFontString(nil, "ARTWORK", "GameFontDisableSmall")
+    row.age:SetPoint("LEFT", nb, "RIGHT", 4, 0); row.age:SetWidth(40); row.age:SetJustifyH("LEFT")
+    local done = CreateFrame("Button", nil, row, "UIPanelButtonTemplate")
+    done:SetPoint("RIGHT", row, "RIGHT", 0, 0); done:SetWidth(52); done:SetHeight(18); done:SetText("Done")
+    done:SetScript("OnClick", function() GuildRecruiter_ReadyDone(row.pname, "done") end)
+    local copy = CreateFrame("Button", nil, row, "UIPanelButtonTemplate")
+    copy:SetPoint("RIGHT", done, "LEFT", -4, 0); copy:SetWidth(52); copy:SetHeight(18); copy:SetText("Copy")
+    copy:SetScript("OnClick", function() GuildRecruiter_ReadyCopy(row.pname) end)
+    row:Hide()
+    p.rows[i] = row
+  end
+  p.more = p:CreateFontString(nil, "ARTWORK", "GameFontDisableSmall")
+  p.more:SetJustifyH("LEFT")
+  p.tick = 0
+  p:SetScript("OnUpdate", function(self, elapsed)   -- ages + expiry, once a second while shown
+    self.tick = self.tick - (elapsed or 0)
+    if self.tick > 0 then return end
+    self.tick = 1
+    GuildRecruiter_ReadyRefresh()
+  end)
+  p:Hide()
+  return p
+end
+
+-- redraw the panel (if built); it hides itself when the list is empty
+function GuildRecruiter_ReadyRefresh()
+  local p = GuildRecruiterReadyPanel
+  if not p then return end
+  GuildRecruiter_ReadyPrune()
+  local r = GuildRecruiter_Settings.ready or {}
+  local names = GuildRecruiter_ReadyNames()
+  local n = #names
+  if n == 0 then p:Hide(); return end
+  local title = "Ready to invite ("..n..")"
+  if p.flashUntil and GetTime() < p.flashUntil and p.flashName and r[p.flashName] then
+    title = "|cff40ff40New: "..p.flashName.."|r  --  "..title       -- the visible cue for a new name
+  end
+  p.title:SetText(title)
+  p.nextFS:SetText("oldest: "..names[n].." ("..GuildRecruiter_ReadyAge(r[names[n]].t)..")")
+  local shown = 0
+  for i = 1, GR_Compat.READY_ROWS do
+    local row = p.rows[i]
+    local nm = names[i]
+    if nm then
+      row.pname = nm
+      row.nameBtn.text:SetText(GR_Compat.PlayerLink(nm))
+      row.age:SetText(GuildRecruiter_ReadyAge(r[nm].t))
+      row:Show()
+      shown = i
+    else
+      row.pname = nil
+      row:Hide()
+    end
+  end
+  local h = 96 + shown * 22
+  if n > shown then
+    p.more:ClearAllPoints()
+    p.more:SetPoint("TOPLEFT", p, "TOPLEFT", 12, -88 - shown * 22)
+    p.more:SetText("+"..(n - shown).." more (Lists tab > Ready to invite)")
+    p.more:Show()
+    h = h + 14
+  else
+    p.more:Hide()
+  end
+  p:SetHeight(h)
+end
+
+-- show (or hide) the panel. newName = a name just added: the title flashes it
+function GuildRecruiter_ReadyShow(on, newName)
+  local p = GuildRecruiter_ReadyPanel()
+  if newName then p.flashUntil = GetTime() + 8; p.flashName = newName end
+  if on then p:Show(); GuildRecruiter_ReadyRefresh() else p:Hide() end
+end
+
+-- /gr ready
+function GuildRecruiter_ReadyToggle()
+  GuildRecruiter_ReadyPrune()
+  local p = GuildRecruiterReadyPanel
+  if p and p:IsShown() then p:Hide(); return end
+  if GuildRecruiter_ReadyCount() == 0 then
+    Print("Nobody is waiting for an invite. Names land on the Ready list when a whisper reply passes the reply rule (whisper-then-invite mode) or a Next press shows an invite prompt.")
+    return
+  end
+  GuildRecruiter_ReadyShow(true)
+end
+
+-- at load: expire stale entries, and show the panel if anyone is still waiting
+function GuildRecruiter_ReadyLoad()
+  GuildRecruiter_ReadyPrune()
+  local n = GuildRecruiter_ReadyCount()
+  if n > 0 then
+    Print(n.." name(s) still on the Ready list, waiting for your invite (/gr ready).")
+    GuildRecruiter_ReadyShow(true)
+  end
+end
+
+-- ---------------------------------------------------------------------------
 -- List window: view/edit the contact queue, blacklist, and invite history
 -- ---------------------------------------------------------------------------
 local listFrame, listMode = nil, "queue"
 local listData = {}
 local NUM_ROWS, ROW_HEIGHT = 13, 18
-local LIST_ORDER = { "candidates", "queue", "blacklist", "history", "negatives", "affirmatives" }
-local LIST_TITLE = { candidates = "Candidates (collected)", queue = "Queue (this run)", blacklist = "Blacklist",
+local LIST_ORDER = { "ready", "candidates", "queue", "blacklist", "history", "negatives", "affirmatives" }
+local LIST_TITLE = { ready = "Ready to invite", candidates = "Candidates (collected)", queue = "Queue (this run)", blacklist = "Blacklist",
   history = "Invite history", negatives = "Refusal words (no)", affirmatives = "Yes words (yesonly mode)" }
 
 local function BuildListData()
   listData = {}
-  if listMode == "candidates" then
+  if listMode == "ready" then
+    listData = GuildRecruiter_ReadyNames()   -- newest first
+  elseif listMode == "candidates" then
     for n in pairs(GuildRecruiter_Settings.candidates) do tinsert(listData, n) end
     table.sort(listData)
   elseif listMode == "queue" then
@@ -2199,7 +2689,9 @@ local function BuildListData()
 end
 
 local function RemoveListItem(name)
-  if listMode == "candidates" then
+  if listMode == "ready" then
+    GuildRecruiter_ReadyDone(name, "removed")   -- the player took it off: the invite is recorded
+  elseif listMode == "candidates" then
     GuildRecruiter_Settings.candidates[name] = nil
   elseif listMode == "queue" then
     for i = 1, #contactQueue do
@@ -2235,7 +2727,7 @@ function GuildRecruiter_InviteOne(name)
   if GR_Compat.RequiresHardwareEvent then
     GuildRecruiter_oneName = name
     GuildRecruiter_ShowNext()
-    Print("Invite "..name..": click the Next button (under the minimap button) or press its key. Typed commands and list clicks can't send a guild invite on this client; a macro with /click GuildRecruiterNextButton can. /gr stop drops it.")
+    Print("Invite "..name..": click the Next button (under the minimap button) or press its key for the invite prompt; the name then waits on the Ready list until you invite it in Guild > Invite Member and press Done. /gr stop drops it.")
     return
   end
   -- timer-loop client: invite right away, as in 1.12
@@ -2245,7 +2737,8 @@ function GuildRecruiter_InviteOne(name)
 end
 
 -- record a single invite (history, candidate list, tally). Key-press mode: run
--- from the secure button's PreClick, right after the /ginvite macro is set.
+-- by GuildRecruiter_ReadyDone (Done, or the join/decline message), never when
+-- the prompt is shown. Timer-loop client: right after the invite call.
 function GuildRecruiter_InvitedOne(name)
   if not GuildRecruiter_Settings.history then GuildRecruiter_Settings.history = {} end
   GuildRecruiter_Settings.history[name] = { t = time(), p = GuildRecruiter_Settings.activeProfile }
@@ -2269,8 +2762,12 @@ function GuildRecruiter_ListControls(fr)
     -- window in combat)
     local left = #contactQueue + #replyQueue
     if GR_Compat.RequiresHardwareEvent and not paused and left > 0 then
-      prog = prog.." -- "..left.." left, click Next by the minimap"
+      local _, hm = GuildRecruiter_HeadMode()   -- read-only (no A/B roll)
+      if hm == nil or GuildRecruiter_TimerMode(hm) then prog = prog.." -- "..left.." whisper(s) going out"
+      else prog = prog.." -- "..left.." left, click Next by the minimap" end
     end
+    local nr = GuildRecruiter_ReadyCount()
+    if GR_Compat.RequiresHardwareEvent and nr > 0 then prog = prog.." | "..nr.." ready to invite" end
     fr.hint:SetText((paused and "|cffffcc00Paused|r -- " or ("|cff40ff40"..verb.."|r  "))..prog)
   else
     fr.lpauseBtn:Hide(); fr.lstopBtn:Hide()
@@ -2278,9 +2775,14 @@ function GuildRecruiter_ListControls(fr)
     local cc = CountTable(GuildRecruiter_Settings.candidates or {})
     fr.inviteBtn:SetText("Invite all ("..cc..")")
     if cc > 0 then fr.inviteBtn:Enable(); fr.sendBtn:Enable() else fr.inviteBtn:Disable(); fr.sendBtn:Disable() end
-    fr.hint:SetText(listMode == "candidates"
-      and (GR_Compat.RequiresHardwareEvent and "left-click a name, then Next, to invite it -- right-click to drop it"
-           or "left-click a name to invite it -- right-click to drop it") or LIST_HINT)
+    if listMode == "ready" then
+      -- the Ready list: names waiting for YOUR invite in Guild > Invite Member
+      fr.hint:SetText("waiting for your invite (/gr ready for the panel) -- click a name once invited: records it, like Done")
+    else
+      fr.hint:SetText(listMode == "candidates"
+        and (GR_Compat.RequiresHardwareEvent and "left-click a name, then Next, for its invite prompt -- right-click to drop it"
+             or "left-click a name to invite it -- right-click to drop it") or LIST_HINT)
+    end
   end
 end
 
@@ -2323,6 +2825,9 @@ local function BuildListsPanel(parent)
         if button == "RightButton" then RemoveListItem(nm)             -- drop a false positive
         else GuildRecruiter_InviteOne(nm) end                          -- left-click invites this one
         UpdateList()
+      elseif listMode == "ready" then                                  -- records the invite: confirm
+        GuildRecruiter_Confirm("Remove |cffffffff"..nm.."|r from the Ready list and record the invite (same as Done)?",
+          function() RemoveListItem(nm); UpdateList() end)
       elseif listMode == "blacklist" or listMode == "history" then     -- persistent: confirm
         GuildRecruiter_Confirm("Remove |cffffffff"..nm.."|r from the "..(LIST_TITLE[listMode] or listMode).."?",
           function() RemoveListItem(nm); UpdateList() end)
@@ -2415,7 +2920,12 @@ UpdateList = function()
       local nm = listData[idx]
       row.pname = nm
       local disp = nm
-      if listMode == "history" then
+      if listMode == "ready" then
+        local e = GuildRecruiter_Settings.ready and GuildRecruiter_Settings.ready[nm]
+        if type(e) == "table" then
+          disp = nm.."  |cff999999("..(e.kind == "reply" and "replied " or "prompted ")..GuildRecruiter_ReadyAge(e.t).." ago)|r"
+        end
+      elseif listMode == "history" then
         local e = GuildRecruiter_Settings.history[nm]
         if type(e) == "table" and e.p == "(remote)" then disp = nm.."  |cff7f9fffguild|r" end  -- shared by a guildmate
       elseif listMode == "candidates" then
@@ -2578,12 +3088,15 @@ RefreshConfig = function()
   configFrame.abNote:SetText(GuildRecruiter_ABActive()
     and "|cff40ff40A/B on -- this is variant A (control)|r" or "")
   -- tell the user WHY some Invite controls are greyed for the current mode
+  local hw = GR_Compat.RequiresHardwareEvent   -- Forever: the addon never sends the invite itself
   if mode == "invite" then
-    configFrame.modeNote:SetText("Invite-only: sends a guild invite straight away. Reply & Message aren't used.")
+    configFrame.modeNote:SetText(hw and "Invite-only: each Next press puts one name on the Ready list; you send the invite. Reply & Message aren't used."
+      or "Invite-only: sends a guild invite straight away. Reply & Message aren't used.")
   elseif mode == "whisper" then
     configFrame.modeNote:SetText("Whisper-only: just messages them. Method & Reply aren't used.")
   else
-    configFrame.modeNote:SetText("Whisper, then invite when they reply (per the Reply rule).")
+    configFrame.modeNote:SetText(hw and "Whisper (automatic); a reply that passes the Reply rule goes to the Ready list (/gr ready) and you invite."
+      or "Whisper, then invite when they reply (per the Reply rule).")
   end
 
   configFrame.updating = false
@@ -2668,7 +3181,7 @@ local function BuildDDPopup()
   })
   p:EnableMouse(true); p:Hide()
   p.opts = {}
-  for i = 1, 6 do
+  for i = 1, 7 do   -- the longest list: the Lists tab's 7 views
     local ob = CreateFrame("Button", nil, p)
     ob:SetHeight(16)
     ob:SetPoint("TOPLEFT", 6, -4 - (i - 1) * 16)
@@ -2720,7 +3233,7 @@ function GuildRecruiter_OpenMenu(btn, order, label, cb, target, key)
   if ddPopup:IsShown() and ddPopup.owner == btn then ddPopup:Hide(); return end
   ddPopup.owner = btn
   local n = #order
-  for i = 1, 6 do
+  for i = 1, 7 do
     local ob = ddPopup.opts[i]
     if i <= n then
       local k = order[i]
@@ -3409,6 +3922,8 @@ function GuildRecruiter_MinimapTip(btn)
   GameTooltip:AddLine("Auto-rescan: "..(s.autoScan and ("on -- every "..(s.autoScanDelay or 60).."s") or "off"), 0.6, 0.8, 1)
   local hw = GR_Compat.RequiresHardwareEvent
   if hw and running then GameTooltip:AddLine("Next: "..GuildRecruiter_NextLabel(), 1, 0.82, 0) end
+  local nr = GuildRecruiter_ReadyCount()
+  if nr > 0 then GameTooltip:AddLine("Ready to invite: "..nr.."  (/gr ready)", 0.3, 1, 0.3) end
   GameTooltip:AddLine(" ")
   GameTooltip:AddLine("Left-click: settings", 1, 1, 1)
   GameTooltip:AddLine("Right-click: "..(running and "stop" or (hw and "arm (then press Next per /who or invite)" or "start")), 1, 1, 1)
@@ -3492,6 +4007,9 @@ local function Status()
     Print("Idle. Last run: contacted "..stats.contacted.." ("..stats.invited.." inv, "..stats.whispered.." wsp), guilded-skipped "..stats.guilded..".")
   end
   Print("Mode "..(GuildRecruiter_Settings.mode).." | invite="..GuildRecruiter_Settings.inviteDelay.."s who="..GuildRecruiter_Settings.whoDelay.."s | jitter "..(GuildRecruiter_Settings.jitter and "on" or "off").." | sync "..(GuildRecruiter_Settings.guildSync and "on" or "off").." | history "..HistoryCount())
+  GuildRecruiter_ReadyPrune()
+  Print("Ready to invite: "..GuildRecruiter_ReadyCount().." (/gr ready; expire after "..(GuildRecruiter_Settings.readyTTL or 30).." min) | reply alert "..(GuildRecruiter_Settings.readyAlert and "on" or "off")
+    ..". Invites are counted on Done or when the join message names them, not when prompted.")
 end
 
 SLASH_GUILDRECRUITER1 = "/gr"
@@ -3508,6 +4026,10 @@ SlashCmdList["GUILDRECRUITER"] = function(msg)
   elseif cmd == "resume" then Resume()
   elseif cmd == "next" then GuildRecruiter_Next()   -- typed: /who and whisper steps only (no secure click)
   elseif cmd == "status" then Status()
+  elseif cmd == "ready" then GuildRecruiter_ReadyToggle()   -- the Ready-to-invite panel
+  elseif cmd == "alert" then
+    if larg == "on" or larg == "off" then GuildRecruiter_Settings.readyAlert = (larg == "on") end
+    Print("Reply alert (sound + taskbar flash when a yes-reply lands on the Ready list): "..(GuildRecruiter_Settings.readyAlert and "ON" or "OFF")..".  /gr alert on|off")
   elseif cmd == "collect" then
     if larg == "on" or larg == "off" then GuildRecruiter_Settings.collectOnly = (larg == "on"); RefreshConfig() end
     Print("Collect-only "..(GuildRecruiter_Settings.collectOnly and "ON -- scans build a list (send with /gr send)" or "off -- scans contact immediately")..".")
@@ -3587,6 +4109,7 @@ SlashCmdList["GUILDRECRUITER"] = function(msg)
     end
   elseif cmd == "reset" then
     seen = {}; contactQueue = {}; replyQueue = {}   -- clear queues too, or a mid-run reset re-queues re-found players
+    GuildRecruiter_dealt = nil
     Print("Cleared this session's scan list and queues (history kept).")
   elseif cmd == "debug" then
     GuildRecruiter_Settings.debug = (larg == "on") or (larg ~= "off" and not GuildRecruiter_Settings.debug)
@@ -3669,8 +4192,11 @@ SlashCmdList["GUILDRECRUITER"] = function(msg)
       GuildRecruiter_Settings.inviteMethod = rest; RefreshConfig(); Print("Invite method: "..rest..".")
     elseif which == "mode" and MODE_LABEL[rest] then
       GuildRecruiter_Settings.mode = rest; RefreshConfig(); Print("Mode: "..MODE_LABEL[rest]..".")
+    elseif which == "readyttl" and val and val >= 1 then
+      val = clamp(val, 1, 1440); GuildRecruiter_Settings.readyTTL = val
+      Print("Ready list entries expire after "..val.." min (no invite is recorded for them).")
     else
-      Print("set invite|who|reinvite|cap|min|max <n> | set method auto|byname|invite|chat | set mode invite|whisper|whisperinvite")
+      Print("set invite|who|reinvite|cap|min|max <n> | set readyttl <minutes> | set method auto|byname|invite|chat | set mode invite|whisper|whisperinvite")
     end
   elseif cmd == "autoscan" then
     local n = tonumber(larg)
@@ -3695,7 +4221,8 @@ SlashCmdList["GUILDRECRUITER"] = function(msg)
     Print("|cff33ff99Guild Rawcruiter v"..VERSION.."|r  --  /gr config, /gr list, /gr stats")
     Print("start | stop | pause | resume | status | reset | forget | hide")
     if GR_Compat.RequiresHardwareEvent then
-      Print("next -- the next /who or whisper (this client needs one press each). Guild invites need the Next button by the minimap, its key (Key Bindings > Guild Rawcruiter) or a macro with /click GuildRecruiterNextButton; not in combat")
+      Print("next -- the next /who (one press each; whispers go out by themselves). Invite prompts need the Next button by the minimap, its key (Key Bindings > Guild Rawcruiter) or a macro with /click GuildRecruiterNextButton; not in combat")
+      Print("ready -- the Ready list: yes-replies wait there for YOUR invite (Guild > Invite Member; shift-click the name in chat, or Copy + paste; then Done) | alert on|off | set readyttl <min>")
     end
     Print("autoscan on|off (loop scanning) | autoscan <seconds> (rest between cycles)")
     Print("collect on|off (scan into a list) | inviteall (fast) | send (paced) | invite <name> | candidates | clearlist")
