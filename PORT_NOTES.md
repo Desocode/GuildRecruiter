@@ -386,19 +386,26 @@ GuildInviteByName, GuildInvite, the /ginvite chat fallback) on that path only.
 
 ## 2. Still unverified
 
-There was no game client and no Lua interpreter. Everything below is untested.
-Wiki facts come from the pages listed in §4. The wiki is fan-maintained, and its
-per-function flavour tables say an API *exists* on Forever 1.60.1 (build 69913).
-They do not say a restriction applies per flavour.
+There was no game client and no Lua interpreter. The facts from a real
+Forever client are only those listed in §1.10, §2.2 and the commits after
+`dccd448`.
 
-| # | Blocker (REQUIREMENTS §3) | Isolated in | What the wiki says / what is still open |
+On 2026-11-05 every Blizzard API, event, template and global the addon uses
+was checked against the Forever UI source (the mirror at
+`../reference/wow-ui-source-forever`, 1.60.1 build 70790). The results are in
+**API_AUDIT.md**. Items that source proves are moved out of these lists into
+§2.3. Four mismatches found there are fixed in GR_Compat (§2.3, first list).
+
+Wiki facts come from the pages listed in §4. The wiki is fan-maintained.
+
+| # | Blocker (REQUIREMENTS §3) | Isolated in | What is still open |
 |---|---|---|---|
-| 1 | Do SendWho / C_FriendList.SendWho, GetNumWhoResults / GetWhoInfo and SetWhoToUI exist, and what are their throttle and hardware-event rules? | `GR_Compat.SendWho` (gated by `GR_Compat.CheckPress`), `GR_Compat.GetNumWhoResults`, `GR_Compat.GetWhoRow`, `GR_Compat.SetWhoToUI` (+ `GR_Compat.WhoPanel`); mode switch `GR_Compat.RequiresHardwareEvent` | All four `C_FriendList` calls are listed for Forever 1.60.1. **SendWho is marked `#hwevent` (needs a key or mouse press, since 8.2.5)** and is throttled server-side ("queries are not guaranteed to generate a response"). **Handled by key-press mode (§1.9): one /who per press.** Still open: whether Forever actually enforces `#hwevent` here, and what a violation does (the wiki page doesn't say whether it errors, fails silently or fires ADDON_ACTION_BLOCKED; a silent drop would show up as a /who timeout and retry). The origin argument was added in 10.2.0; the code passes `Enum.SocialWhoOrigin.Social` (1), which is my choice and unverified. The wiki says GetNumWhoResults "never seem[s] to go over 50". SetWhoToUi(true) sends every reply to WHO_LIST_UPDATE and FriendsFrame. Whether FriendsFrame is the frame that registers WHO_LIST_UPDATE on Forever (needed for Who-window suppression) is unknown. |
-| 2 | Are GuildInvite / GuildInviteByName / C_GuildInfo.Invite callable from addon code, and do they need a hardware event? | Key-press mode: `GR_Compat.GuildInvite` -> `GR_Compat.SetSecureInvite` / `GR_Compat.SecureClear` on the secure `GuildRecruiterNextButton`. Timer-loop client: `GR_Compat.ResolveInvite`, `GR_Compat.RunSlash` (method "chat"). Both: `GR_Compat.CanGuildInvite`, `GR_Compat.InviteApiName` | **Answered in game: `C_GuildInfo.Invite` from addon code raised ADDON_ACTION_FORBIDDEN, even inside a key press** (§1.10). It is protected, not just `#hwevent`. **Handled by the secure button (§1.10): the client's own `/ginvite`, run as a secure macro, one per click, not in combat.** Still open: everything in §2.2 about the secure button. Whether `CanGuildInvite` still exists on Forever is unknown (the call is feature-detected; if it's missing, invites are allowed, as in 1.12). |
-| 3 | Is a WHISPER via SendChatMessage / C_ChatInfo.SendChatMessage unrestricted for addon code? | `GR_Compat.SendWhisper` | The wiki marks only SAY, YELL and CHANNEL as hardware-event; WHISPER is not. The global `SendChatMessage` was deprecated in 11.2.0, and the 11.2.0 change list shows it as removed. `C_ChatInfo.SendChatMessage` is listed for Forever. The Forever 1.60.1 changes add a hardware-event requirement for EMOTE only (not used here). Behaviour under "chat messaging lockdown" (encounters, challenge mode, PvP) is unknown; the default "pause in instances" setting avoids most of it. Key-press mode relies on this row: `whisper`-mode contacts still go out from the timer (`GR_Compat.TimerContactModes`). If WHISPER turns out to need a press too, set that table to `{}` and every contact will wait for Next. |
-| 4 | Are /who result fields secret values? | `GR_Compat.IsSecret`, `GR_Compat.GetWhoRow`, `GR_Compat.GetNumWhoResults` (also used by the guards in `GR_OnEvent` and `OnAddonMessage`, and by `GR_Compat.FilterSystemChat` and `GR_Compat.IsWhoNoise`) | The Secret_Values page does not mention /who or guild data. UnitName is secret only for non-player units in combat. Chat events can carry secrets while SecretInChatMessagingLockdown is active. The 1.60.1 notes say Midnight's addon restrictions, including secrets, apply on Forever. If /who levels did come back secret, every reply would look "foreign" (0 rows in band), and the sweep would run on timeouts and retries, finding nobody. |
-| 5 | Do `string.gfind`, `table.getn`, `getglobal`/`setglobal` and `SetBackdrop` exist? | **No longer needed:** the port uses only Lua 5.1 natives (`#`, `string.gmatch`, `_G`, `pairs`, `select`). SetBackdrop goes through `GR_Compat.BackdropFrame` / `SetBackdrop` / `SetBackdropColor` | Still open: whether Forever's "modified Lua 5.1" keeps the standard 5.1 core. The fan sources list only `goto`, `//`, bitwise operators and `_ENV` as banned. The same question applies to the deprecated templates (`GR_Compat.TemplateFrame`, `GR_Compat.FauxScroll*`) and to `SetColorTexture` (`GR_Compat.ColorTexture`). |
-| 6 | What exact chat strings does the Forever server send for guild join/decline, throttling and who results (CHAT_MSG_SYSTEM)? | `GR_Compat.IsThrottleMsg`, `GR_Compat.IsWhoNoise`. Join/decline stays where it was (`ToPattern`, `JOIN_PAT`/`DECLINE_PAT`), because it is already built from the client's own `ERR_GUILD_JOIN_S` / `ERR_GUILD_DECLINE_S` strings with an enUS fallback. | Nothing found on the wiki. Unknown: the wording of Forever's throttle message, and whether names in system messages are hyperlinked (`|Hplayer:...|h`) or plain. |
+| 1 | /who: throttle and hardware-event rules | `GR_Compat.SendWho` (gated by `GR_Compat.CheckPress`), `GR_Compat.GetNumWhoResults`, `GR_Compat.GetWhoRow`, `GR_Compat.SetWhoToUI`, `GR_Compat.WhoPanel` / `MuteWhoWindow` / `HideWhoWindow`; mode switch `GR_Compat.RequiresHardwareEvent` | The functions, arguments and fields are settled (§2.3), and a key press is known to send the /who. Still open: the server's real throttle, and what a `#hwevent` violation does (an error, a silent drop, or ADDON_ACTION_BLOCKED). A silent drop would show up as a /who timeout and retry. Also open: whether the server parses the text filter `c-"Class"` the same way (Blizzard's Forever Who list filters classes with the `SendWhoFilters` table instead). |
+| 2 | Guild invites from addon code | Key-press mode: `GR_Compat.GuildInvite` -> `GR_Compat.SetSecureInvite` (the copy box, `GR_Compat.ShowCopyBox`). Timer-loop client: `GR_Compat.ResolveInvite`, `GR_Compat.RunSlash`. Both: `GR_Compat.CanGuildInvite` | **Answered in game:** `C_GuildInfo.Invite` is forbidden for addon code, from a key press, from a secure `/ginvite` macro, and from `/ginvite` typed into the chat box by the addon. The player now invites through Blizzard's own Guild > Invite Member dialog; API_AUDIT.md §4 shows how that dialog uses the pasted text. Still open: whether `C_GuildInfo.Invite` accepts "First Surname" (with the space) as pasted. |
+| 3 | WHISPER from addon code | `GR_Compat.SendWhisper` | The signature is settled (§2.3). Still open: what the docs' `HasRestrictions = true` and `RestrictedForMacroChatMessages = true` on `C_ChatInfo.SendChatMessage` mean for an addon WHISPER. The wiki marks only SAY, YELL, CHANNEL and, on Forever, EMOTE as hardware-event. Behaviour under "chat messaging lockdown" (encounters, PvP) is also open. Key-press mode relies on this row: `whisper`-mode contacts still go out from the timer (`GR_Compat.TimerContactModes`). If WHISPER turns out to need a press too, set that table to `{}`. |
+| 4 | Secret /who fields | `GR_Compat.IsSecret`, `GR_Compat.GetWhoRow`, `GR_Compat.GetNumWhoResults`, and the guards in `GR_OnEvent`, `OnAddonMessage`, `GR_Compat.FilterSystemChat`, `GR_Compat.IsWhoNoise` | Settled by the docs, not yet seen in game: the /who calls carry no secret-return flag. CHAT_MSG_SYSTEM and CHAT_MSG_WHISPER are `SecretInChatMessagingLockdown`; CHAT_MSG_ADDON is not. The guards stay. |
+| 5 | Lua core, templates, backdrops | — | Settled (§2.3). |
+| 6 | Server chat strings (join/decline, throttle, /who summary) | `GR_Compat.IsThrottleMsg`, `GR_Compat.IsWhoNoise`, `ToPattern` / `JOIN_PAT` / `DECLINE_PAT` (built from `ERR_GUILD_JOIN_S` / `ERR_GUILD_DECLINE_S` with an enUS fallback) | Still open. The mirror has no GlobalStrings.lua, so none of this text is in it. Also open: whether names in those messages are plain, linked (`|Hplayer:...|h`), or carry a surname or realm. |
 
 In-game probe (from REQUIREMENTS §3, also in README.txt):
 
@@ -411,81 +418,88 @@ The addon's own load line then shows which invite, /who and whisper calls GR_Com
 
 ### 2.1 Other unverified assumptions (outside the six blockers)
 
-- **Events:** ADDON_LOADED's first argument is the folder name ("GuildRecruiter"), and VARIABLES_LOADED still fires. Unknown events make `RegisterEvent` error on Mainline. All eight registered events exist on Mainline 12.x as far as I know, but I have not checked them against a Forever event list.
-- **Sender format:** that CHAT_MSG_WHISPER and CHAT_MSG_ADDON carry "Name-Realm", and the /who `fullName` carries "Name" or "Name-Realm". Ambiguate itself is listed for Forever 1.60.1, and its "none" context strips the realm for same-realm players.
-- **`ChatFrame_AddMessageEventFilter`** on Forever: its wiki page lists no flavours. `ChatEdit_SendText` and `DEFAULT_CHAT_FRAME.editBox` have not been checked either.
-- **Templates:** InputBoxTemplate, UICheckButtonTemplate (and its `$parentText`/`.text` caption), UIPanelButtonTemplate and UIPanelCloseButton are used directly. They are core Mainline templates and none is marked deprecated. OptionsSliderTemplate's children (`$parentText/Low/High` or `.Text/.Low/.High`) are unverified.
-- **Lua environment globals** I assumed exist as in Mainline: `random`, `tinsert`, `tremove`, `date`, `time`, `math.atan2`, `HideUIPanel`, `IsInInstance`, `UnitFactionGroup`, `GetGuildInfo`, `StaticPopup_Show`, `UISpecialFrames`, `GetCursorPosition`.
-- **Addon messages:** per the wiki, Forever trial and Veteran accounts cannot send addon messages, so guild sync fails silently for them. The per-prefix throttle is 10 messages, refilling at 1 per second. The result code is ignored, as before.
-- **Game data left unchanged** (per "no behaviour change"): the hard-coded class lists per faction (`FactionLists`: no Horde paladins, no Alliance shamans) and the 1-60 level range. These are vanilla values; if Forever differs, they need updating.
-- **Defaults:** the code's default contact mode is `invite`, but REQUIREMENTS N5 asks for `whisper` on first run. Left unchanged because the task said not to change defaults; this needs a decision.
-- `METHOD_SHORT` still says "GuildInviteByName"/"GuildInvite". These are labels in a table nothing reads, so I left them.
+- **Sender and name format with surnames:** the exact form of the
+  CHAT_MSG_WHISPER / CHAT_MSG_ADDON sender and of the /who `fullName` for a
+  "First Surname" player. Does `Ambiguate(x, "none")` keep the surname? Does it
+  equal `GetUnitName("player")`, which `GR_Compat.MyName` now uses? The
+  separator constant `CHARACTERNAME_SURNAME_SEPARATOR` is not in the docs.
+  Forever's whisper parser accepts both "FirstName-SecondName" and
+  "FirstName SecondName" (`Blizzard_ChatFrameBase/Shared/ChatFrameEditBox.lua:84-85`).
+- **Muting a Blizzard frame's event:** `MuteWhoWindow` unregisters
+  WHO_LIST_UPDATE on `LFGWhoListFrame`, which belongs to a `## Secure: 1` addon.
+  The docs mark Register/UnregisterEvent `AddsForbiddenAspects =
+  EventRegistrations`, and the mirror doesn't say what that does. The 1.12 and
+  Mainline code did the same to FriendsFrame. If Blizzard's Who list
+  misbehaves after a run, `/gr hide` turns the muting off.
+- **`issecretvalue` / `issecrettable` from addon code:** the docs flag them
+  `SecretArguments = "AllowedWhenUntainted"`, and the mirror does not define
+  what that means for a tainted caller.
+- **`EditBox:SetFont(path, 12, "")`:** the 3-argument form is required (flags
+  are not nilable for an EditBox). Whether `""` is a valid `TBFFlags` value is
+  not in the mirror.
+- **Addon messages:** per the wiki, Forever trial and Veteran accounts cannot
+  send addon messages, so guild sync fails silently for them. The per-prefix
+  throttle is 10 messages, refilling at 1 per second. The result code
+  (`SendAddonMessageResult`, which includes NotInGuild and AddOnMessageLockdown)
+  is ignored, as before.
+- **Game data left unchanged** (per "no behaviour change"): the hard-coded
+  class lists per faction (`FactionLists`: no Horde paladins, no Alliance
+  shamans), the 1-60 level range and the minimap icon `INV_Scroll_03`. These
+  are vanilla values; if Forever differs, they need updating. Forever's Who
+  list caps a reply at `MAX_WHOS_FROM_SERVER = 50`; `CAP_HINT` (49) is only an
+  upper bound and the real cap is learned, so this is safe.
+- **Defaults:** the code's default contact mode is `invite`, but REQUIREMENTS N5
+  asks for `whisper` on first run. Left unchanged because the task said not to
+  change defaults; this needs a decision.
+- `METHOD_SHORT` still says "GuildInviteByName"/"GuildInvite". These are labels
+  in a table nothing reads, so I left them.
 
 ### 2.2 Key-press mode: unverified (no client)
 
-**Seen in game (one screenshot):** a key press on the old script binding sent
-a /who through `GR_Compat.Press` -> `pcall` -> `C_FriendList.SendWho`, and the
-results were read and queued. So the hardware context does cover the `pcall`,
-at least for a key-down script binding. A direct `C_GuildInfo.Invite` was
-FORBIDDEN (§1.10). Everything about the secure button is untested:
+**Seen in game:** a key press on the old script binding sent a /who through
+`GR_Compat.Press` -> `pcall` -> `C_FriendList.SendWho`, and the results were
+read and queued (48 candidates). So the hardware context does cover the
+`pcall`, at least for a key-down script binding. A direct
+`C_GuildInfo.Invite`, a secure `/ginvite` macro and `/ginvite` typed into the
+chat box by the addon were all refused (row 2 above). Invites now go through
+the copy box and Blizzard's Invite Member dialog. The secure button still
+carries the /who and whisper steps, and its PreClick shows the copy box for an
+invite step. Still untested:
 
-- **The secure macro `/ginvite Name` is untested.** It relies on the template's
-  OnClick running `C_Macro.RunMacroText("/ginvite Name")` untainted, so that
-  Blizzard's `/ginvite` handler may call `C_GuildInfo.Invite`. If Forever also
-  forbids `/ginvite` from a secure macro, or the attributes set by addon code
-  taint it, no invite goes out. It may then show up as ADDON_ACTION_FORBIDDEN
-  naming this addon (the run pauses and says so), or as nothing at all (the
-  bookkeeping would still record the invite).
-- **Attributes set in PreClick apply to the same click.** This is the
-  well-documented pattern (PreClick runs before the template's OnClick, and
-  SecureActionButton_OnClick reads `type` and `macrotext` when it runs), but it
-  is untested on Forever. If it did not hold, each click would run the
-  previous click's macro; PostClick empties the action, so it would run
-  nothing instead.
 - **Up-edge dispatch of the CLICK key binding.** The action fires on the up
-  click. That a CLICK binding sends an up click when the key is released, and
-  that `runOnUp="true"` is accepted on a CLICK binding, are my Mainline
-  knowledge, not checked. If the key does nothing, the mouse click and the
-  `/click` macro should still work. Setting `useOnKeyDown` to true and
-  registering `LeftButtonDown` would be the fallback, but then `/click` would
-  need `/click GuildRecruiterNextButton LeftButton true`.
+  click. Blizzard uses `runOnUp="true"` only on script bindings in this
+  source, never on a CLICK binding. So it is unverified that the attribute is
+  accepted on a CLICK binding and that the release sends an up click. If the
+  key does nothing, the mouse click and the `/click` macro should still work.
 - **A key release, and a mouse up, as the hardware event for `SendWho`:** the
   /who now runs in the PreClick of an up click, not on key down as in the
-  screenshot.
+  in-game test.
 - **A CLICK binding on a hidden button:** I believe the binding and `/click`
-  still click it (hidden secure buttons are a common pattern). The button is
-  hidden when no run is armed, and then a press only says "not armed".
+  still click it. The button is hidden when no run is armed, and then a press
+  only says "not armed".
 - **`SetText` on the secure button in combat** (the label updates every 0.2 s):
   assumed not to be a restricted call. If it were, ADDON_ACTION_BLOCKED would
   name this addon in combat and pause the run.
 - **Forever's `SecureActionButtonTemplate` / `UIPanelButtonTemplate` combo:**
   read in the Forever UI source (neither defines a conflicting OnClick), not run.
-- **Combat timing:** PLAYER_REGEN_DISABLED firing before lockdown (wiki) is what
-  lets the action be emptied there. Between clicks it is empty anyway.
-- **Hardware context through `pcall` for typed commands:** typed `/gr next` runs
-  inside the Enter-key press. Same assumption as above, but for Enter in the
-  chat box instead of a binding.
-- **A macro that mixes `/gr invite Bob` and `/click GuildRecruiterNextButton`:**
-  it should invite Bob in one press if the client clears taint between macro
-  lines, as it does for `/run` + `/cast`. Not tested.
-- **ADDON_ACTION_BLOCKED / _FORBIDDEN:** the payload is `(addonName, function)`
-  and both are synchronous (wiki; both are listed for Forever 1.60.1). It is
-  unknown whether a `#hwevent` violation fires either of them, and in what
-  format the `function` string comes (the example line in §1.9 is illustrative).
-  The handler compares the first argument with the addon's folder name.
-- **Bindings.xml:** the wiki documents `name`, `header`, `runOnUp` and `default`
-  (no `category`). Where the entry shows up in Forever's Key Bindings window
-  (an "AddOns" group or a "Guild Rawcruiter" header) is unverified. No default
-  key is set, so nothing collides. The entry is now the CLICK binding (§1.10);
-  its label global name was read from Forever's BindingUtil.lua, not seen in
-  the window.
-- **`GetBindingKey`** (shows the bound key in chat and tooltips) is
-  feature-detected; without it the hints just leave the key out.
+- **Combat timing:** PLAYER_REGEN_DISABLED fires before lockdown starts (wiki).
+- **Hardware context through `pcall` for typed commands:** typed `/gr next`
+  runs inside the Enter-key press. Same assumption as above, but for Enter in
+  the chat box instead of a binding.
+- **ADDON_ACTION_BLOCKED / _FORBIDDEN:** whether a `#hwevent` violation fires
+  either of them. The payload itself is settled (§2.3).
+- **Key Bindings page:** where the entry shows up. Blizzard's own Bindings.xml
+  files use `category=`, not `header=`. Forever's Settings page groups bindings
+  by category and draws every `HEADER*` entry as a blank spacer
+  (`Blizzard_SettingsDefinitions_Frame/Keybindings.lua:242-249`). So the
+  "Guild Rawcruiter" header text is probably not shown, and the in-game hint
+  "Key Bindings > Guild Rawcruiter" may not match what the player sees. No
+  default key is set, so nothing collides.
 - **Floating button position:** anchored under the minimap button, wherever the
   player dragged it. On some minimap layouts it may overlap other UI.
 - **Taint:** `/gr next` and the PreClick are plain addon code calling the
-  non-protected `#hwevent` SendWho. Invites were the protected case (shown by the
-  block report in game) and now go through the secure button (§1.10).
+  `#hwevent` SendWho. Invites were the protected case, and the addon no longer
+  makes or arms them.
 - **Server throttle per press:** the community tools pace by hand, so the
   server's real minimum gap between /who queries is unknown. The /who delay
   default (3 s) is unchanged.
@@ -493,6 +507,84 @@ FORBIDDEN (§1.10). Everything about the secure button is untested:
   chunk), so it cannot load on a 1.12 Lua 5.0 client at all. The timer-loop path
   (`RequiresHardwareEvent == false`) is for clients that run Lua 5.1 but lack
   `C_FriendList.SendWho`. The 1.12 build itself stays on `main`.
+
+### 2.3 Settled by the Forever UI source (2026-11-05; evidence in API_AUDIT.md)
+
+**Mismatches found and fixed in GR_Compat:**
+
+- **Who window.** On Forever (game type `camelot`) FriendsFrame does not
+  register WHO_LIST_UPDATE. The Who list is `LFGWhoListFrame` inside
+  `LFGParentFrame` (load-on-demand Blizzard_GroupFinder_VanillaStyle). The old
+  code muted nothing, closed the player's Friends list on every reply, and
+  added a WHO_LIST_UPDATE registration to FriendsFrame on restore. Now handled
+  by `GR_Compat.WhoPanel`, `MuteWhoWindow` and `HideWhoWindow`.
+- **/who routing.** Forever's Who list calls `C_FriendList.SetWhoToUi(false)`
+  whenever it closes. `GR_Compat.SendWho` now sets the routing again before
+  every query.
+- **Chat filter.** `ChatFrame_AddMessageEventFilter` exists only when the CVar
+  `loadDeprecationFallbacks` is on, and `ChatFrame_OnEvent` does not exist.
+  `GR_Compat.FilterSystemChat` now uses `ChatFrameUtil.AddMessageEventFilter`.
+- **Own name.** On Forever `UnitName("player")` returns the first name and the
+  surname separately. Blizzard's Forever Who list recognises the player with
+  `fullName == GetUnitName("player")`. The new `GR_Compat.MyName` is used for
+  the own /who row, the own guild-sync echo and the band split. Before, a
+  player with a surname counted their own echo as a peer, and one share of the
+  levels was never swept.
+
+**Moved out of the lists above (proven, no change needed):**
+
+- **C_FriendList:** `SendWho(filter, origin, filters)` with `HasRestrictions`.
+  `GetNumWhoResults()` returns `(numWhos, totalNumWhos)`. `GetWhoInfo(i)`
+  returns a WhoInfo table (fullName, fullGuildName, level, raceStr, classStr,
+  area, ...) or nothing. `SetWhoToUi(bool)`. WHO_LIST_UPDATE has no payload.
+  The origin `Enum.SocialWhoOrigin.Social` (1) is what Blizzard's own Who list
+  sends. The 1.12 globals don't exist on Forever (fallback only).
+- **Events:** all eight registered events plus the two block events exist,
+  with the payload orders the code reads. ADDON_LOADED is `(addOnName,
+  containsBindings)`. CHAT_MSG_ADDON is `(prefix, text, channel, sender, ...)`.
+  ADDON_ACTION_BLOCKED / _FORBIDDEN: the docs call the first argument
+  `isTainted`, but Blizzard's handler uses it as the addon name, and the
+  in-game report matched ours.
+- **C_ChatInfo:** `SendChatMessage(message, chatType, languageID, target)`,
+  `SendAddonMessage(prefix, message, chatType, target)` -> result enum, and
+  `RegisterAddonMessagePrefix(prefix)` -> result enum. The globals
+  `SendChatMessage` and `GuildInvite` are deprecation aliases that exist only
+  with the `loadDeprecationFallbacks` CVar. `GuildInviteByName`,
+  `ChatFrameEditBox` and the 1.12 who globals don't exist. `ChatEdit_SendText`
+  is CVar-gated. All of these are timer-loop-only paths.
+- **Guild and state:** `CanGuildInvite`, `GetGuildInfo("player")`,
+  `IsInGuild`, `InCombatLockdown`, `IsInInstance` (`bool, instanceType`),
+  `UnitFactionGroup`, `Ambiguate(name, "none")`, `GetTime`, `time`, `date`,
+  `issecretvalue`, `issecrettable`.
+- **Templates and FrameXML:** `BackdropTemplate` / `BackdropTemplateMixin`
+  (SetBackdrop, SetBackdropColor), `SetColorTexture`, `C_XMLUtil.GetTemplateInfo`
+  (may return nothing).
+  - `OptionsSliderTemplate` is still defined, in DeprecatedTemplates.xml, with
+    `$parentText/Low/High`.
+  - `FauxScrollFrameTemplate` and `FauxScrollFrame_Update/GetOffset/OnVerticalScroll(self,
+    value, itemHeight, fn)` are in SecureScrollTemplates.
+  - `UICheckButtonTemplate` (`$parentText`), `UIPanelButtonTemplate`,
+    `InputBoxTemplate`, `UIPanelCloseButton`, `SecureActionButtonTemplate`.
+  - Every font object used, every widget method used, `GameTooltip`,
+    `UISpecialFrames`, `HideUIPanel`, `Minimap`, `GetCursorPosition`, and all
+    texture paths except the icon.
+- **StaticPopup:** `StaticPopupDialogs` is a plain global table that addons may
+  add to, `StaticPopup_Show(which, text_arg1, ...)` is the current call (there
+  is no `StaticPopup_ShowDialog`), and the fields used (`text "%s"`, button1/2,
+  OnAccept, OnCancel, timeout, whileDead, hideOnEscape) are read the way the
+  code expects.
+- **Slash command:** `SlashCmdList` + `SLASH_GUILDRECRUITER1`. The handler gets
+  the line already trimmed (`strtrim`), so `/gr black add First Surname` already
+  stores "first surname".
+- **Bindings:** the label rule `_G["BINDING_NAME_"..name]` (BindingUtil.lua),
+  and the binding name `"CLICK <button>:LeftButton"`, the form Blizzard's own
+  action buttons pass to `GetBindingKey`.
+- **Lua environment:** every `string`, `table` and `math` function the port
+  uses (including `string.gmatch` and `math.atan2`), plus `tinsert`, `tremove`
+  and `random`, is used by Blizzard UI code in this source.
+- **Superseded by the in-game results** (the code no longer does these):
+  `/ginvite` as a secure macro; attributes set in PreClick applying to the same
+  click; a macro that mixes `/gr invite` and `/click`.
 
 ## 3. What could not be ported safely
 

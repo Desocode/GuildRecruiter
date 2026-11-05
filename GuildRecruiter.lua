@@ -141,12 +141,38 @@ function GR_Compat.ShortName(name)
   return name
 end
 
+-- the player's OWN name in the form /who and chat use, for the "is this me?"
+-- checks (own /who row, own guild-sync echo, the band split). On Forever
+-- UnitName("player") is only the first name: Blizzard's Forever NameUtil reads
+-- its two returns as (name, surname) and builds the full name as
+-- name..CHARACTERNAME_SURNAME_SEPARATOR..surname (reference Blizzard_FrameXMLUtil/
+-- Camelot/NameUtil.lua:4-11), and Blizzard's own Forever Who list recognises
+-- the player's row with info.fullName == GetUnitName("player")
+-- (Blizzard_GroupFinder_VanillaStyle/Mainline/WhoList.lua:94; GetUnitName is
+-- Blizzard_UnitFrame/Mainline/UnitFrame.lua:1094). Without a surname, or on a
+-- client without GetUnitName, this is UnitName("player") as before.
+function GR_Compat.MyName()
+  if type(GetUnitName) == "function" then
+    local n = GetUnitName("player")
+    if type(n) == "string" and not issecret(n) and n ~= "" then return n end
+  end
+  return UnitName("player")
+end
+
 -- /who query (blocker 1). Mainline: C_FriendList.SendWho(filter, origin); the
 -- origin argument arrived in 10.2.0, and the wiki marks the call #hwevent
 -- (needs a key/mouse press) since 8.2.5. RESTRICTED: CheckPress first.
 function GR_Compat.SendWho(filter)
   if C_FriendList and C_FriendList.SendWho then
     GR_Compat.CheckPress("C_FriendList.SendWho")
+    -- re-route replies to WHO_LIST_UPDATE before EVERY query, not only at Start:
+    -- on Forever the default Who list turns the routing off whenever it is
+    -- closed (LFGWhoListMixin:OnHide -> C_FriendList.SetWhoToUi(false),
+    -- reference Blizzard_GroupFinder_VanillaStyle/Mainline/WhoList.lua:253-254),
+    -- after which replies would go to chat and every /who would time out.
+    GR_Compat.SetWhoToUI(true)
+    -- origin: Enum.SocialWhoOrigin.Social (= 1, SocialConstantsDocumentation.lua:14),
+    -- the value Blizzard's own Who list sends (WhoList.lua:178, 189)
     local origin = Enum and Enum.SocialWhoOrigin and Enum.SocialWhoOrigin.Social
     C_FriendList.SendWho(filter, origin)
   elseif type(SendWho) == "function" then
@@ -207,10 +233,50 @@ function GR_Compat.SetWhoToUI(on)
   end
 end
 
--- the default-UI frame that pops the Who list on WHO_LIST_UPDATE (1.12:
--- FriendsFrame). Unverified on Forever; nil just turns Who-window hiding off.
+-- the default-UI frame that pops the Who list on WHO_LIST_UPDATE, and the window
+-- to close (1.12 and Mainline: FriendsFrame for both). nil turns hiding off.
+-- Forever (game type "camelot") does NOT use FriendsFrame for /who: Blizzard_
+-- FriendsFrame.toc loads Camelot\FriendsFrame.lua there, whose FriendsFrame_OnLoad
+-- registers no WHO_LIST_UPDATE (reference Blizzard_FriendsFrame/Camelot/
+-- FriendsFrame.lua:287-311). The Who list is LFGWhoListFrame (Blizzard_
+-- GroupFinder_VanillaStyle/Mainline/WhoList.xml:89, parent LFGParentFrame): it
+-- registers the event (WhoList.lua:199) and every update ends in
+-- ShowUIPanel(LFGParentFrame) (WhoList.lua:274-275). That addon is load-on-
+-- demand, so this is asked each time.
 function GR_Compat.WhoPanel()
-  return FriendsFrame
+  if LFGWhoListFrame then return LFGWhoListFrame, LFGParentFrame end
+  return FriendsFrame, FriendsFrame
+end
+
+-- stop (on) / restore (off) the Who window popping on WHO_LIST_UPDATE. Only the
+-- frame that really had the event registered is unregistered, and restore
+-- re-registers exactly that frame: re-registering a frame that never had it
+-- (Forever's FriendsFrame, above) would add a registration Blizzard never made.
+-- IsEventRegistered: Blizzard_APIDocumentationGenerated/SimpleFrameAPIDocumentation.lua:740.
+GR_Compat.whoMuted = nil
+function GR_Compat.MuteWhoWindow(on)
+  if on then
+    if GR_Compat.whoMuted then return end
+    local wp = GR_Compat.WhoPanel()
+    if wp and (not wp.IsEventRegistered or wp:IsEventRegistered("WHO_LIST_UPDATE")) then
+      wp:UnregisterEvent("WHO_LIST_UPDATE")
+      GR_Compat.whoMuted = wp
+    end
+  elseif GR_Compat.whoMuted then
+    GR_Compat.whoMuted:RegisterEvent("WHO_LIST_UPDATE")
+    GR_Compat.whoMuted = nil
+  end
+end
+
+-- close the Who window if it is showing (Forever: only when the LFG frame is on
+-- its Who tab, i.e. LFGWhoListFrame is shown, Blizzard_LFGVanilla_ParentFrame.lua:22).
+-- A frame that neither we muted nor has WHO_LIST_UPDATE registered is not the
+-- Who window (Forever's FriendsFrame is the Friends list), so it is left alone.
+function GR_Compat.HideWhoWindow()
+  local who, win = GR_Compat.WhoPanel()
+  if not who or not win or not who:IsVisible() then return end
+  if who ~= GR_Compat.whoMuted and who.IsEventRegistered and not who:IsEventRegistered("WHO_LIST_UPDATE") then return end
+  HideUIPanel(win)
 end
 
 -- guild invite (blocker 2), TIMER-LOOP CLIENTS ONLY (no C_FriendList.SendWho).
@@ -264,8 +330,11 @@ function GR_Compat.SetSecureInvite(name)
   -- a Blizzard frame, so the invite stays a Blizzard-UI action.
   GR_Compat.ShowCopyBox(name)
   if DEFAULT_CHAT_FRAME then
-    DEFAULT_CHAT_FRAME:AddMessage("|cffff8000Rawcruiter:|r invite "..name
-      .." -- copy box open: Ctrl+C, Esc, then paste into Guild > Invite Member (or type /ginvite "..name..")")
+    -- Blizzard's own link handler fills the open Invite Member box when a player link
+    -- is shift-clicked (Blizzard_UIPanels_Game/Mainline/ItemRefHandlers.lua:24-28,
+    -- StaticPopup_Visible("ADD_GUILDMEMBER")), so the name is printed as a link too.
+    DEFAULT_CHAT_FRAME:AddMessage("|cffff8000Rawcruiter:|r invite |Hplayer:"..name.."|h["..name.."]|h"
+      .." -- with Guild > Invite Member open, SHIFT-CLICK the name; or Ctrl+C in the copy box, Esc, paste")
   end
 end
 
@@ -431,9 +500,18 @@ end
 -- hide CHAT_MSG_SYSTEM lines for which hide(msg) is true. Mainline has the
 -- message-filter API (2.4+); replacing ChatFrame_OnEvent (the 1.12 trick) taints
 -- Mainline chat frames, so it is only the fallback, with the 3.0+ signature.
+-- Forever: the filter API is ChatFrameUtil.AddMessageEventFilter(event, cb), cb
+-- called as (chatFrame, event, ...) and a true first return drops the line
+-- (reference Blizzard_ChatFrameBase/Shared/ChatFrameFilters.lua:202, 138-170).
+-- The global ChatFrame_AddMessageEventFilter is only an alias that exists when
+-- the CVar loadDeprecationFallbacks is on (Blizzard_DeprecatedChatInfo/
+-- Deprecated_ChatFrame.lua:4, 51), and ChatFrame_OnEvent is not defined
+-- anywhere in the Forever UI, so without this the quiet-/who filter silently
+-- did nothing.
 function GR_Compat.FilterSystemChat(hide)
-  if type(ChatFrame_AddMessageEventFilter) == "function" then
-    ChatFrame_AddMessageEventFilter("CHAT_MSG_SYSTEM", function(frame, ev, msg)
+  local addFilter = (ChatFrameUtil and ChatFrameUtil.AddMessageEventFilter) or ChatFrame_AddMessageEventFilter
+  if type(addFilter) == "function" then
+    addFilter("CHAT_MSG_SYSTEM", function(frame, ev, msg)
       if issecret(msg) then return false end
       return hide(msg) and true or false
     end)
@@ -645,19 +723,18 @@ local function CountTable(t)
 end
 
 -- Stop the default UI's Who panel from popping during a run. We unregister
--- WHO_LIST_UPDATE on FriendsFrame (our own frame still receives it) so the
--- window never opens at all -- no open-then-hide flicker. Restored when we stop.
+-- WHO_LIST_UPDATE on the default Who list (GR_Compat.WhoPanel: FriendsFrame on
+-- 1.12/Mainline, LFGWhoListFrame on Forever; our own frame still receives it) so
+-- the window never opens at all -- no open-then-hide flicker. Restored when we stop.
 local whoSuppressed = false
 local function SuppressWho(on)
-  local wp = GR_Compat.WhoPanel()
-  if not wp then return end
   if on then
     if not whoSuppressed and GuildRecruiter_Settings.hideWho then
-      wp:UnregisterEvent("WHO_LIST_UPDATE")
+      GR_Compat.MuteWhoWindow(true)   -- the frame is chosen in GR_Compat.WhoPanel
       whoSuppressed = true
     end
   elseif whoSuppressed then
-    wp:RegisterEvent("WHO_LIST_UPDATE")
+    GR_Compat.MuteWhoWindow(false)
     whoSuppressed = false
   end
 end
@@ -850,7 +927,7 @@ end
 
 -- names of all recruiters currently active (self when running, plus live peers)
 local function ActiveNames()
-  local me = UnitName("player")
+  local me = GR_Compat.MyName()   -- full name: peers are keyed by their full sender name
   local names = {}
   if running then tinsert(names, me) end
   for n, _ in pairs(recruiters) do
@@ -871,7 +948,7 @@ RecomputeBand = function()
   else
     local names = ActiveNames()
     local total = #names
-    local me = UnitName("player")
+    local me = GR_Compat.MyName()
     local idx = 1
     for i = 1, total do if names[i] == me then idx = i end end
     local span = hiL - loL + 1
@@ -893,7 +970,7 @@ local function OnAddonMessage(prefix, text, channel, sender)
   local sec = GR_Compat.IsSecret
   if sec(prefix) or sec(text) or sec(sender) then return end   -- unreadable: skip, never compare
   if prefix ~= SYNC_PREFIX then return end
-  local me = UnitName("player")
+  local me = GR_Compat.MyName()                    -- Forever: "First Surname", like the sender
   sender = GR_Compat.ShortName(sender)             -- Mainline sends "Name-Realm"
   if not sender or sender == me then return end   -- ignore our own echo
   local _, _, ver, kind, rest = string.find(text or "", "^(%S+)%s+(%S+)%s*(.*)$")
@@ -1116,7 +1193,7 @@ local function ClassAllowed(class)
 end
 
 local function ProcessWho()
-  local me = UnitName("player")
+  local me = GR_Compat.MyName()   -- compared with the /who fullName (Blizzard: WhoList.lua:94)
   local num = GR_Compat.GetNumWhoResults()
   local inBand = 0
   for i = 1, num do
@@ -1542,8 +1619,7 @@ local function GR_OnUpdate(e)
 
   if hideSoon then
     hideSoon = false
-    local wp = GR_Compat.WhoPanel()
-    if wp and wp:IsVisible() then HideUIPanel(wp) end
+    GR_Compat.HideWhoWindow()
   end
 
   -- presence ping + peer pruning
@@ -1890,7 +1966,9 @@ function GuildRecruiter_NextLabel()
     elseif secs > 0 then text = "/who ready in "..secs.."s"
     else text = "Next: send /who" end
   elseif act and secs > 0 then
-    text = (string.match(short, "^%S+") or "Next").." ready in "..secs.."s"
+    -- the whole step text ("Invite First Surname"): a Forever name has a space,
+    -- and the first word alone was only the verb
+    text = (short or "Next").." ready in "..secs.."s"
   end
   if inv and GR_Compat.InCombat() then text = text.." (after combat)" end
   if #replyQueue > 0 then text = text.." ["..#replyQueue.."]" end
