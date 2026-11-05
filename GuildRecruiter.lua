@@ -474,9 +474,18 @@ function GR_Compat.ShowCopyBox(name)
     GR_Compat.ColorTexture(bg, 0, 0, 0, 0.6)
     eb:SetScript("OnEscapePressed", function(self) self:ClearFocus(); f:Hide() end)
     eb:SetScript("OnEnterPressed", function(self) self:ClearFocus(); f:Hide() end)
+    -- Ctrl+C closes the box by itself (one key less). If the client never delivers
+    -- OnKeyDown to an edit box this does nothing and Esc closes it as before.
+    pcall(eb.SetScript, eb, "OnKeyDown", function(self, key)
+      if key == "C" and IsControlKeyDown and IsControlKeyDown() then
+        if C_Timer and C_Timer.After then
+          C_Timer.After(0.15, function() self:ClearFocus(); f:Hide() end)
+        end
+      end
+    end)
     f.edit = eb
   end
-  f.label:SetText("Ctrl+C, Esc, Ctrl+V in Guild > Invite Member, Accept, then Done")
+  f.label:SetText("Ctrl+C to copy (Esc closes), then Ctrl+V in Guild > Invite Member, Accept, Done")
   f.edit:SetText(name)
   f:Show()
   f.edit:SetFocus()
