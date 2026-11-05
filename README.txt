@@ -20,7 +20,7 @@ Everything else is under "Advanced..." in the guide (or /gr config). Tick
 "Don't show again" and the guide stops opening by itself; /gr still opens it.
 
 
-WoW: FOREVER BUILD  (branch "forever", version 4.0.0-forever.1)
+WoW: FOREVER BUILD  (branch "forever", version 4.0.0-forever.2)
 -----------------------------------------------------------------
 This is a BETA port to the WoW: Forever client (## Interface: 16001, modified
 Lua 5.1, Mainline-style API). Only parts of it have been seen working in game

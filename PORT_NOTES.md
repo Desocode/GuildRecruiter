@@ -1,6 +1,6 @@
 # GuildRecruiter: WoW: Forever port notes
 
-Version `4.0.0-forever.1`, branch `forever`, based on `1023a66` (the v3.22 source
+Version `4.0.0-forever.2`, branch `forever`, based on `1023a66` (the v3.22 source
 plus REQUIREMENTS.md). Status: **ported and checked offline; a few player tests
 on a Forever client** (§1.10, §1.11). Committed: the port `e824243`, key-press
 mode (§1.9) `716a33b`, the secure button and the copy box (§1.10) `dccd448` to
@@ -89,8 +89,8 @@ words in comments and strings are not counted.
 
 ### 1.6 Version and metadata
 
-- `VERSION = "4.0.0-forever.1"`, and the header comment says it is the Forever port (3 lines).
-- TOC: `## Interface: 16001`, `## Version: 4.0.0-forever.1`, and Notes now say "WoW: Forever port, beta". Title, SavedVariables (`GuildRecruiter_Settings`), file list and folder name are unchanged.
+- `VERSION = "4.0.0-forever.2"`, and the header comment says it is the Forever port (3 lines).
+- TOC: `## Interface: 16001`, `## Version: 4.0.0-forever.2`, and Notes now say "WoW: Forever port, beta". Title, SavedVariables (`GuildRecruiter_Settings`), file list and folder name are unchanged.
 - README.txt: new "WoW: FOREVER BUILD" section at the top, including the REQUIREMENTS §3 probe. The 1.12 text is unchanged.
 
 ### 1.7 The compat layer itself
