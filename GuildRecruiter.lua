@@ -258,11 +258,57 @@ function GR_Compat.SetSecureInvite(name)
   -- and never touches the chat box. It prints the name as a clickable player link;
   -- the PLAYER invites with Blizzard's own menu (right-click > Invite to Guild) or
   -- types the command by hand. Untested whether the menu entry works from a link.
-  local link = "|Hplayer:"..name.."|h["..name.."]|h"
+  -- The right-click menu on that link did NOT offer Invite to Guild (player test), so
+  -- the name goes in the addon's OWN copy box instead: Ctrl+C, Esc, then paste it
+  -- into the Blizzard Guild > Invite Member box yourself. The addon never touches
+  -- a Blizzard frame, so the invite stays a Blizzard-UI action.
+  GR_Compat.ShowCopyBox(name)
   if DEFAULT_CHAT_FRAME then
-    DEFAULT_CHAT_FRAME:AddMessage("|cffff8000Rawcruiter:|r invite "..link
-      .." -- right-click the name > Invite to Guild, or type: /ginvite "..name)
+    DEFAULT_CHAT_FRAME:AddMessage("|cffff8000Rawcruiter:|r invite "..name
+      .." -- copy box open: Ctrl+C, Esc, then paste into Guild > Invite Member (or type /ginvite "..name..")")
   end
+end
+
+-- a small draggable box holding the name, selected, so the player can copy it
+-- (Ctrl+C) and paste it into Blizzard's own invite box. Our own frame only.
+-- While it has focus key bindings are suspended, so Esc (or Enter) closes it.
+function GR_Compat.ShowCopyBox(name)
+  local f = GuildRecruiterCopyBox
+  if not f then
+    f = GR_Compat.BackdropFrame("Frame", "GuildRecruiterCopyBox", UIParent)
+    f:SetWidth(300)
+    f:SetHeight(66)
+    f:SetPoint("TOP", UIParent, "TOP", 0, -140)
+    f:SetFrameStrata("DIALOG")
+    GR_Compat.SetBackdrop(f, { bgFile = "Interface\\DialogFrame\\UI-DialogBox-Background",
+      edgeFile = "Interface\\DialogFrame\\UI-DialogBox-Border", tile = true, tileSize = 16, edgeSize = 16,
+      insets = { left = 4, right = 4, top = 4, bottom = 4 } })
+    f:SetMovable(true)
+    f:EnableMouse(true)
+    f:RegisterForDrag("LeftButton")
+    f:SetScript("OnDragStart", function(self) self:StartMoving() end)
+    f:SetScript("OnDragStop", function(self) self:StopMovingOrSizing() end)
+    local label = f:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    label:SetPoint("TOP", f, "TOP", 0, -10)
+    f.label = label
+    local eb = CreateFrame("EditBox", "GuildRecruiterCopyEdit", f)
+    eb:SetWidth(270)
+    eb:SetHeight(24)
+    eb:SetPoint("BOTTOM", f, "BOTTOM", 0, 10)
+    eb:SetFontObject(ChatFontNormal or GameFontHighlight)
+    eb:SetAutoFocus(false)
+    local bg = eb:CreateTexture(nil, "BACKGROUND")
+    bg:SetAllPoints(eb)
+    GR_Compat.ColorTexture(bg, 0, 0, 0, 0.6)
+    eb:SetScript("OnEscapePressed", function(self) self:ClearFocus(); f:Hide() end)
+    eb:SetScript("OnEnterPressed", function(self) self:ClearFocus(); f:Hide() end)
+    f.edit = eb
+  end
+  f.label:SetText("Invite: Ctrl+C, Esc, then Ctrl+V in Guild > Invite Member")
+  f.edit:SetText(name)
+  f:Show()
+  f.edit:SetFocus()
+  f.edit:HighlightText()
 end
 
 -- empty the secure button's action. Between clicks it is always empty: PostClick
