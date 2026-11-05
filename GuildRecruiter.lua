@@ -43,14 +43,28 @@ local issecret    = issecretvalue  or function() return false end
 local issecrettab = issecrettable  or function() return false end
 GR_Compat.IsSecret = issecret
 
--- Hardware-event mode (blockers 1 + 2). The wiki marks C_FriendList.SendWho and
--- C_GuildInfo.Invite #hwevent: they work only inside a handler the client runs
--- for a key press or mouse click, never from OnUpdate, C_Timer or an event.
+-- Hardware-event mode (blockers 1 + 2). The wiki marks C_FriendList.SendWho
+-- #hwevent: it works only inside a handler the client runs for a key press or
+-- mouse click, never from OnUpdate, C_Timer or an event. C_GuildInfo.Invite is
+-- stricter: on a Forever client it raised ADDON_ACTION_FORBIDDEN from a key
+-- press, so it is protected (Blizzard-only) and addon code never calls it here.
+-- Invites go through the SECURE Next button instead (GR_Compat.SetSecureInvite):
+-- its PreClick puts "/ginvite Name" in the button's macrotext and the client's
+-- own secure click handler runs that macro.
 -- ONE switch, set by feature detection at load: a client with
 -- C_FriendList.SendWho is treated as needing a press for every /who and every
 -- invite (the run waits for the Next key / button); a client with only the old
--- globals keeps the automatic timer loop.
+-- globals keeps the automatic timer loop and its old invite calls.
 GR_Compat.RequiresHardwareEvent = (C_FriendList and C_FriendList.SendWho) and true or false
+
+-- the Bindings.xml CLICK binding on the secure Next button (also its key lookup)
+GR_Compat.NEXT_BINDING = "CLICK GuildRecruiterNextButton:LeftButton"
+
+-- combat lockdown: insecure code may not change a secure frame (its attributes,
+-- show/hide, position or size) while it is on
+function GR_Compat.InCombat()
+  return type(InCombatLockdown) == "function" and InCombatLockdown() and true or false
+end
 
 -- contact modes the run timer may still send by itself in hardware-event mode:
 -- a WHISPER is not hardware-restricted (wiki), so whisper-only contacts keep
@@ -59,11 +73,13 @@ GR_Compat.TimerContactModes = { whisper = true }
 
 -- GR_Compat.Press(fn, ...) runs fn for a key press or click, in the SAME call
 -- stack (pcall is synchronous: no timer, no OnUpdate hop, no coroutine), and
--- returns pcall's ok, err. The restricted wrappers below (SendWho, GuildInvite)
--- call CheckPress first: in hardware-event mode, reaching them outside a Press
--- is a bug, and it stops the run with a named error instead of tripping the
--- client's "action blocked" counter.
+-- returns pcall's ok, err. The restricted /who wrapper below (SendWho) calls
+-- CheckPress first: in hardware-event mode, reaching it outside a Press is a
+-- bug, and it stops the run with a named error instead of tripping the
+-- client's "action blocked" counter. Invites have their own gate
+-- (SetSecureInvite: only inside the secure button's PreClick).
 GR_Compat.inPress = false
+GR_Compat.secureClick = nil   -- the secure Next button, set only while its PreClick runs
 function GR_Compat.Press(fn, ...)
   local outer = GR_Compat.inPress
   GR_Compat.inPress = true
@@ -97,10 +113,18 @@ function GR_Compat.WatchBlocked(frame)
   pcall(frame.RegisterEvent, frame, "ADDON_ACTION_FORBIDDEN")
 end
 
--- one chat line for a block report that names this addon, else nil
+-- one chat line for a block report that names this addon, else nil. fn is the
+-- event's second argument (the call the client refused). FORBIDDEN means a
+-- Blizzard-only call, which no key press unlocks; BLOCKED means a protected
+-- call from tainted code (e.g. a secure frame changed in combat).
 function GR_Compat.BlockedLine(event, addon, fn)
   if issecret(addon) or issecret(fn) or addon ~= ADDON_NAME then return nil end
-  local line = "|cffff4040The client blocked "..tostring(fn or "an action").."|r ("..tostring(event)..")"
+  local line
+  if event == "ADDON_ACTION_FORBIDDEN" then
+    line = "|cffff4040The client forbids "..tostring(fn or "an action").." for addons|r (ADDON_ACTION_FORBIDDEN: Blizzard-only, a key press does not unlock it)"
+  else
+    line = "|cffff4040The client blocked "..tostring(fn or "an action").."|r ("..tostring(event)..")"
+  end
   if GR_Compat.lastCall then
     line = line.."; our last restricted call was "..GR_Compat.lastCall
          ..string.format(" %.1fs ago", GetTime() - (GR_Compat.lastCallAt or 0))
@@ -189,11 +213,12 @@ function GR_Compat.WhoPanel()
   return FriendsFrame
 end
 
--- guild invite (blocker 2). method = the saved setting auto|byname|invite|chat.
--- Mainline: C_GuildInfo.Invite(name), marked #hwevent on the wiki. "auto" tries
--- it first, then the 1.12 order (GuildInviteByName, GuildInvite, /ginvite).
--- A chosen method whose function is missing falls back to the "auto" order.
--- Returns the call's name and the function that sends it.
+-- guild invite (blocker 2), TIMER-LOOP CLIENTS ONLY (no C_FriendList.SendWho).
+-- method = the saved setting auto|byname|invite|chat. "auto" tries
+-- C_GuildInfo.Invite(name) first, then the 1.12 order (GuildInviteByName,
+-- GuildInvite, /ginvite). A chosen method whose function is missing falls back
+-- to the "auto" order. Returns the call's name and the function that sends it.
+-- In key-press mode GR_Compat.GuildInvite never reaches this (SetSecureInvite).
 function GR_Compat.ResolveInvite(method)
   if method == "byname" and type(GuildInviteByName) == "function" then return "GuildInviteByName", GuildInviteByName end
   if method == "invite" and type(GuildInvite) == "function" then return "GuildInvite", GuildInvite end
@@ -205,16 +230,57 @@ function GR_Compat.ResolveInvite(method)
 end
 function GR_Compat.InviteByChat(name) GR_Compat.RunSlash("/ginvite "..name) end
 
--- RESTRICTED: every invite method (including /ginvite typed from code) needs
--- the press on a hardware-event client, so CheckPress guards all of them.
+-- Key-press mode invite. C_GuildInfo.Invite is protected (ADDON_ACTION_FORBIDDEN
+-- seen on Forever), so addon code never calls it, nor GuildInviteByName,
+-- GuildInvite or a /ginvite typed from code. Inside the secure Next button's
+-- PreClick (GR_Compat.secureClick) this sets that button's action to the macro
+-- "/ginvite <name>"; the template's secure OnClick runs it right after PreClick
+-- returns, in the same click, and PostClick empties it again (SecureClear).
+-- Reached anywhere else, or in combat lockdown, it raises an error: the press
+-- code checks both before it gets here, so that would be a bug.
+function GR_Compat.SetSecureInvite(name)
+  local btn = GR_Compat.secureClick
+  if not btn then
+    error("a guild invite needs a click on the secure Next button (or its key, or /click GuildRecruiterNextButton) on this client, but was reached from "
+      ..(GR_Compat.inPress and "a typed command" or "a timer or event"), 0)
+  end
+  if GR_Compat.InCombat() then error("can't set the invite in combat", 0) end
+  if type(name) ~= "string" or not string.find(name, "^[^%s/]+$") then
+    error("not a player name for /ginvite: "..tostring(name), 0)   -- no spaces/newlines in a macro line
+  end
+  btn:SetAttribute("type", "macro")
+  btn:SetAttribute("macrotext", "/ginvite "..name)
+  GR_Compat.lastCall, GR_Compat.lastCallAt = "/ginvite on "..(btn:GetName() or "the Next button"), GetTime()
+end
+
+-- empty the secure button's action. Between clicks it is always empty: PostClick
+-- empties it, and so does PLAYER_REGEN_DISABLED (which fires just BEFORE
+-- lockdown starts). In combat lockdown SetAttribute is not allowed, so this does
+-- nothing then (there is nothing to empty).
+function GR_Compat.SecureClear(btn)
+  if not btn or GR_Compat.InCombat() then return end
+  if btn:GetAttribute("type") ~= nil or btn:GetAttribute("macrotext") ~= nil then
+    btn:SetAttribute("type", nil)
+    btn:SetAttribute("macrotext", nil)
+  end
+end
+
+-- the invite. Key-press mode: the secure macro above (never C_GuildInfo.Invite).
+-- Timer-loop client (no C_FriendList.SendWho): the call ResolveInvite picks,
+-- as before (CheckPress only records it there; it never blocks on that client).
 function GR_Compat.GuildInvite(name, method)
+  if GR_Compat.RequiresHardwareEvent then
+    GR_Compat.SetSecureInvite(name)
+    return
+  end
   local label, send = GR_Compat.ResolveInvite(method)
   GR_Compat.CheckPress(label)
   send(name)
 end
 
--- which call "auto" invites with, for the load message
+-- which call invites, for the load message
 function GR_Compat.InviteApiName()
+  if GR_Compat.RequiresHardwareEvent then return "/ginvite on the secure Next button" end
   local label = GR_Compat.ResolveInvite("auto")
   return label
 end
@@ -262,7 +328,7 @@ function GR_Compat.ApiSummary()
   local wsp = (C_ChatInfo and C_ChatInfo.SendChatMessage and "C_ChatInfo.SendChatMessage")
            or (type(SendChatMessage) == "function" and "SendChatMessage") or "none"
   return "Invite API: "..GR_Compat.InviteApiName().." (who: "..who..", whisper: "..wsp..")"
-      ..(GR_Compat.RequiresHardwareEvent and ". Key-press mode: each /who and invite waits for /gr next or the Next key" or "")
+      ..(GR_Compat.RequiresHardwareEvent and ". Key-press mode: each /who and invite waits for the Next button or its key (invites: not in combat)" or "")
 end
 
 -- guild sync. Mainline moved both calls to C_ChatInfo (8.0.1) and delivers
@@ -390,10 +456,12 @@ end
 
 local VERSION    = "4.0.0-forever.1"
 
--- Key Bindings entry (Bindings.xml in this folder, loaded by the client; it
--- calls GuildRecruiter_Next). FrameXML reads these two globals for the labels.
-BINDING_HEADER_GUILDRECRUITER    = "Guild Rawcruiter"
-BINDING_NAME_GUILDRECRUITER_NEXT = "Next: send one /who or one invite"
+-- Key Bindings entry (Bindings.xml in this folder, loaded by the client): a
+-- CLICK binding on the secure button GuildRecruiterNextButton. FrameXML labels
+-- a binding with _G["BINDING_NAME_"..name] (GetBindingName in BindingUtil.lua),
+-- and this name has a space and a colon in it, so it is set through _G.
+BINDING_HEADER_GUILDRECRUITER = "Guild Rawcruiter"
+_G["BINDING_NAME_"..GR_Compat.NEXT_BINDING] = "Next: one /who, whisper or guild invite"
 local CAP_HINT   = 49      -- treat a query returning >= this many as truncated
 local START_WIDTH = 10     -- initial level-band width to try
 local WHO_TIMEOUT = 15     -- give up waiting on a /who reply after this many seconds (then retry)
@@ -793,9 +861,11 @@ end
 -- ---------------------------------------------------------------------------
 -- Contacting: invite and/or whisper
 -- ---------------------------------------------------------------------------
--- The invite call itself is chosen in GR_Compat.GuildInvite: C_GuildInfo.Invite
--- where it exists, else GuildInviteByName (Turtle's name-taking invite; bare
--- GuildInvite() invites your TARGET on some cores), else GuildInvite, else /ginvite.
+-- The invite call itself is chosen in GR_Compat.GuildInvite. Key-press mode:
+-- "/ginvite name" set on the secure Next button during its PreClick (works only
+-- there). Timer-loop client: C_GuildInfo.Invite where it exists, else
+-- GuildInviteByName (Turtle's name-taking invite; bare GuildInvite() invites
+-- your TARGET on some cores), else GuildInvite, else /ginvite.
 local function DoGuildInvite(name, method)
   GR_Compat.GuildInvite(name, method or GuildRecruiter_Settings.inviteMethod or "auto")
 end
@@ -1187,6 +1257,7 @@ local function GR_OnEvent(event, ...)
     GuildRecruiter_Settings = GuildRecruiter_Settings or {}
     Defaults()
     InitMinimap()
+    GuildRecruiter_SyncNext()   -- key-press mode: build the secure Next button (hidden) out of combat
     Print("v"..VERSION.." loaded. "..GR_Compat.ApiSummary()..". /gr for commands, /gr config for settings.")
   elseif event == "WHO_LIST_UPDATE" and running then
     ProcessWho()
@@ -1244,8 +1315,12 @@ local function GR_OnEvent(event, ...)
     if line then GuildRecruiter_PauseBlocked(line) end
   elseif event == "PLAYER_REGEN_DISABLED" then
     inCombat = true
+    -- lockdown starts right AFTER this event: last chance to empty the secure
+    -- button (it is already empty between clicks; SecureClear checks lockdown)
+    GR_Compat.SecureClear(GuildRecruiterNextButton)
   elseif event == "PLAYER_REGEN_ENABLED" then
     inCombat = false
+    GuildRecruiter_SyncNext()   -- lockdown is over: build / show / hide the secure Next button
   end
 end
 
@@ -1310,7 +1385,9 @@ end
 
 -- RESTRICTED (guild invite): the first player on the ready-to-invite list
 -- (replied yes to a whisperinvite whisper). Callers: GuildRecruiter_Drain (1.12
--- timer only) and GuildRecruiter_NextPress.
+-- timer only) and GuildRecruiter_NextPress (key-press mode: only from the
+-- secure button's PreClick, where DoGuildInvite sets the /ginvite macro and
+-- this records the invite).
 function GuildRecruiter_InviteReply()
   local name = tremove(replyQueue, 1)
   DoGuildInvite(name)
@@ -1325,7 +1402,8 @@ end
 
 -- RESTRICTED when the head's contact is an invite: contact the head of the
 -- queue with the variant DealHead dealt it. Callers: GuildRecruiter_Drain (1.12
--- timer; key-press mode only for TimerMay whispers) and GuildRecruiter_NextPress.
+-- timer; key-press mode only for TimerMay whispers) and GuildRecruiter_NextPress
+-- (key-press mode: an invite only from the secure button's PreClick).
 function GuildRecruiter_ContactHead()
   local name, v = GuildRecruiter_DealHead()
   tremove(contactQueue, 1)
@@ -1545,7 +1623,10 @@ local function Start()
 end
 
 local function Stop()
-  if not running then Print("Not running.") return end
+  if not running then
+    if not GuildRecruiter_CancelOne() then Print("Not running.") end   -- or drop a single invite set on Next
+    return
+  end
   local wasSend = (GuildRecruiter_runKind ~= "scan")
   running, scanning, awaiting, paused = false, false, false, false
   GuildRecruiter_rescanWait = 0
@@ -1646,17 +1727,40 @@ function GuildRecruiter_TogglePause() if paused then Resume() else Pause() end e
 -- ---------------------------------------------------------------------------
 -- Key-press mode (GR_Compat.RequiresHardwareEvent): the Next action
 -- ---------------------------------------------------------------------------
--- The client marks C_FriendList.SendWho and C_GuildInfo.Invite #hwevent, so
--- every /who and every invite must start from a key press or click. One press
--- makes at most ONE restricted call, chosen in this order:
+-- The client marks C_FriendList.SendWho #hwevent (a key press or click must
+-- start it) and treats C_GuildInfo.Invite as protected (ADDON_ACTION_FORBIDDEN
+-- from addon code, even inside a key press). One press makes at most ONE
+-- restricted call, chosen in this order:
 --   1. the ready-to-invite list (whisper replies that passed the reply rule)
 --   2. the head of the contact queue, unless its contact is a plain whisper
 --      (those still go out on the timer: GuildRecruiter_TimerMay)
 --   3. the next /who of the sweep
+-- With no run armed, a single invite set from the Lists tab or /gr invite
+-- (GuildRecruiter_oneName) is the only step.
 -- The pacing settings are minimum gaps: a press that comes too early only says
--- how long to wait. Entry point GuildRecruiter_Next(): Bindings.xml, the Next
--- buttons and /gr next, all key/click handlers; the restricted call runs in
--- the same call stack (GR_Compat.Press -> pcall, which is synchronous).
+-- how long to wait.
+--
+-- Entry points:
+--   * the SECURE button GuildRecruiterNextButton (SecureActionButtonTemplate):
+--     a mouse click on it, the Bindings.xml CLICK binding on it, or a macro
+--     with /click GuildRecruiterNextButton. Its PreClick
+--     (GuildRecruiter_SecurePreClick) runs the step. An invite step sets the
+--     button's action to the macro "/ginvite <name>" and records the invite;
+--     the template's secure OnClick then runs that macro, so the invite is the
+--     client's own /ginvite. A /who or whisper step runs inside PreClick.
+--   * typed /gr next (GuildRecruiter_Next): a typed command can't click a
+--     secure button, so it does /who and whisper steps and only explains an
+--     invite step.
+-- Either way the step runs in the same call stack (GR_Compat.Press -> pcall,
+-- which is synchronous).
+--
+-- Click edge: the secure action fires on the click's UP edge, fixed by the
+-- button's own attribute useOnKeyDown = false (SecureActionButton_OnClick in
+-- the client's SecureTemplates.lua reads it before the ActionButtonUseKeyDown
+-- CVar). The button is registered for LeftButtonUp only, so PreClick and
+-- PostClick run on that same event (both also ignore a down event). Up, because
+-- "/click GuildRecruiterNextButton" sends an up click by default and a mouse
+-- click ends on the up edge; the key binding acts when the key is released.
 
 -- the client reported a blocked call naming this addon (GR_Compat.BlockedLine)
 function GuildRecruiter_PauseBlocked(line)
@@ -1669,12 +1773,17 @@ end
 
 -- What the next press would do, without doing it (the press, the buttons and
 -- /gr status all ask this, so they always agree):
---   action  "reply" | "contact" | "who", or nil when a press can do nothing now
+--   action  "reply" | "contact" | "who" | "one", or nil when a press can do nothing now
 --   wait    seconds until that press may fire (0 = now)
 --   info    what it would do / why not, for chat
 --   short   the same for the button
+--   invite  true when the step is a guild invite (secure button only, not in combat)
 function GuildRecruiter_NextStep()
-  if not running then return nil, 0, "not armed -- /gr start first", "Not armed" end
+  if not running then
+    local one = GuildRecruiter_oneName   -- a single invite set from the Lists tab / /gr invite
+    if one then return "one", 0, "invite "..one, "Invite "..one, true end
+    return nil, 0, "not armed -- /gr start first", "Not armed"
+  end
   if paused then return nil, 0, "paused -- /gr resume first", "Paused" end
   -- contacts held (combat / instance / throttle) don't stop the /who: as in
   -- 1.12, only the server-throttle backoff holds the sweep
@@ -1682,15 +1791,17 @@ function GuildRecruiter_NextStep()
   local held = nil
   local cwait = (inviteTimer > 0) and inviteTimer or 0
   if #replyQueue > 0 then
-    if not blocked then return "reply", cwait, "invite "..replyQueue[1].." (replied)", "Invite "..replyQueue[1] end
+    if not blocked then return "reply", cwait, "invite "..replyQueue[1].." (replied)", "Invite "..replyQueue[1], true end
     held = "invites held: "..blocked
   elseif #contactQueue > 0 then
     if CapReached() then return nil, 0, "session cap reached", "Cap reached" end
     local name, v = GuildRecruiter_DealHead()
     if not GuildRecruiter_TimerMay(v) then
       if not blocked then
-        local verb = (GuildRecruiter_runKind ~= "blast" and GuildRecruiter_CfgOf(v).mode ~= "invite") and "Whisper" or "Invite"
-        return "contact", cwait, string.lower(verb).." "..name, verb.." "..name
+        -- same split as Contact: only whisper / whisperinvite whisper, anything else invites
+        local m = GuildRecruiter_CfgOf(v).mode
+        local verb = (GuildRecruiter_runKind ~= "blast" and (m == "whisper" or m == "whisperinvite")) and "Whisper" or "Invite"
+        return "contact", cwait, string.lower(verb).." "..name, verb.." "..name, verb == "Invite"
       end
       held = "contacts held: "..blocked
     end
@@ -1712,7 +1823,7 @@ end
 
 -- the Next button's text, e.g. "/who ready in 2s [3]" ([n] = ready to invite)
 function GuildRecruiter_NextLabel()
-  local act, wait, _, short = GuildRecruiter_NextStep()
+  local act, wait, _, short, inv = GuildRecruiter_NextStep()
   local secs = math.ceil(wait or 0)
   local text = short
   if act == "who" then
@@ -1723,26 +1834,42 @@ function GuildRecruiter_NextLabel()
   elseif act and secs > 0 then
     text = (string.match(short, "^%S+") or "Next").." ready in "..secs.."s"
   end
+  if inv and GR_Compat.InCombat() then text = text.." (after combat)" end
   if #replyQueue > 0 then text = text.." ["..#replyQueue.."]" end
   return text
 end
 
--- runs INSIDE the hardware event (via GR_Compat.Press): at most one restricted call
+-- runs INSIDE the hardware event (via GR_Compat.Press): at most one restricted
+-- call. GR_Compat.secureClick is the secure button while its PreClick runs, and
+-- nil for a typed /gr next, which therefore can't do an invite step.
 function GuildRecruiter_NextPress()
-  local act, wait, info = GuildRecruiter_NextStep()
+  local act, wait, info, _, inv = GuildRecruiter_NextStep()
   if not act then Print("Next: "..info..".") return end
   if wait > 0 then Print("Next: wait "..math.ceil(wait).."s ("..info..").") return end
-  if act == "reply" then
-    GuildRecruiter_InviteReply()            -- C_GuildInfo.Invite
+  if inv then
+    if not GR_Compat.secureClick then
+      Print("Next: "..info.." -- a typed command can't send a guild invite on this client. Click the Next button (under the minimap button), press its key, or use a macro with /click GuildRecruiterNextButton.")
+      return
+    end
+    if GR_Compat.InCombat() then Print("Next: can't set the invite in combat -- press again when combat ends.") return end
+  end
+  if act == "one" then
+    local name = GuildRecruiter_oneName
+    GuildRecruiter_oneName = nil
+    DoGuildInvite(name)                     -- sets /ginvite on the secure button
+    GuildRecruiter_InvitedOne(name)
+  elseif act == "reply" then
+    GuildRecruiter_InviteReply()            -- invite: /ginvite on the secure button
   elseif act == "contact" then
-    GuildRecruiter_ContactHead()            -- C_GuildInfo.Invite, or the whisperinvite whisper
+    GuildRecruiter_ContactHead()            -- invite (/ginvite on the secure button), or a whisper
   else
     SendNextWho()                           -- C_FriendList.SendWho
     whoTimer = Pace(GuildRecruiter_Settings.whoDelay)
   end
 end
 
--- THE entry point for a key press or click (Bindings.xml, Next buttons, /gr next)
+-- typed /gr next. A typed command can't click the secure button, so this does
+-- the /who and whisper steps and only explains an invite step (NextPress).
 function GuildRecruiter_Next()
   if not GR_Compat.RequiresHardwareEvent then
     Print("Next isn't needed on this client: the run sends /who and invites by itself (/gr start).")
@@ -1752,18 +1879,43 @@ function GuildRecruiter_Next()
   if not ok then Abort(err) end
 end
 
+-- PreClick of the secure Next button: insecure addon code that runs in the
+-- click's hardware event BEFORE the template's secure OnClick. An invite step
+-- sets the /ginvite macro (out of combat only); a /who or whisper step runs
+-- here. The button's action is empty when this starts (PostClick emptied it).
+function GuildRecruiter_SecurePreClick(btn, button, down)
+  if down then return end                   -- the secure action fires on the up edge
+  GR_Compat.SecureClear(btn)                -- start empty (does nothing in combat: already empty)
+  GR_Compat.secureClick = btn
+  local ok, err = GR_Compat.Press(GuildRecruiter_NextPress)
+  GR_Compat.secureClick = nil
+  if not ok then
+    GR_Compat.SecureClear(btn)              -- never run a half-made step
+    Abort(err)
+  end
+end
+
+-- PostClick: the secure action has run (or there was none). Empty it, so no
+-- later click or key can fire a stale /ginvite.
+function GuildRecruiter_SecurePostClick(btn, button, down)
+  if down then return end
+  GR_Compat.SecureClear(btn)
+end
+
 -- how to press Next, for chat
 function GuildRecruiter_PressHint()
-  local k = GR_Compat.BindingKey("GUILDRECRUITER_NEXT")
-  if k then return "press "..k..", click Next (under the minimap button) or type /gr next" end
-  return "click Next (under the minimap button) or type /gr next; bind a key under Key Bindings > Guild Rawcruiter"
+  local k = GR_Compat.BindingKey(GR_Compat.NEXT_BINDING)
+  if k then return "press "..k.." or click Next (under the minimap button)" end
+  return "click Next (under the minimap button), or bind a key under Key Bindings > Guild Rawcruiter"
 end
 
 -- key-press mode: announce the armed run and show the Next button. Returns
 -- false on a timer-loop client, so the caller prints its 1.12 line instead.
 function GuildRecruiter_Arm(text)
   if not GR_Compat.RequiresHardwareEvent then return false end
-  Print(text.." Each /who and invite waits for you: "..GuildRecruiter_PressHint()..". /gr stop to cancel.")
+  GuildRecruiter_oneName = nil              -- a single invite set earlier gives way to the run
+  Print(text.." Each /who and invite waits for you: "..GuildRecruiter_PressHint()
+    ..". Invites need that button or key (not /gr next, not in combat). /gr stop to cancel.")
   GuildRecruiter_ShowNext()
   return true
 end
@@ -1774,36 +1926,109 @@ function GuildRecruiter_NextTip(btn)
   GameTooltip:AddLine("Guild Rawcruiter: Next")
   GameTooltip:AddLine("Next: "..info, 1, 1, 1, 1)
   if #replyQueue > 0 then GameTooltip:AddLine(#replyQueue.." replied -- ready to invite", 0.3, 1, 0.3) end
-  GameTooltip:AddLine("One /who or one invite per press: this client needs a key press or click for each.", 0.7, 0.7, 0.7, 1)
-  local k = GR_Compat.BindingKey("GUILDRECRUITER_NEXT")
-  GameTooltip:AddLine(k and ("Key: "..k.."  (or /gr next)") or "No key bound: Key Bindings > Guild Rawcruiter (or /gr next)", 0.6, 0.8, 1, 1)
+  GameTooltip:AddLine("One /who, whisper or invite per click. Invites run /ginvite through this secure button, so they can't be set in combat.", 0.7, 0.7, 0.7, 1)
+  local k = GR_Compat.BindingKey(GR_Compat.NEXT_BINDING)
+  GameTooltip:AddLine(k and ("Key: "..k) or "No key bound: Key Bindings > Guild Rawcruiter", 0.6, 0.8, 1, 1)
+  GameTooltip:AddLine("In a macro: /click GuildRecruiterNextButton", 0.6, 0.8, 1, 1)
   GameTooltip:Show()
 end
 
--- the floating Next button under the minimap button; hides itself when the run ends
+-- should the Next button be on screen? (a run is armed, or a single invite is set)
+function GuildRecruiter_NextWanted()
+  return (running or GuildRecruiter_oneName ~= nil) and true or false
+end
+
+-- THE secure button: SecureActionButtonTemplate, with the UIPanelButtonTemplate
+-- look. Built once, out of combat (a secure frame's attributes, click
+-- registration, size and position can't be set in lockdown); until then the
+-- PLAYER_REGEN_ENABLED handler retries. Parented and anchored to UIParent only:
+-- anchoring it to the minimap button (or parenting it to the main window) would
+-- make that frame protected too, so moving or hiding it in combat would be
+-- blocked. It has NO OnClick script: that would replace the template's secure
+-- SecureActionButton_OnClick.
+function GuildRecruiter_MakeNext()
+  local b = GuildRecruiterNextButton
+  if b or not GR_Compat.RequiresHardwareEvent or GR_Compat.InCombat() then return b end
+  b = CreateFrame("Button", "GuildRecruiterNextButton", UIParent, "SecureActionButtonTemplate,UIPanelButtonTemplate")
+  b:SetWidth(170); b:SetHeight(22)
+  b:SetFrameStrata("DIALOG"); b:SetFrameLevel(100)   -- stays clickable over the main window
+  b:SetClampedToScreen(true)
+  b:SetAttribute("useOnKeyDown", false)   -- the secure action fires on the UP edge, whatever the CVar
+  b:RegisterForClicks("LeftButtonUp")     -- so PreClick / PostClick run on that same edge
+  b:SetScript("PreClick", function(self, button, down) GuildRecruiter_SecurePreClick(self, button, down) end)
+  b:SetScript("PostClick", function(self, button, down) GuildRecruiter_SecurePostClick(self, button, down) end)
+  b:SetScript("OnEnter", function(self) GuildRecruiter_NextTip(self) end)
+  b:SetScript("OnLeave", function() GameTooltip:Hide() end)
+  b.tick = 0
+  b:SetScript("OnUpdate", function(self, elapsed)
+    self.tick = self.tick - (elapsed or 0)
+    if self.tick > 0 then return end
+    self.tick = 0.2
+    if not GuildRecruiter_NextWanted() then
+      if not GR_Compat.InCombat() then self:Hide() end   -- a secure frame can't be hidden in combat
+      return
+    end
+    local ok, text = pcall(GuildRecruiter_NextLabel)   -- label only; never sends anything
+    self:SetText(ok and text or "Next")
+  end)
+  b:SetText("Next")
+  b:Hide()
+  return b
+end
+
+-- put the button under the minimap button, anchored to UIParent (see
+-- MakeNext): the minimap button's screen spot in UIParent units. Out of combat only.
+function GuildRecruiter_PlaceNext(b)
+  if not b or GR_Compat.InCombat() then return end
+  local mb = GuildRecruiterMinimapButton
+  local x, bottom = nil, nil
+  if mb then x = mb:GetCenter(); bottom = mb:GetBottom() end
+  b:ClearAllPoints()
+  if x and bottom then
+    local k = mb:GetEffectiveScale() / UIParent:GetEffectiveScale()
+    b:SetPoint("TOP", UIParent, "BOTTOMLEFT", x * k, bottom * k - 2)
+  else
+    b:SetPoint("TOP", UIParent, "TOP", 0, -120)
+  end
+end
+
+-- build the button if needed and show or hide it to match NextWanted. Out of
+-- combat only; the PLAYER_REGEN_ENABLED handler calls it again after combat.
+function GuildRecruiter_SyncNext()
+  if not GR_Compat.RequiresHardwareEvent or GR_Compat.InCombat() then return end
+  local b = GuildRecruiter_MakeNext()
+  if not b then return end
+  if GuildRecruiter_NextWanted() then
+    GuildRecruiter_PlaceNext(b)
+    local ok, text = pcall(GuildRecruiter_NextLabel)
+    b:SetText(ok and text or "Next")
+    b:Show()
+  else
+    b:Hide()
+  end
+end
+
+-- show the Next button now (a run armed, a single invite set). A secure frame
+-- can't be shown in combat: then say so; SyncNext shows it when combat ends.
 function GuildRecruiter_ShowNext()
   if not GR_Compat.RequiresHardwareEvent then return end
   local b = GuildRecruiterNextButton
-  if not b then
-    b = CreateFrame("Button", "GuildRecruiterNextButton", UIParent, "UIPanelButtonTemplate")
-    b:SetWidth(170); b:SetHeight(22); b:SetFrameStrata("MEDIUM")
-    if GuildRecruiterMinimapButton then b:SetPoint("TOP", GuildRecruiterMinimapButton, "BOTTOM", 0, -2)
-    else b:SetPoint("TOP", UIParent, "TOP", 0, -120) end
-    b:SetScript("OnClick", function() GuildRecruiter_Next() end)   -- the click IS the hardware event
-    b:SetScript("OnEnter", function(self) GuildRecruiter_NextTip(self) end)
-    b:SetScript("OnLeave", function() GameTooltip:Hide() end)
-    b.tick = 0
-    b:SetScript("OnUpdate", function(self, elapsed)
-      self.tick = self.tick - (elapsed or 0)
-      if self.tick > 0 then return end
-      self.tick = 0.2
-      if not running then self:Hide(); return end
-      local ok, text = pcall(GuildRecruiter_NextLabel)   -- label only; never sends anything
-      self:SetText(ok and text or "Next")
-    end)
+  if GR_Compat.InCombat() then
+    if b and b:IsShown() then b:SetText(GuildRecruiter_NextLabel())
+    else Print("In combat: the Next button appears when combat ends.") end
+    return
   end
-  b:SetText(GuildRecruiter_NextLabel())
-  b:Show()
+  GuildRecruiter_SyncNext()
+end
+
+-- drop a single invite set on the Next button (/gr stop with no run armed)
+function GuildRecruiter_CancelOne()
+  local one = GuildRecruiter_oneName
+  if not one then return false end
+  GuildRecruiter_oneName = nil
+  Print("Dropped the invite for "..one.." from the Next button.")
+  GuildRecruiter_SyncNext()
+  return true
 end
 
 -- ---------------------------------------------------------------------------
@@ -1863,23 +2088,39 @@ local LIST_HINT = "click a name to remove it (Blacklist / History ask first)"
 -- so an invite-all run is controllable right where it was launched.
 -- invite a single candidate on demand (left-click in the Candidates view).
 -- GLOBAL so the list-row handler adds no upvalues to BuildListsPanel.
+-- Key-press mode: the invite itself is protected, and neither a list row nor a
+-- typed command can run a secure action, so this only SETS the name on the
+-- secure Next button (GuildRecruiter_oneName); the next click on that button
+-- (or its key) sends /ginvite and GuildRecruiter_InvitedOne records it.
 function GuildRecruiter_InviteOne(name)
   if not name then return end
   if not IsInGuild() then Print("You're not in a guild.") return end
   if running then Print("A run is active -- stop it first to invite individually.") return end
-  -- RESTRICTED: reached only from a list-row click or a typed /gr invite, both
-  -- hardware events; GR_Compat.Press marks it so the invite gate lets it through
+  if GR_Compat.RequiresHardwareEvent then
+    GuildRecruiter_oneName = name
+    GuildRecruiter_ShowNext()
+    Print("Invite "..name..": click the Next button (under the minimap button) or press its key. Typed commands and list clicks can't send a guild invite on this client; a macro with /click GuildRecruiterNextButton can. /gr stop drops it.")
+    return
+  end
+  -- timer-loop client: invite right away, as in 1.12
   local ok, err = GR_Compat.Press(DoGuildInvite, name)
   if not ok then error(err, 0) end
+  GuildRecruiter_InvitedOne(name)
+end
+
+-- record a single invite (history, candidate list, tally). Key-press mode: run
+-- from the secure button's PreClick, right after the /ginvite macro is set.
+function GuildRecruiter_InvitedOne(name)
   if not GuildRecruiter_Settings.history then GuildRecruiter_Settings.history = {} end
   GuildRecruiter_Settings.history[name] = { t = time(), p = GuildRecruiter_Settings.activeProfile }
   if GuildRecruiter_Settings.candidates then GuildRecruiter_Settings.candidates[name] = nil end
   TallyBump("invited")
   Print("Invited "..name..".")
+  GuildRecruiter_ListRefresh()
 end
 
 function GuildRecruiter_ListControls(fr)
-  if not fr or not fr.inviteBtn or not fr.lnextBtn then return end
+  if not fr or not fr.inviteBtn then return end
   if running then
     fr.inviteBtn:Hide(); fr.sendBtn:Hide()
     fr.lpauseBtn:Show(); fr.lstopBtn:Show()
@@ -1887,23 +2128,23 @@ function GuildRecruiter_ListControls(fr)
     local total = GuildRecruiter_runTotal or 0
     local verb = (GuildRecruiter_runKind == "blast" or GuildRecruiter_runKind == "send") and "Inviting" or "Working"
     local prog = (total > 0) and (stats.contacted.." of "..total) or (stats.contacted.." sent")
-    -- key-press mode: one invite per click on this strip's Next button
+    -- key-press mode: one invite per click on the secure Next button (this tab
+    -- has no Next of its own: a secure button in this window would lock the
+    -- window in combat)
     local left = #contactQueue + #replyQueue
-    if GR_Compat.RequiresHardwareEvent then
-      fr.lnextBtn:SetText("Next ("..left..")"); fr.lnextBtn:Show()
-      if not paused and left > 0 then prog = prog.." -- "..left.." left, click Next" end
-    else
-      fr.lnextBtn:Hide()
+    if GR_Compat.RequiresHardwareEvent and not paused and left > 0 then
+      prog = prog.." -- "..left.." left, click Next by the minimap"
     end
     fr.hint:SetText((paused and "|cffffcc00Paused|r -- " or ("|cff40ff40"..verb.."|r  "))..prog)
   else
-    fr.lpauseBtn:Hide(); fr.lstopBtn:Hide(); fr.lnextBtn:Hide()
+    fr.lpauseBtn:Hide(); fr.lstopBtn:Hide()
     fr.inviteBtn:Show(); fr.sendBtn:Show()
     local cc = CountTable(GuildRecruiter_Settings.candidates or {})
     fr.inviteBtn:SetText("Invite all ("..cc..")")
     if cc > 0 then fr.inviteBtn:Enable(); fr.sendBtn:Enable() else fr.inviteBtn:Disable(); fr.sendBtn:Disable() end
     fr.hint:SetText(listMode == "candidates"
-      and "left-click a name to invite it -- right-click to drop it" or LIST_HINT)
+      and (GR_Compat.RequiresHardwareEvent and "left-click a name, then Next, to invite it -- right-click to drop it"
+           or "left-click a name to invite it -- right-click to drop it") or LIST_HINT)
   end
 end
 
@@ -1989,7 +2230,7 @@ local function BuildListsPanel(parent)
     local cnt = CountTable(GuildRecruiter_Settings.candidates)
     if cnt == 0 then Print("No collected candidates yet. Turn on Collect (Settings) and scan.") return end
     GuildRecruiter_Confirm(GR_Compat.RequiresHardwareEvent
-      and ("Invite all "..cnt.." collected candidate(s)? This client needs a click per invite: each click on Next sends one.")
+      and ("Invite all "..cnt.." collected candidate(s)? This client needs a click per invite: each click on the Next button by the minimap (or its key) sends one, not in combat.")
       or ("Invite all "..cnt.." collected candidate(s) now? Guild invites go out as fast as the server allows."),
       function() GuildRecruiter_SendToCandidates(true) end)
   end)
@@ -2010,13 +2251,9 @@ local function BuildListsPanel(parent)
   fr.lstopBtn:SetPoint("RIGHT", fr.lpauseBtn, "LEFT", -8, 0); fr.lstopBtn:SetWidth(70); fr.lstopBtn:SetHeight(22); fr.lstopBtn:SetText("|cffff6060Stop|r")
   fr.lstopBtn:SetScript("OnClick", function() GuildRecruiter_StopRun() end)
   fr.lstopBtn:Hide()
-  -- key-press mode: Next (one /who or invite per click), left of Stop
-  fr.lnextBtn = CreateFrame("Button", nil, fr, "UIPanelButtonTemplate")
-  fr.lnextBtn:SetPoint("RIGHT", fr.lstopBtn, "LEFT", -8, 0); fr.lnextBtn:SetWidth(80); fr.lnextBtn:SetHeight(22); fr.lnextBtn:SetText("Next")
-  fr.lnextBtn:SetScript("OnClick", function() GuildRecruiter_Next() end)   -- the click IS the hardware event
-  fr.lnextBtn:SetScript("OnEnter", function(self) GuildRecruiter_NextTip(self) end)
-  fr.lnextBtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
-  fr.lnextBtn:Hide()
+  -- key-press mode: no Next button here. Invites need the one secure button
+  -- (GuildRecruiterNextButton, by the minimap): a plain button can't run a
+  -- secure action, and a secure one in this window would protect the window.
   -- keep the run strip / launch buttons live while this tab is shown
   fr.ltick = 0
   fr:SetScript("OnUpdate", function(self, elapsed)
@@ -2057,6 +2294,11 @@ UpdateList = function()
   GR_Compat.FauxScrollUpdate(listFrame.scroll, n, NUM_ROWS, ROW_HEIGHT)
   listFrame.cycle:SetText("View: "..(LIST_TITLE[listMode] or listMode).."  ("..n..")")
   GuildRecruiter_ListControls(listFrame)   -- idle launch buttons vs live run strip
+end
+
+-- redraw the Lists tab if it is open (after a single invite from the Next button)
+function GuildRecruiter_ListRefresh()
+  if listFrame and listFrame:IsVisible() then UpdateList() end
 end
 
 -- ---------------------------------------------------------------------------
@@ -3042,6 +3284,9 @@ local function MinimapUpdatePos()
   if not minimapBtn then return end
   local a = math.rad(GuildRecruiter_Settings.minimapAngle or 210)
   minimapBtn:SetPoint("CENTER", Minimap, "CENTER", 80 * math.cos(a), 80 * math.sin(a))
+  -- the secure Next button is anchored to UIParent, not to this button: re-place it
+  local nb = GuildRecruiterNextButton
+  if nb and nb:IsShown() then GuildRecruiter_PlaceNext(nb) end   -- does nothing in combat
 end
 
 InitMinimap = function()
@@ -3125,7 +3370,7 @@ SlashCmdList["GUILDRECRUITER"] = function(msg)
   elseif cmd == "stop" then Stop()
   elseif cmd == "pause" then Pause()
   elseif cmd == "resume" then Resume()
-  elseif cmd == "next" then GuildRecruiter_Next()   -- typed: the Enter key press is the hardware event
+  elseif cmd == "next" then GuildRecruiter_Next()   -- typed: /who and whisper steps only (no secure click)
   elseif cmd == "status" then Status()
   elseif cmd == "collect" then
     if larg == "on" or larg == "off" then GuildRecruiter_Settings.collectOnly = (larg == "on"); RefreshConfig() end
@@ -3313,7 +3558,9 @@ SlashCmdList["GUILDRECRUITER"] = function(msg)
   else
     Print("|cff33ff99Guild Rawcruiter v"..VERSION.."|r  --  /gr config, /gr list, /gr stats")
     Print("start | stop | pause | resume | status | reset | forget | hide")
-    if GR_Compat.RequiresHardwareEvent then Print("next -- send the next /who or invite (this client needs one key press each; bind a key under Key Bindings > Guild Rawcruiter)") end
+    if GR_Compat.RequiresHardwareEvent then
+      Print("next -- the next /who or whisper (this client needs one press each). Guild invites need the Next button by the minimap, its key (Key Bindings > Guild Rawcruiter) or a macro with /click GuildRecruiterNextButton; not in combat")
+    end
     Print("autoscan on|off (loop scanning) | autoscan <seconds> (rest between cycles)")
     Print("collect on|off (scan into a list) | inviteall (fast) | send (paced) | invite <name> | candidates | clearlist")
     Print("set invite/who/reinvite/cap/min/max/method/mode <v> | msg <text> | class <list|all>")

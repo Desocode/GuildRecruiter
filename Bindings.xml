@@ -1,9 +1,12 @@
 <Bindings>
   <!-- Loaded by the client from the addon folder (not listed in the .toc).
-       One key press = one hardware event = at most one /who or one invite.
-       Labels: BINDING_HEADER_GUILDRECRUITER / BINDING_NAME_GUILDRECRUITER_NEXT
-       in GuildRecruiter.lua. Fires on key down only (no runOnUp). -->
-  <Binding name="GUILDRECRUITER_NEXT" header="GUILDRECRUITER">
-    GuildRecruiter_Next()
-  </Binding>
+       A CLICK binding: the key clicks the SECURE button GuildRecruiterNextButton
+       (SecureActionButtonTemplate, built in GuildRecruiter.lua), so a guild
+       invite step runs the client's own /ginvite macro. C_GuildInfo.Invite is
+       protected; a script binding (the old GUILDRECRUITER_NEXT) can't send it.
+       The secure action fires on the click's UP edge (useOnKeyDown = false),
+       i.e. when the key is released; runOnUp asks for that release event.
+       Label: _G["BINDING_NAME_CLICK GuildRecruiterNextButton:LeftButton"] and
+       BINDING_HEADER_GUILDRECRUITER in GuildRecruiter.lua. No default key. -->
+  <Binding name="CLICK GuildRecruiterNextButton:LeftButton" header="GUILDRECRUITER" runOnUp="true"/>
 </Bindings>

@@ -20,8 +20,9 @@ checks which API the client actually has (feature detection, never a version
 check) and uses the modern one when present, else the old 1.12 global:
   /who            C_FriendList.SendWho / GetNumWhoResults / GetWhoInfo /
                   SetWhoToUi          (else SendWho, GetWhoInfo, SetWhoToUI)
-  guild invite    C_GuildInfo.Invite  (else GuildInviteByName, GuildInvite,
-                                       then the /ginvite chat command)
+  guild invite    Forever: /ginvite run by the secure Next button (see below)
+                  older clients: C_GuildInfo.Invite (else GuildInviteByName,
+                                 GuildInvite, then the /ginvite chat command)
   whisper         C_ChatInfo.SendChatMessage      (else SendChatMessage)
   guild sync      C_ChatInfo.SendAddonMessage + RegisterAddonMessagePrefix
   window frames   BackdropTemplate when the client has it
@@ -29,9 +30,9 @@ Values the client marks secret (issecretvalue) are skipped, never compared.
 On load the addon prints which invite, /who and whisper calls it picked.
 
 ONE KEY PRESS PER /WHO OR INVITE (key-press mode)
-The warcraft.wiki.gg pages for C_FriendList.SendWho and C_GuildInfo.Invite say
-both need a hardware event (a key press or mouse click), and the other Forever
-recruiters all work one /who or one invite per press. So on a client that has
+The warcraft.wiki.gg page for C_FriendList.SendWho says it needs a hardware
+event (a key press or mouse click), and the other Forever recruiters all work
+one /who or one invite per press. So on a client that has
 C_FriendList.SendWho, the addon never sends a /who or an invite from its timer.
 It waits for you to press "Next":
   /gr start       ARMS the run (or right-click the minimap button). Nothing is
@@ -41,14 +42,16 @@ It waits for you to press "Next":
                     2. the next queued contact: an invite, or the first whisper
                        of whisper-then-invite mode
                     3. otherwise the next /who of the sweep
-                  Three ways to press it:
-                    - a key: Key Bindings > Guild Rawcruiter >
-                      "Next: send one /who or one invite" (binding name
-                      GUILDRECRUITER_NEXT, from Bindings.xml). No default key.
+                  Ways to press it:
                     - the "Next" button that appears under the minimap button
-                      while a run is armed (and on the Lists tab during
-                      Invite all / Send)
-                    - typing /gr next (a macro with /gr next works too)
+                      while a run is armed (or a single invite is set)
+                    - a key: Key Bindings > Guild Rawcruiter >
+                      "Next: one /who, whisper or guild invite". No default key.
+                      This entry is new: if you bound a key to the old Next
+                      entry, bind it again here.
+                    - a macro with: /click GuildRecruiterNextButton
+                    - typing /gr next -- but only for a /who or a whisper
+                      (see GUILD INVITES below)
 The button shows what the next press will do and when it is allowed, e.g.
 "Next: send /who", "/who ready in 2s", "Invite Bob", "Waiting for /who".
 A number in [brackets] is how many replies are ready to invite.
@@ -59,13 +62,40 @@ results, judging whisper replies, auto-backoff, the rest between auto-rescan
 sweeps (each new sweep waits for a press), and ending the run.
 Whisper-only contacts are not restricted, so in "whisper" mode the whispers
 still go out by themselves at the invite delay; you only press for the /who.
-Lists tab "Invite all" / "Send": confirm once to arm, then each click on Next
-sends one invite and chat says "N left, click again".
+Lists tab "Invite all" / "Send": confirm once to arm, then each click on the
+Next button by the minimap (or its key) sends one invite and chat says
+"N left, click again". The Lists tab has no Next button of its own any more.
+Lists tab, Candidates view: left-click a name, then click Next, to invite
+that one player (/gr invite <name> does the same; /gr stop drops it).
+
+GUILD INVITES: A SECURE BUTTON, NOT IN COMBAT
+A Forever client showed that C_GuildInfo.Invite is protected: addon code that
+calls it gets ADDON_ACTION_FORBIDDEN even inside a key press. So the addon
+never calls it. The Next button is a secure button (Blizzard's
+SecureActionButtonTemplate): when the next step is an invite, the addon sets
+the button's macro to "/ginvite Name" just before your click is handled, and
+the game runs that macro itself -- exactly as if you had typed /ginvite.
+What that means for you:
+  - Invites go out only from a click on the Next button, its key, or a macro
+    with /click GuildRecruiterNextButton. Typing /gr next or /gr invite can't
+    send one (chat tells you what to click instead).
+  - Not in combat: the game doesn't let addons change a secure button in
+    combat. An invite press in combat says "can't set the invite in combat";
+    press again afterwards. The button then reads "Invite Bob (after combat)".
+    (With "Pause in combat" on, the default, invites are held anyway and the
+    press does the /who instead.)
+  - In combat the button can't appear or disappear either; it does that when
+    combat ends.
+  - The "Invite method" setting (/gr set method) is not used on Forever.
+  - The secure action runs when you RELEASE the mouse button or the key.
 If the client still blocks a call (ADDON_ACTION_BLOCKED / FORBIDDEN naming
 this addon), the run pauses and one chat line names the blocked call.
 On a client without C_FriendList.SendWho the old automatic timer loop runs
 unchanged and Next is not needed.
-NONE OF THIS HAS BEEN TESTED IN GAME. Details and open questions are in
+Seen in game so far (one player's screenshot): a Next key press sent a /who
+and queued 48 candidates; the first invite (then a direct C_GuildInfo.Invite)
+was refused with ADDON_ACTION_FORBIDDEN. The secure /ginvite button that
+replaces it HAS NOT BEEN TESTED IN GAME. Details and open questions are in
 PORT_NOTES.md.
 
 Before trusting it, run this in game and send the output along with any error:
@@ -216,8 +246,10 @@ ANTI-PATTERN / SAFETY OPTIONS
 ALL COMMANDS  (slash:  /gr)
 ---------------------------
   start | stop | pause | resume | status | config
-  next                  (Forever build) Send the next /who or invite -- one
-                        per press. Bind a key: Key Bindings > Guild Rawcruiter.
+  next                  (Forever build) Send the next /who or whisper -- one
+                        per press. Invites need the Next button, its key
+                        (Key Bindings > Guild Rawcruiter) or a macro with
+                        /click GuildRecruiterNextButton, out of combat.
   reset                 Clear THIS session's scan list (keeps history).
   forget                Wipe the persistent invite history.
   hide                  Toggle auto-hiding the Who window during scans.
