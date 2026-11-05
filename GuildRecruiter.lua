@@ -500,6 +500,31 @@ function GR_Compat.RenderList(names, r)
   return true
 end
 
+-- /gr chattab: ask Blizzard's own FCF_OpenNewWindow to make the "Rawcruiter" tab with
+-- no message types (second argument true). That function runs from our (tainted)
+-- context and writes chat-window state, so the rule is: /reload straight after.
+-- A reload starts a clean session; the new window itself is kept (the client saves
+-- it), so the clicks on its links run untainted. Untested on Forever, so every step
+-- is under pcall and a failure just tells the player to make the tab by hand.
+function GR_Compat.MakeChatTab()
+  local say = function(t) if DEFAULT_CHAT_FRAME then DEFAULT_CHAT_FRAME:AddMessage("|cffff8000Rawcruiter:|r "..t) end end
+  if GR_Compat.ListFrame() then
+    say("the \""..GR_Compat.CHAT_TAB.."\" chat tab already exists.")
+    return
+  end
+  if InCombatLockdown and InCombatLockdown() then say("can't make a chat window in combat; try again after.") return end
+  if type(FCF_OpenNewWindow) ~= "function" then
+    say("this client has no FCF_OpenNewWindow; make it by hand: right-click a chat tab > New Window > name it "..GR_Compat.CHAT_TAB..".")
+    return
+  end
+  local ok, res = pcall(FCF_OpenNewWindow, GR_Compat.CHAT_TAB, true)
+  if not ok or not res then
+    say("couldn't create it ("..(ok and "no free chat window" or tostring(res))..").  Make it by hand: right-click a chat tab > New Window > name it "..GR_Compat.CHAT_TAB..".")
+    return
+  end
+  say("created the \""..GR_Compat.CHAT_TAB.."\" tab. |cffffff00Type /reload now|r (the new tab is cleanest after a reload, so a clicked name can't be blocked).")
+end
+
 -- a small draggable box holding the name, selected, so the player can copy it
 -- (Ctrl+C) and paste it into Blizzard's own invite box. Our own frame only.
 -- While it has focus key bindings are suspended, so Esc (or Enter) closes it.
@@ -4130,6 +4155,7 @@ SlashCmdList["GUILDRECRUITER"] = function(msg)
   elseif cmd == "next" then GuildRecruiter_Next()   -- typed: /who and whisper steps only (no secure click)
   elseif cmd == "status" then Status()
   elseif cmd == "ready" then GuildRecruiter_ReadyToggle()   -- the Ready-to-invite panel
+  elseif cmd == "chattab" then GR_Compat.MakeChatTab()      -- create the "Rawcruiter" chat tab (then /reload)
   elseif cmd == "alert" then
     if larg == "on" or larg == "off" then GuildRecruiter_Settings.readyAlert = (larg == "on") end
     Print("Reply alert (sound + taskbar flash when a yes-reply lands on the Ready list): "..(GuildRecruiter_Settings.readyAlert and "ON" or "OFF")..".  /gr alert on|off")
