@@ -127,6 +127,12 @@ end
 -- call from tainted code (e.g. a secure frame changed in combat).
 function GR_Compat.BlockedLine(event, addon, fn)
   if issecret(addon) or issecret(fn) or addon ~= ADDON_NAME then return nil end
+  -- a refused clipboard copy is harmless: note it so CopyName falls back to the
+  -- copy box, and do not pause the run for it
+  if type(fn) == "string" and string.find(fn, "Clipboard", 1, true) then
+    GR_Compat.clipBlocked = true
+    return nil
+  end
   local line
   if event == "ADDON_ACTION_FORBIDDEN" then
     line = "|cffff4040The client forbids "..tostring(fn or "an action").." for addons|r (ADDON_ACTION_FORBIDDEN: Blizzard-only, a key press does not unlock it)"
@@ -398,8 +404,30 @@ function GR_Compat.SetSecureInvite(name)
   -- This is only the PROMPT: the caller puts the name on the Ready list, and the
   -- invite is counted when the player presses Done there (or the join/decline
   -- message names them), never here.
-  GR_Compat.ShowCopyBox(name)
+  -- (The old copy window is no longer opened here: the Ready panel is the one place
+  -- to act on a name, and its [Copy] button puts the name on the clipboard.)
   GR_Compat.PrintLink(name)
+end
+
+-- Put a player name on the OS clipboard. Blizzard documents CopyToClipboard(text) in
+-- the Os API as HasRestrictions = true, i.e. it probably needs the click that calls
+-- it (Blizzard_APIDocumentationGenerated/OsDocumentation.lua). It touches no Blizzard
+-- frame. If the client blocks it or the function is missing, the copy box is shown
+-- instead. Returns true when the clipboard call ran without a block or error.
+function GR_Compat.CopyName(name)
+  GR_Compat.clipBlocked = false
+  if type(CopyToClipboard) == "function" then
+    local ok = pcall(CopyToClipboard, name)
+    if ok and not GR_Compat.clipBlocked then
+      if DEFAULT_CHAT_FRAME then
+        DEFAULT_CHAT_FRAME:AddMessage("|cffff8000Rawcruiter:|r copied "..name
+          .." -- paste with Ctrl+V into Guild > Invite Member (Shift-click Copy to see a copy box instead)")
+      end
+      return true
+    end
+  end
+  GR_Compat.ShowCopyBox(name)
+  return false
 end
 
 -- print the invite prompt line with the name as a player link, in the chat frame
@@ -2479,7 +2507,12 @@ end
 
 -- [Copy]: the existing copy box, holding just the name
 function GuildRecruiter_ReadyCopy(name)
-  if name then GR_Compat.ShowCopyBox(name) end
+  if not name then return end
+  if IsShiftKeyDown and IsShiftKeyDown() then
+    GR_Compat.ShowCopyBox(name)      -- Shift-click Copy: the box, for selecting by hand
+  else
+    GR_Compat.CopyName(name)         -- plain click: straight to the clipboard
+  end
 end
 
 -- [Copy next]: the name that has waited longest
