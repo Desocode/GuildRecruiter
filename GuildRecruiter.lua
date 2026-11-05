@@ -420,8 +420,7 @@ function GR_Compat.CopyName(name)
     local ok = pcall(CopyToClipboard, name)
     if ok and not GR_Compat.clipBlocked then
       if DEFAULT_CHAT_FRAME then
-        DEFAULT_CHAT_FRAME:AddMessage("|cffff8000Rawcruiter:|r copied "..name
-          .." -- paste with Ctrl+V into Guild > Invite Member (Shift-click Copy to see a copy box instead)")
+        DEFAULT_CHAT_FRAME:AddMessage("|cffff8000Rawcruiter:|r copied "..name.." -- Ctrl+V in Invite Member")
       end
       return true
     end
@@ -435,9 +434,9 @@ end
 -- shift-clicks it there: Blizzard_UIPanels_Game/Mainline/ItemRefHandlers.lua:24-28,
 -- StaticPopup_Visible("ADD_GUILDMEMBER")).
 function GR_Compat.PrintLink(name)
+  if GR_Compat.ListFrame() then return end     -- the Rawcruiter tab already lists it
   if DEFAULT_CHAT_FRAME then
-    DEFAULT_CHAT_FRAME:AddMessage("|cffff8000Rawcruiter:|r invite "..GR_Compat.PlayerLink(name)
-      .." -- with Guild > Invite Member open, SHIFT-CLICK the name here in chat (or Copy + paste), then press Done in the Ready panel")
+    DEFAULT_CHAT_FRAME:AddMessage("|cffff8000Rawcruiter:|r invite "..GR_Compat.PlayerLink(name).." -- shift-click it in Guild > Invite Member")
   end
 end
 
@@ -491,8 +490,7 @@ function GR_Compat.OnTrialError()
   local key = s.ready and GR_Compat.FindKey(s.ready, p.name)
   if key then s.ready[key] = nil end                      -- not an invite: nothing counted
   if DEFAULT_CHAT_FRAME then
-    DEFAULT_CHAT_FRAME:AddMessage("|cffff8000Rawcruiter:|r "..p.name.." has a Free Trial account (cannot join guilds) -- skipped, and not contacted again for "
-      ..GR_Compat.TRIAL_DAYS.." days. Free Trial total: "..s.trialCount..".")
+    DEFAULT_CHAT_FRAME:AddMessage("|cffff8000Rawcruiter:|r "..p.name..": Free Trial account, skipped for "..GR_Compat.TRIAL_DAYS.." days (total "..s.trialCount..")")
   end
   GuildRecruiter_ReadyRefresh()
   GuildRecruiter_ListRefresh()
@@ -539,9 +537,7 @@ function GR_Compat.RenderList(names, r)
   if not fr then
     if #names > 0 and not GR_Compat.tabWarned and DEFAULT_CHAT_FRAME then
       GR_Compat.tabWarned = true
-      DEFAULT_CHAT_FRAME:AddMessage("|cffff8000Rawcruiter:|r for a clickable invite list, make a chat tab named \""
-        ..GR_Compat.CHAT_TAB.."\": right-click any chat tab > New Window > name it "..GR_Compat.CHAT_TAB
-        ..", then untick all message types. Names appear there to shift-click.")
+      DEFAULT_CHAT_FRAME:AddMessage("|cffff8000Rawcruiter:|r no \""..GR_Compat.CHAT_TAB.."\" chat tab yet -- type /gr chattab, then /reload.")
     end
     return false
   end
@@ -551,14 +547,14 @@ function GR_Compat.RenderList(names, r)
   pcall(function()
     fr:Clear()
     if #names == 0 then
-      fr:AddMessage("|cffff8000Rawcruiter:|r nobody is waiting for an invite.")
+      fr:AddMessage("|cff999999Nobody waiting.|r")
       return
     end
-    fr:AddMessage("|cffff8000Rawcruiter: ready to invite ("..#names..")|r  Open Guild > Invite Member, SHIFT-click a name here, Accept, then press Done in the Ready panel.")
+    fr:AddMessage("|cffff8000Ready to invite ("..#names..")|r  shift-click a name")
     for i = #names, 1, -1 do      -- oldest first: that is who has waited longest
       local e = r and r[names[i]]
       local when = (type(e) == "table" and e.t) and date("%H:%M", e.t) or "?"
-      fr:AddMessage("   "..GR_Compat.PlayerLink(names[i]).."   |cff999999replied "..when.."|r")
+      fr:AddMessage(GR_Compat.PlayerLink(names[i]).." |cff999999"..when.."|r")
     end
   end)
   return true
@@ -2423,13 +2419,9 @@ function GuildRecruiter_Arm(text)
   GuildRecruiter_oneName = nil              -- a single invite set earlier gives way to the run
   local m = GuildRecruiter_Settings.mode
   if GuildRecruiter_runKind ~= "blast" and (m == "whisper" or m == "whisperinvite") then
-    Print(text.." Each /who waits for you: "..GuildRecruiter_PressHint()
-      ..". Whispers then go out by themselves"
-      ..(m == "whisperinvite" and "; a yes-reply lands on the Ready list (/gr ready), where you invite them yourself" or "")
-      ..". /gr stop to cancel.")
+    Print(text.." Press Next for each /who. /gr stop to cancel.")
   else
-    Print(text.." Each /who and each invite prompt waits for you: "..GuildRecruiter_PressHint()
-      ..". A prompt puts the name on the Ready list (/gr ready); you send the invite in Guild > Invite Member and press Done. /gr stop to cancel.")
+    Print(text.." Press Next for each /who or invite step. /gr stop to cancel.")
   end
   GuildRecruiter_ShowNext()
   return true
@@ -2627,7 +2619,7 @@ function GuildRecruiter_ReadyAdd(name, kind, v, quiet)
   if kind == "reply" then
     -- the player link in this chat line is the shift-click target for an open
     -- Guild > Invite Member box (handled by Blizzard's own chat link code)
-    Print(GR_Compat.PlayerLink(name).." replied -- ready to invite ("..GuildRecruiter_ReadyCount().." waiting). Open Guild > Invite Member and SHIFT-click the name, or use Copy in the Ready panel; then press Done.")
+    Print(GR_Compat.PlayerLink(name).." replied -- "..GuildRecruiter_ReadyCount().." waiting"..(GR_Compat.ListFrame() and "" or " (shift-click in Guild > Invite Member)"))
     if s.readyAlert and not quiet then GR_Compat.Alert() end
   end
   GuildRecruiter_ReadyShow(true, name)
@@ -2662,7 +2654,7 @@ function GuildRecruiter_ReadyDone(name, how)
       s.history[key] = { t = time(), p = e.v or ((type(pe) == "table") and pe.p) or s.activeProfile }
     end
     if s.candidates then s.candidates[key] = nil end
-    Print("Invite recorded: "..key..((how and how ~= "done") and (" ("..how..")") or "").." -- "..GuildRecruiter_ReadyCount().." still waiting.")
+    Print("Invited "..key..((how and how ~= "done") and (" ("..how..")") or "")..", "..GuildRecruiter_ReadyCount().." waiting.")
   end
   GuildRecruiter_ReadyRefresh()
   GuildRecruiter_ListRefresh()
