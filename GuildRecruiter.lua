@@ -245,8 +245,10 @@ function GR_Compat.SetSecureInvite(name)
       ..(GR_Compat.inPress and "a typed command" or "a timer or event"), 0)
   end
   if GR_Compat.InCombat() then error("can't set the invite in combat", 0) end
-  if type(name) ~= "string" or not string.find(name, "^[^%s/]+$") then
-    error("not a player name for /ginvite: "..tostring(name), 0)   -- no spaces/newlines in a macro line
+  -- Forever names are "First Surname" (one space), so spaces are allowed; only
+  -- characters that could end or alter the macro line are refused.
+  if type(name) ~= "string" or not string.find(name, "^[^%c/|]+$") or string.find(name, "^%s") or string.find(name, "%s$") then
+    error("not a player name for /ginvite: "..tostring(name), 0)   -- no newlines/slashes/escapes in a macro line
   end
   btn:SetAttribute("type", "macro")
   btn:SetAttribute("macrotext", "/ginvite "..name)
