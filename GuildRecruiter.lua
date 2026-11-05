@@ -441,6 +441,65 @@ function GR_Compat.PrintLink(name)
   end
 end
 
+-- THE READY LIST IN A REAL BLIZZARD CHAT TAB. Our own frames can't make a link that
+-- fills Invite Member without tainting the invite, but a Blizzard chat window can:
+-- its link click is Blizzard's own code. So the player makes one chat tab by hand
+-- (right-click any chat tab > New Window > name it "Rawcruiter", leave every chat
+-- type unticked) and this prints the waiting names there as player links, to
+-- SHIFT-click. We only find that window and AddMessage into it (what every addon
+-- does to print); we never create or configure a chat window (that would run
+-- Blizzard's chat setup code from our tainted context).
+GR_Compat.CHAT_TAB = "Rawcruiter"
+
+-- the chat frame whose tab is named "Rawcruiter", or nil
+function GR_Compat.ListFrame()
+  local count = NUM_CHAT_WINDOWS or 10
+  for i = 1, count do
+    local nm
+    if type(GetChatWindowInfo) == "function" then nm = GetChatWindowInfo(i) end
+    if type(nm) ~= "string" or nm == "" then
+      local tab = _G["ChatFrame"..i.."Tab"]
+      nm = tab and tab.GetText and tab:GetText()
+    end
+    if type(nm) == "string" and not issecret(nm) and nm == GR_Compat.CHAT_TAB then
+      return _G["ChatFrame"..i]
+    end
+  end
+  return nil
+end
+
+-- redraw the list in that tab, only when the set of names (or the tab) changed.
+-- names: newest first (GuildRecruiter_ReadyNames); r: the Ready table.
+function GR_Compat.RenderList(names, r)
+  local fr = GR_Compat.ListFrame()
+  if not fr then
+    if #names > 0 and not GR_Compat.tabWarned and DEFAULT_CHAT_FRAME then
+      GR_Compat.tabWarned = true
+      DEFAULT_CHAT_FRAME:AddMessage("|cffff8000Rawcruiter:|r for a clickable invite list, make a chat tab named \""
+        ..GR_Compat.CHAT_TAB.."\": right-click any chat tab > New Window > name it "..GR_Compat.CHAT_TAB
+        ..", then untick all message types. Names appear there to shift-click.")
+    end
+    return false
+  end
+  local sig = #names..":"..table.concat(names, "\1")
+  if GR_Compat.listSig == sig and GR_Compat.listFrame == fr then return true end
+  GR_Compat.listSig, GR_Compat.listFrame = sig, fr
+  pcall(function()
+    fr:Clear()
+    if #names == 0 then
+      fr:AddMessage("|cffff8000Rawcruiter:|r nobody is waiting for an invite.")
+      return
+    end
+    fr:AddMessage("|cffff8000Rawcruiter: ready to invite ("..#names..")|r  Open Guild > Invite Member, SHIFT-click a name here, Accept, then press Done in the Ready panel.")
+    for i = #names, 1, -1 do      -- oldest first: that is who has waited longest
+      local e = r and r[names[i]]
+      local when = (type(e) == "table" and e.t) and date("%H:%M", e.t) or "?"
+      fr:AddMessage("   "..GR_Compat.PlayerLink(names[i]).."   |cff999999replied "..when.."|r")
+    end
+  end)
+  return true
+end
+
 -- a small draggable box holding the name, selected, so the player can copy it
 -- (Ctrl+C) and paste it into Blizzard's own invite box. Our own frame only.
 -- While it has focus key bindings are suspended, so Esc (or Enter) closes it.
@@ -2627,6 +2686,8 @@ end
 
 -- redraw the panel (if built); it hides itself when the list is empty
 function GuildRecruiter_ReadyRefresh()
+  GuildRecruiter_ReadyPrune()
+  GR_Compat.RenderList(GuildRecruiter_ReadyNames(), GuildRecruiter_Settings.ready)   -- the "Rawcruiter" chat tab, if the player made one
   local p = GuildRecruiterReadyPanel
   if not p then return end
   GuildRecruiter_ReadyPrune()
