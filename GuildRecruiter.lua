@@ -250,9 +250,31 @@ function GR_Compat.SetSecureInvite(name)
   if type(name) ~= "string" or not string.find(name, "^[^%c/|]+$") or string.find(name, "^%s") or string.find(name, "%s$") then
     error("not a player name for /ginvite: "..tostring(name), 0)   -- no newlines/slashes/escapes in a macro line
   end
-  btn:SetAttribute("type", "macro")
-  btn:SetAttribute("macrotext", "/ginvite "..name)
-  GR_Compat.lastCall, GR_Compat.lastCallAt = "/ginvite on "..(btn:GetName() or "the Next button"), GetTime()
+  -- A secure /ginvite macro was tried on a real Forever client and refused: "A macro
+  -- script has been blocked from an action only available to the Blizzard UI".
+  -- So the addon does not send the invite. It types "/ginvite <name>" into the chat
+  -- box and the PLAYER presses Enter (typed chat is Blizzard UI). The secure
+  -- button's action stays empty.
+  GR_Compat.lastCall, GR_Compat.lastCallAt = "/ginvite typed into chat for "..name, GetTime()
+  if not GR_Compat.PrefillChat("/ginvite "..name) then
+    if DEFAULT_CHAT_FRAME then DEFAULT_CHAT_FRAME:AddMessage("|cffff8000Rawcruiter:|r couldn't open the chat box -- type: /ginvite "..name) end
+  end
+end
+
+-- put text in the chat box ready to send; the player presses Enter. Unverified on
+-- Forever (the Forever dev guide warns against ChatFrame_OpenChat /
+-- ChatEdit_ActivateChat), so every call is pcall-guarded and false means "failed".
+function GR_Compat.PrefillChat(text)
+  if type(ChatFrame_OpenChat) == "function" and DEFAULT_CHAT_FRAME
+     and pcall(ChatFrame_OpenChat, text, DEFAULT_CHAT_FRAME) then
+    return true
+  end
+  local eb = DEFAULT_CHAT_FRAME and DEFAULT_CHAT_FRAME.editBox
+  if eb and type(ChatEdit_ActivateChat) == "function" and pcall(ChatEdit_ActivateChat, eb) then
+    eb:SetText(text)
+    return true
+  end
+  return false
 end
 
 -- empty the secure button's action. Between clicks it is always empty: PostClick
